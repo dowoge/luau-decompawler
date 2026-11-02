@@ -3454,21 +3454,20 @@ impl<'c, 'm> Dec<'c, 'm> {
                     self.declare(key);
                 }
                 self.key_pc = None;
-                let mut head = gen[0].clone();
+                // only nils at the end go; a lone call is one value, as the
+                // register holds, not the three a call there would spread to
+                let used = gen.iter().rposition(|g| g != "nil").map_or(1, |k| k + 1);
+                let mut head = gen[..used].join(", ");
+                if used == 1 && head.ends_with(')') {
+                    head = format!("({head})");
+                }
                 let here = self.reg(a);
-                if o == op::FORGPREP_INEXT {
-                    if gen[0] == "ipairs" || gen[0] == *here {
-                        head = format!("ipairs({})", gen[1]);
-                    }
-                } else if o == op::FORGPREP_NEXT {
-                    if gen[0] == "next" {
-                        head = format!("next, {}", gen[1]);
-                    } else if gen[0] == "pairs" || gen[0] == *here {
-                        head = format!("pairs({})", gen[1]);
-                    }
-                } else if gen[1] != "nil" {
-                    let kept: Vec<&str> = gen.iter().map(String::as_str).filter(|x| *x != "nil").collect();
-                    head = kept.join(", ");
+                if o == op::FORGPREP_INEXT && (gen[0] == "ipairs" || gen[0] == *here) {
+                    head = format!("ipairs({})", gen[1]);
+                } else if o == op::FORGPREP_NEXT && gen[0] == "next" {
+                    head = format!("next, {}", gen[1]);
+                } else if o == op::FORGPREP_NEXT && (gen[0] == "pairs" || gen[0] == *here) {
+                    head = format!("pairs({})", gen[1]);
                 }
                 if let Some((ia, text)) = iter_call {
                     if ia == a {

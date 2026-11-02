@@ -2343,7 +2343,9 @@ fn generic_for(lines: Vec<String>) -> Vec<String> {
                         if !keep.is_empty() {
                             r.push(format!("{pad}local {}", keep.join(", ")));
                         }
-                        r.push(format!("{pad}for {vars} in {} do", d0.1));
+                        // `local a = f()` kept one value: a call in the header would spread
+                        let source = if d0.1.ends_with(')') { format!("({})", d0.1) } else { d0.1.clone() };
+                        r.push(format!("{pad}for {vars} in {source} do"));
                         repl = Some(r);
                     }
                 }
@@ -2491,7 +2493,10 @@ fn interpolation(lines: Vec<String>) -> Vec<String> {
             let args = split_top(&line[m1..close]);
             let holes = fmt.matches("%*").count();
             let rest = fmt.replace("%*", "").replace("%%", "");
+            // a call is a statement, an interpolated string is not
+            let statement = line[..m0].trim().is_empty();
             if holes == 0
+                || statement
                 || holes != args.len()
                 || rest.contains('%')
                 || fmt.contains('`')
@@ -3231,9 +3236,20 @@ fn rename_variables(lines: Vec<String>) -> Vec<String> {
                         base = Some(lower_first(&b[3..]));
                     }
                 }
+                // `_` would hide a global `_` the body reads (one declared
+                // there is its own)
+                let declares = |l: &str| {
+                    let s = l.trim_start();
+                    let names = s
+                        .strip_prefix("for ")
+                        .and_then(|r| r.split(" in ").next())
+                        .or_else(|| s.strip_prefix("local ").and_then(|r| r.split(" = ").next()));
+                    names.is_some_and(|n| n.split(',').any(|v| v.trim() == "_"))
+                };
+                let underscore = (fors[0] + 1..end).any(|j| has_word(&out[j], "_") && !declares(&out[j]));
                 if idx == Some(0) && vars_.len() > 1 {
                     new = Some(
-                        if !body_uses {
+                        if !body_uses && !underscore {
                             "_"
                         } else if src.contains("ipairs(") {
                             "i"
