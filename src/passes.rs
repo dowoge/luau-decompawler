@@ -3367,6 +3367,9 @@ fn rename_variables(lines: Vec<String>) -> Vec<String> {
                 }
             }
             if at.iter().any(|&j| (j < s_lo || s_hi <= j) && has_word(&out[j], name)) {
+                if new == "_" {
+                    continue; // read outside that loop: no `_`
+                }
                 s_lo = lo; // used outside that block after all
                 s_hi = hi;
             }
