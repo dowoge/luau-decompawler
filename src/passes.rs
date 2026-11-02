@@ -4638,7 +4638,7 @@ fn stored_element(line: &str, name: &str) -> Option<String> {
     None
 }
 
-/// `[{,] (IDENT) = NAME[,}]` searched in the line.
+/// `[{,] (IDENT) = NAME( ?}|,)` searched in the line.
 fn stored_in_table<'a>(line: &'a str, name: &str) -> Option<&'a str> {
     let b = line.as_bytes();
     let n = name.as_bytes();
@@ -4647,7 +4647,8 @@ fn stored_in_table<'a>(line: &'a str, name: &str) -> Option<&'a str> {
     while let Some(at) = find_from(b, n, i) {
         i = at + 1;
         let e = at + n.len();
-        if at < 3 || &b[at - 3..at] != b" = " || e >= b.len() || (b[e] != b',' && b[e] != b'}') {
+        let closes = |k: usize| b.get(k).is_some_and(|c| *c == b',' || *c == b'}');
+        if at < 3 || &b[at - 3..at] != b" = " || !(closes(e) || (b.get(e) == Some(&b' ') && b.get(e + 1) == Some(&b'}'))) {
             continue;
         }
         let p = at - 3;
