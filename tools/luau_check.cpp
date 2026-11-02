@@ -12,6 +12,8 @@
 //                                   records.h) and are compiled as --emit
 //                                   does; each result goes back as a record,
 //                                   its bytecode or the compiler's message
+//   -O0, -O1 or -O2                 with --emit or --stream: compile at that
+//                                   level instead
 //
 // Files go through on every core, or LUAU_THREADS of them.
 #include "Luau/Common.h"
@@ -51,12 +53,16 @@ static size_t worker_count(size_t files) {
 int main(int argc, char** argv) {
     const char* emit = nullptr;
     bool stream = false;
+    int level = 2;
     std::vector<Record> files;  // from the command line: names only, read below
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--emit") == 0 && i + 1 < argc)
             emit = argv[++i];
         else if (std::strcmp(argv[i], "--stream") == 0)
             stream = true;
+        else if (std::strcmp(argv[i], "-O0") == 0 || std::strcmp(argv[i], "-O1") == 0 ||
+                 std::strcmp(argv[i], "-O2") == 0)
+            level = argv[i][2] - '0';
         else
             files.push_back({argv[i], {}});
     }
@@ -67,7 +73,7 @@ int main(int argc, char** argv) {
             files.push_back(std::move(r));
     }
     lua_CompileOptions opts = {};
-    opts.optimizationLevel = emit || stream ? 2 : 1;
+    opts.optimizationLevel = emit || stream ? level : 1;
     opts.debugLevel = 1;
     opts.vectorLib = "Vector3";
     opts.vectorCtor = "new";

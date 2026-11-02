@@ -41,6 +41,8 @@ pub struct Suite<'a> {
     pub print: Print,
     /// A program may end in an error, which its decompiled form must repeat.
     pub errors_are_output: bool,
+    /// Programs compile at this level, and their decompiled forms run at it.
+    pub level: u8,
 }
 
 /// What a suite found: the programs that do not behave the same, and why.
@@ -68,12 +70,14 @@ pub fn run(args: &Args, loud: bool) -> usize {
         show: args.opt("--show"),
         print: if loud { Print::All } else { Print::Bad },
         errors_are_output: args.flag("--errors"),
+        level: args.num("--level", 2),
     };
     run_suite(&suite).misbehaving.len()
 }
 
 pub fn run_suite(suite: &Suite) -> Found {
-    let tools = Tools::find();
+    let mut tools = Tools::find();
+    tools.level = suite.level;
     let (cases, show, binary, print) = (&suite.dir, suite.show, &suite.binary, suite.print);
     let mut srcs: Vec<String> = std::fs::read_dir(cases)
         .expect("the cases folder")

@@ -213,6 +213,9 @@ pub struct Tools {
     pub check: String,
     pub run: String,
     pub decompiler: String,
+    /// The level programs compile at, to decompile and to run: 2, like
+    /// Roblox game scripts, unless a suite asks for 0 or 1.
+    pub level: u8,
 }
 
 impl Tools {
@@ -224,15 +227,25 @@ impl Tools {
             check: at(&bin, "luau_check"),
             run: at(&bin, "luau_run"),
             decompiler: at(&repo().join("target").join("release"), "luau_decompile"),
+            level: 2,
         }
     }
 
-    /// Compiles each source at -O2 like Roblox: its bytecode, or why there is none.
+    /// `-O0` or `-O1` when not at Roblox's level (tools before those knew only -O2).
+    fn level_arg(&self, c: &mut Command) {
+        if self.level != 2 {
+            c.arg(format!("-O{}", self.level));
+        }
+    }
+
+    /// Compiles each source at -O2 like Roblox (or at the level asked for):
+    /// its bytecode, or why there is none.
     pub fn compile(&self, sources: &[Item]) -> Vec<Result<Vec<u8>, String>> {
         if sources.is_empty() {
             return Vec::new();
         }
         let mut check = command(&self.check);
+        self.level_arg(&mut check);
         check.arg("--stream");
         let input = records(sources.iter().map(|s| (s.name.as_str(), s.data.as_slice())));
         let ran = run_limited(&mut check, Some(input), COMPILE_LIMIT);
@@ -252,6 +265,7 @@ impl Tools {
         }
         let run = |part: &[Item]| {
             let mut cmd = command(&self.run);
+            self.level_arg(&mut cmd);
             cmd.arg("--budget").arg(budget.to_string()).arg("--seconds").arg(seconds.to_string()).arg("--stream");
             let input = records(part.iter().map(|p| (p.name.as_str(), p.data.as_slice())));
             run_limited(&mut cmd, Some(input), seconds * 4 + 60)

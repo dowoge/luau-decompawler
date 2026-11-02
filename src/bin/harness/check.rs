@@ -3,7 +3,8 @@
 //! pointing at a folder of script dumps (<place>/<id>.wire) it also decompiles
 //! those into out/ and reports jump flags, dispatchers, undeclared names and how
 //! many functions recompile to the original. tools/semantic and the folders in
-//! $LUAU_SUITES must behave too, but for what their known.txt lists.
+//! $LUAU_SUITES must behave too, but for what their known.txt lists: with
+//! --full, compiled and run at -O0, -O1 and -O2.
 //!
 //! Failing random programs are kept in failed/.
 
@@ -127,20 +128,32 @@ fn real_scripts(tools: &Tools, dumps: &str) -> bool {
 /// decompiler can change behaviour: tools/semantic, and any in $LUAU_SUITES
 /// (separated by `;`). Those known not to behave yet are listed in the folder's
 /// known.txt, with why; any other failing, or a listed one now behaving, fails
-/// the check, so the list stays true.
-fn suite(tools: &Tools, dir: &Path) -> bool {
+/// the check, so the list stays true. With `full`, the programs go through at
+/// -O1 and -O0 as well: compiled, decompiled and run at each level, since a
+/// table's layout and so what `pairs` visits first differ between levels.
+fn suite(tools: &Tools, dir: &Path, full: bool) -> bool {
     let has_programs = std::fs::read_dir(dir)
         .map(|d| d.flatten().any(|e| e.path().extension().is_some_and(|x| x == "luau")))
         .unwrap_or(false);
     if !has_programs {
         return true;
     }
+    let levels: &[u8] = if full { &[2, 1, 0] } else { &[2] };
+    let mut ok = true;
+    for &level in levels {
+        ok = suite_at(tools, dir, level) && ok;
+    }
+    ok
+}
+
+fn suite_at(tools: &Tools, dir: &Path, level: u8) -> bool {
     let suite = Suite {
         dir: dir.to_string_lossy().into_owned(),
         binary: tools.decompiler.clone(),
         show: None,
         print: Print::Nothing,
         errors_are_output: true,
+        level,
     };
     let found = cases::run_suite(&suite);
     let listed = std::fs::read_to_string(dir.join("known.txt")).unwrap_or_default();
@@ -154,7 +167,8 @@ fn suite(tools: &Tools, dir: &Path) -> bool {
     let bad: Vec<&(String, &str)> = found.misbehaving.iter().filter(|m| !known.contains(&m.0.as_str())).collect();
     let fixed: Vec<&&str> = known.iter().filter(|k| !found.misbehaving.iter().any(|m| m.0 == **k)).collect();
     let behave = found.total - found.misbehaving.len();
-    println!("{}: {behave} of {} behave, {} known not to yet", dir.display(), found.total, known.len());
+    let at = if level == 2 { String::new() } else { format!(" at -O{level}") };
+    println!("{}{at}: {behave} of {} behave, {} known not to yet", dir.display(), found.total, known.len());
     for (name, why) in &bad {
         println!("  {name}: {why}");
     }
@@ -164,14 +178,14 @@ fn suite(tools: &Tools, dir: &Path) -> bool {
     bad.is_empty() && fixed.is_empty()
 }
 
-fn suites(tools: &Tools) -> bool {
+fn suites(tools: &Tools, full: bool) -> bool {
     let mut dirs = vec![repo().join("tools").join("semantic")];
     if let Ok(more) = std::env::var("LUAU_SUITES") {
         dirs.extend(more.split(';').filter(|d| !d.is_empty()).map(std::path::PathBuf::from));
     }
     let mut ok = true;
     for dir in &dirs {
-        ok = suite(tools, dir) && ok;
+        ok = suite(tools, dir, full) && ok;
     }
     ok
 }
@@ -181,7 +195,7 @@ pub fn main(args: &Args) -> u8 {
     let mut ok = build();
     if ok {
         ok = cases::run(&Args(Vec::new()), false) == 0;
-        ok = suites(&tools) && ok;
+        ok = suites(&tools, args.flag("--full")) && ok;
     }
     let seeds: &[(u64, usize, u64)] = if args.flag("--full") { &FULL } else { &QUICK };
     ok = random_sets(&tools, seeds) && ok;
