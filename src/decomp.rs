@@ -3259,7 +3259,12 @@ impl<'c, 'm> Dec<'c, 'm> {
             let K::TableK(keys) = &p.k[kindex(p, made.d() as i64)] else { return None };
             let mut last = pc;
             for s in &stores {
-                let open = keys.iter().any(|(k, v)| *v < 0 && s.op == op::SETTABLEKS && *k == s.aux as u64);
+                let key = match s.op {
+                    op::SETTABLEKS => Some(s.aux as u64),
+                    op::SETTABLE => self.flow.idx(s.pc).and_then(|i| self.settable_key(i)).map(|k| k as u64),
+                    _ => None,
+                };
+                let open = key.is_some_and(|key| keys.iter().any(|(k, v)| *v < 0 && *k == key));
                 if !open {
                     return Some(last);
                 }
@@ -3384,6 +3389,41 @@ impl<'c, 'm> Dec<'c, 'm> {
         (count != array).then_some((last, true))
     }
 
+    /// The string constant the key register of the SETTABLE at code index
+    /// `at` holds, loaded since the last label: at -O0 Luau folds no
+    /// constants, and stores a constructor's `k = v` that way.
+    fn settable_key(&self, at: usize) -> Option<usize> {
+        let code = &self.p.code;
+        let key = code[at].c();
+        for i in (0..at).rev() {
+            let ins = code[i];
+            if ins.jump_target().is_some() || self.has_label(code[i + 1].pc) {
+                return None;
+            }
+            let (_, wr, _) = self.effects_at(i);
+            if wr.has(key) {
+                let k = match ins.op {
+                    op::LOADK if ins.a() == key => ins.d() as usize,
+                    op::LOADKX if ins.a() == key => ins.aux as usize,
+                    _ => return None,
+                };
+                return matches!(self.p.k.get(k), Some(K::Str(_))).then_some(k);
+            }
+        }
+        None
+    }
+
+    /// The SETTABLE at code index `at` stores a key the template DUPTABLE
+    /// made at pc holds no value for: one of its constructor's items, at -O0.
+    fn template_key_store(&self, pc: i32, at: usize) -> bool {
+        let made = self.insn(pc);
+        if made.op != op::DUPTABLE {
+            return false;
+        }
+        let K::TableK(keys) = &self.p.k[kindex(self.p, made.d() as i64)] else { return false };
+        self.settable_key(at).is_some_and(|key| keys.iter().any(|(k, v)| *v < 0 && *k == key as u64))
+    }
+
     /// Keys DUPTABLE's template has no value for: the constructor's own, so
     /// what stands between it and their stores are those values, calls included.
     fn template_holes(&self, pc: i32) -> usize {
@@ -3415,7 +3455,9 @@ impl<'c, 'm> Dec<'c, 'm> {
             if (joined && left == 0) || self.is_loop_head(q) {
                 return false; // another path joins while it is being built
             }
-            if matches!(ins.op, op::SETTABLEKS | op::SETTABLEN) && qb == r && qa != r {
+            let keyed = matches!(ins.op, op::SETTABLEKS | op::SETTABLEN)
+                || ins.op == op::SETTABLE && ins.c() != r && self.template_key_store(pc, i);
+            if keyed && qb == r && qa != r {
                 if open {
                     return false; // a store of its own: the constructor ended
                 }
@@ -5017,11 +5059,23 @@ impl<'c, 'm> Dec<'c, 'm> {
                     && self.pending.get(&b).is_some_and(|e| e.borrow().fields.is_some());
                 if fold {
                     let table = self.pending[&b].clone();
+                    // a template's key in a register: its `k = v` at -O0
+                    let temp = self.pending.contains_key(&c);
+                    let named = self.flow.idx(pc).and_then(|i| self.settable_key(i)).and_then(|k| kstr(m, p, k));
                     let key = self.get(c);
                     let val = self.get(a);
                     self.pset(b, table.clone());
-                    let f = format!("[{}] = {}", key.borrow().text, val.borrow().text);
-                    self.add_fields(&table, [f]);
+                    let slot = named.filter(|_| temp).and_then(|n| {
+                        let want = format!("{SLOT}{}", field_text(n));
+                        table.borrow().fields.as_ref().and_then(|fs| fs.iter().position(|x| *x == want)).map(|at| (n, at))
+                    });
+                    match slot {
+                        Some((n, at)) => self.fill_slot(&table, at, format!("{} = {}", field_text(n), val.borrow().text)),
+                        None => {
+                            let f = format!("[{}] = {}", key.borrow().text, val.borrow().text);
+                            self.add_fields(&table, [f]);
+                        }
+                    }
                     self.finish_table(out, ind, b, &table, pc);
                 } else {
                     self.flush(out, ind, &[a, b, c]);
