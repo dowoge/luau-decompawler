@@ -13,7 +13,7 @@ use std::sync::OnceLock;
 use crate::analysis::{effects, full_effects, twice, Flow, RegSet};
 use crate::bytecode::{is_cond_jump, is_for, is_forgprep, op, op_name, Insn, Module, Proto, K};
 use crate::expr::*;
-use crate::hash::{HashMap, HashSet};
+use crate::hash::{key, HashMap, HashSet};
 use crate::inline::{last_refusal, match_call, Arg, Inlined, Up};
 use crate::passes;
 
@@ -254,7 +254,7 @@ struct Dec<'c, 'm> {
     /// The register and_or_value left its result in.
     joined_value: Option<usize>,
     /// Per pc: the helper inlined there, and its name.
-    inlined: RefCell<HashMap<i32, Option<(Rc<Inlined>, Rc<str>)>>>,
+    inlined: RefCell<Vec<Option<Option<(Rc<Inlined>, Rc<str>)>>>>,
     refusals: RefCell<Vec<(usize, String)>>,
     /// Dropped definitions still to come, next last.
     defs_left: Vec<(u32, usize)>,
@@ -462,7 +462,7 @@ impl<'c, 'm> Dec<'c, 'm> {
             flat_used: None,
             skip_to: None,
             joined_value: None,
-            inlined: RefCell::new(HashMap::default()),
+            inlined: RefCell::new(vec![None; p.lines.len()]),
             refusals: RefCell::new(Vec::new()),
             defs_left: Vec::new(),
             in_value: false,
@@ -729,8 +729,8 @@ impl<'c, 'm> Dec<'c, 'm> {
         self.trail.push(Undo::Fields(e.clone(), f.len()));
         for text in new {
             // kept after an undo too: at worst a value is written out early
-            let names = text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'));
-            x.field_names.extend(names.filter(|n| !n.is_empty()).map(String::from));
+            let names = text.as_bytes().split(|c| !is_ident_byte(*c));
+            x.field_names.extend(names.filter(|n| !n.is_empty()).map(key));
             f.push(text);
         }
     }
@@ -939,7 +939,7 @@ impl<'c, 'm> Dec<'c, 'm> {
             }
             helpers.retain(|h| h.0 != child);
             helpers.push((child, name.clone()));
-            self.inlined.borrow_mut().clear(); // asked too early, the answer was no
+            self.inlined.borrow_mut().fill(None); // asked too early, the answer was no
         }
         let waiting = self.waiting_on(r, &name);
         if !waiting.is_empty() && self.declared[k] {
@@ -1001,7 +1001,7 @@ impl<'c, 'm> Dec<'c, 'm> {
             return None;
         }
         let line = *self.p.lines.get(pc as usize)?;
-        if let Some(known) = self.inlined.borrow().get(&pc) {
+        if let Some(known) = &self.inlined.borrow()[pc as usize] {
             return known.clone();
         }
         let start = self.flow.idx(pc)?;
@@ -1065,7 +1065,7 @@ impl<'c, 'm> Dec<'c, 'm> {
                 }
             }
         }
-        self.inlined.borrow_mut().insert(pc, found.clone());
+        self.inlined.borrow_mut()[pc as usize] = Some(found.clone());
         found
     }
 
@@ -1179,10 +1179,11 @@ impl<'c, 'm> Dec<'c, 'm> {
 
     /// Registers whose waiting value reads `name`, which r is about to change.
     fn waiting_on(&self, r: usize, name: &str) -> Vec<usize> {
+        let word = key(name.as_bytes());
         let reads = |e: &E| {
             let x = e.borrow();
             if x.constructor {
-                return !x.method && x.field_names.contains(name);
+                return !x.method && x.field_names.contains(&word);
             }
             !x.method && contains_ident(&x.text, name)
         };
@@ -1928,7 +1929,10 @@ impl<'c, 'm> Dec<'c, 'm> {
                         None => break,
                     }
                 }
-                let (rd, wr, barrier) = effects(&ins, top.unwrap_or(self.p.maxstack));
+                let (rd, wr, barrier) = match top {
+                    Some(top) => effects(&ins, top),
+                    None => self.flow.effects[i],
+                };
                 if rd.has(r) && twice(&ins, r) {
                     break; // `x * x`: two reads in one instruction
                 }
@@ -2029,7 +2033,7 @@ impl<'c, 'm> Dec<'c, 'm> {
                 listed = true;
                 last = Some(ins.pc);
             } else {
-                let (rd, wr, barrier) = effects(&ins, self.p.maxstack);
+                let (rd, wr, barrier) = self.flow.effects[i];
                 let joined = self.has_label(ins.pc) && self.first_jump[ins.pc as usize] <= pc;
                 if rd.has(r) || wr.has(r) || (left == 0 && (barrier || joined)) {
                     break;
@@ -2082,7 +2086,7 @@ impl<'c, 'm> Dec<'c, 'm> {
             if is_forgprep(ins.op) && qa == r {
                 return true; // a loop's iterator: its header
             }
-            let (rd, wr, barrier) = effects(&ins, self.p.maxstack);
+            let (rd, wr, barrier) = self.flow.effects[i];
             if rd.has(r) {
                 return !twice(&ins, r) && (wr.has(r) || !self.live_after(q, r));
             }

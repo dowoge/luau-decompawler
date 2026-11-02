@@ -9,6 +9,14 @@ pub type HashSet<K> = std::collections::HashSet<K, BuildHasherDefault<Quick>>;
 
 const MIX: u64 = 0xf135_7aea_2e62_a9c5;
 
+/// A word as a number, for what only asks whether it has seen a word: no copy
+/// to make, no text to compare, and two words alike one time in 2^64.
+pub fn key(word: &[u8]) -> u64 {
+    let mut h = Quick::default();
+    h.write(word);
+    h.0
+}
+
 #[derive(Default, Clone, Copy)]
 pub struct Quick(u64);
 

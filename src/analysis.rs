@@ -6,8 +6,9 @@
 
 use crate::bytecode::{is_for, op, Insn, Proto};
 
-/// Registers are u8 operands, but `a + b` style ranges can run past 255.
-const WORDS: usize = 9;
+/// A function has at most 255 registers. What bad bytecode names past that,
+/// with a range running on from a high register, is dropped.
+const WORDS: usize = 4;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct RegSet(pub [u64; WORDS]);
@@ -200,6 +201,9 @@ pub struct Flow {
     pub web_span: Vec<(i32, i32, i32)>,
     pub live_in: Vec<RegSet>,
     pub live_out: Vec<RegSet>,
+    /// effects() of every instruction, the end of a list being the stack's.
+    /// The printer's look-aheads ask again and again, for the same few.
+    pub effects: Vec<(RegSet, RegSet, bool)>,
 }
 
 fn find(parent: &mut [u32], mut x: u32) -> u32 {
@@ -735,6 +739,7 @@ impl Flow {
             web_span,
             live_in,
             live_out,
+            effects: code.iter().map(|ins| effects(ins, p.maxstack)).collect(),
         }
     }
 

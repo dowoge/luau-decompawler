@@ -57,7 +57,7 @@ pub struct X {
     pub closure: Option<usize>,
     /// A table constructor; the names in its fields.
     pub constructor: bool,
-    pub field_names: HashSet<String>,
+    pub field_names: HashSet<u64>,
 }
 
 thread_local! {
@@ -134,7 +134,7 @@ fn is_ident_start(b: u8) -> bool {
     b.is_ascii_alphabetic() || b == b'_'
 }
 
-fn is_ident_byte(b: u8) -> bool {
+pub fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 

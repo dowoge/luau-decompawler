@@ -4,7 +4,9 @@
 //! The matchers are hand-written: each one states the pattern it implements,
 //! with the same greedy/anchored meaning the pattern would have.
 
-use crate::hash::{HashMap, HashSet};
+use std::sync::OnceLock;
+
+use crate::hash::{key, HashMap, HashSet};
 
 pub type CallMap = HashMap<String, Vec<Vec<String>>>;
 
@@ -12,27 +14,59 @@ pub type CallMap = HashMap<String, Vec<Vec<String>>>;
 
 #[inline]
 fn is_start(b: u8) -> bool {
-    b.is_ascii_alphabetic() || b == b'_'
+    WORD[b as usize] & 2 != 0
 }
 
 #[inline]
 fn is_word(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
+    WORD[b as usize] != 0
 }
+
+/// Per byte: 1 may be in a word, 2 may also start one.
+const WORD: [u8; 256] = {
+    let mut table = [0; 256];
+    let mut i = 0;
+    while i < 256 {
+        let c = i as u8;
+        if c.is_ascii_digit() {
+            table[i] = 1;
+        } else if c.is_ascii_alphabetic() || c == b'_' {
+            table[i] = 3;
+        }
+        i += 1;
+    }
+    table
+};
 
 fn is_space(c: char) -> bool {
     c.is_whitespace() || ('\x1c'..='\x1f').contains(&c)
 }
 
 /// `str.strip()`.
-#[inline]
 fn strip(s: &str) -> &str {
-    s.trim_matches(is_space)
+    // nearly always an indent and then plain characters at both ends
+    let start = s.as_bytes().iter().position(|c| *c != b' ').unwrap_or(s.len());
+    let rest = &s[start..];
+    match rest.as_bytes() {
+        [] => rest,
+        [first, .., last] if is_plain(*first) && is_plain(*last) => rest,
+        [only] if is_plain(*only) => rest,
+        _ => rest.trim_matches(is_space),
+    }
+}
+
+/// Is this byte a character that is not space of any kind?
+#[inline]
+fn is_plain(b: u8) -> bool {
+    (0x21..0x7f).contains(&b)
 }
 
 #[inline]
 fn rstrip(s: &str) -> &str {
-    s.trim_end_matches(is_space)
+    match s.as_bytes().last() {
+        Some(b) if is_plain(*b) => s,
+        _ => s.trim_end_matches(is_space),
+    }
 }
 
 #[inline]
@@ -113,7 +147,7 @@ fn find_from(hay: &[u8], needle: &[u8], start: usize) -> Option<usize> {
 fn alpha_len(s: &str, i: usize) -> usize {
     let b = s.as_bytes()[i];
     if b < 0x80 {
-        return (b.is_ascii_alphabetic() || b == b'_') as usize;
+        return usize::from(is_start(b));
     }
     if !s.is_char_boundary(i) {
         return 0;
@@ -130,7 +164,7 @@ fn alpha_len(s: &str, i: usize) -> usize {
 fn alnum_len(s: &str, i: usize) -> usize {
     let b = s.as_bytes()[i];
     if b < 0x80 {
-        return (b.is_ascii_alphanumeric() || b == b'_') as usize;
+        return usize::from(is_word(b));
     }
     if !s.is_char_boundary(i) {
         return 0;
@@ -187,6 +221,13 @@ fn for_each_word<'a>(s: &'a str, mut f: impl FnMut(&'a str) -> bool) {
         }
         i += 1;
     }
+}
+
+fn word_keys_into(set: &mut HashSet<u64>, line: &str) {
+    for_each_word(line, |w| {
+        set.insert(key(w.as_bytes()));
+        true
+    });
 }
 
 fn words_into(set: &mut HashSet<String>, line: &str) {
@@ -2936,13 +2977,36 @@ fn def_kind(s: &str, name: &str) -> Option<DefKind> {
     None
 }
 
+/// Per line: the next one with text that is indented less, where the block it
+/// sits in has ended; lines.len() if none is.
+fn less_indented(lines: &[String]) -> Vec<u32> {
+    let mut found = vec![lines.len() as u32; lines.len()];
+    // later lines nothing after them hides, least indented first
+    let mut open: Vec<(usize, u32)> = Vec::new();
+    for (i, l) in lines.iter().enumerate().rev() {
+        if is_blank(l) {
+            continue;
+        }
+        let ind = indent_of(l);
+        while open.last().is_some_and(|o| o.0 >= ind) {
+            open.pop();
+        }
+        if let Some(o) = open.last() {
+            found[i] = o.1;
+        }
+        open.push((ind, i as u32));
+    }
+    found
+}
+
 /// Generated names (v5_1, arg2_1) get natural ones where the value says what
 /// it is: one definition, and the name is free in the scope.
 fn rename_variables(lines: Vec<String>) -> Vec<String> {
     let mut out = lines;
     let mut funcs = functions(&out);
     funcs.sort_by_key(|f| f.0);
-    let mut index: Option<WordIndex> = None;
+    // renames leave indents alone, and these only ever narrow things down
+    let mut index: Option<(WordIndex, Vec<u32>)> = None;
     for (fi, fend, _) in &funcs {
         let fi = *fi;
         let lo = (fi + 1) as usize;
@@ -2980,11 +3044,11 @@ fn rename_variables(lines: Vec<String>) -> Vec<String> {
             continue;
         }
         own.sort();
-        let index = index.get_or_insert_with(|| WordIndex::new(&out));
+        let (index, block_ends) = index.get_or_insert_with(|| (WordIndex::new(&out), less_indented(&out)));
         // names in use anywhere in this function (and so unavailable)
-        let mut used: HashSet<String> = HashSet::default();
+        let mut used: HashSet<u64> = HashSet::default();
         for l in &out[(fi.max(0) as usize)..hi] {
-            words_into(&mut used, l);
+            word_keys_into(&mut used, l);
         }
         for name in &own {
             // a generated name is never the tail of a number, as `x10` can be
@@ -3050,14 +3114,7 @@ fn rename_variables(lines: Vec<String>) -> Vec<String> {
                 let d = *d;
                 if out[d].trim_start_matches(is_space).starts_with("local ") {
                     s_lo = d;
-                    s_hi = hi;
-                    let dind = indent_of(&out[d]);
-                    for k in d + 1..hi {
-                        if !is_blank(&out[k]) && indent_of(&out[k]) < dind {
-                            s_hi = k;
-                            break;
-                        }
-                    }
+                    s_hi = hi.min(block_ends[d] as usize);
                 }
             }
             if at.iter().any(|&j| (j < s_lo || s_hi <= j) && has_word(&out[j], name)) {
@@ -3072,7 +3129,7 @@ fn rename_variables(lines: Vec<String>) -> Vec<String> {
                         break;
                     }
                 }
-                if taken || ((s_lo, s_hi) == (lo, hi) && used.contains(&new)) {
+                if taken || ((s_lo, s_hi) == (lo, hi) && used.contains(&key(new.as_bytes()))) {
                     continue;
                 }
             }
@@ -3081,7 +3138,7 @@ fn rename_variables(lines: Vec<String>) -> Vec<String> {
                 replace_token(&mut out[*j as usize], name, &new);
             }
             index.add(&new, &hits);
-            used.insert(new);
+            used.insert(key(new.as_bytes()));
         }
     }
     out
@@ -3360,16 +3417,18 @@ const USAGE_TYPES: &[(&str, &[(&str, i32)])] = &[
 ];
 
 /// Which lines mention which word. A line listed for a word may no longer
-/// use it (renames leave entries behind) and the word may sit in a string, so
-/// this only narrows down the lines the exact matchers have to try.
+/// use it (renames leave entries behind), the word may sit in a string, and
+/// words are known by their key, so this only narrows down the lines the exact
+/// matchers have to try.
 struct WordIndex {
-    ids: HashMap<String, u32>,
+    ids: HashMap<u64, u32>,
     lines: Vec<Vec<u32>>,
 }
 
 impl WordIndex {
     fn new(lines: &[String]) -> WordIndex {
-        let mut index = WordIndex { ids: HashMap::default(), lines: Vec::new() };
+        let ids = HashMap::with_capacity_and_hasher(lines.len(), Default::default());
+        let mut index = WordIndex { ids, lines: Vec::with_capacity(lines.len()) };
         for (j, l) in lines.iter().enumerate() {
             let b = l.as_bytes();
             let mut i = 0;
@@ -3391,18 +3450,17 @@ impl WordIndex {
     }
 
     fn intern(&mut self, word: &str) -> usize {
-        if let Some(&id) = self.ids.get(word) {
-            return id as usize;
+        let next = self.lines.len() as u32;
+        let id = *self.ids.entry(key(word.as_bytes())).or_insert(next);
+        if id == next {
+            self.lines.push(Vec::new());
         }
-        let id = self.lines.len();
-        self.ids.insert(word.to_string(), id as u32);
-        self.lines.push(Vec::new());
-        id
+        id as usize
     }
 
     /// Lines in lo..hi that mention word, ascending.
     fn within(&self, word: &str, lo: usize, hi: usize) -> &[u32] {
-        match self.ids.get(word) {
+        match self.ids.get(&key(word.as_bytes())) {
             Some(&id) => {
                 let list = &self.lines[id as usize];
                 let a = list.partition_point(|j| (*j as usize) < lo);
@@ -3421,6 +3479,20 @@ impl WordIndex {
         list.sort_unstable();
         list.dedup();
     }
+}
+
+/// USAGE_TYPES the other way round: member -> (type, weight).
+fn usage_members() -> &'static HashMap<&'static str, Vec<(usize, i32)>> {
+    static TABLE: OnceLock<HashMap<&'static str, Vec<(usize, i32)>>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut table: HashMap<&'static str, Vec<(usize, i32)>> = HashMap::default();
+        for (k, (_, members)) in USAGE_TYPES.iter().enumerate() {
+            for (m, weight) in *members {
+                table.entry(m).or_default().push((k, *weight));
+            }
+        }
+        table
+    })
 }
 
 /// What a value is, from the members it is used with.
@@ -3458,9 +3530,15 @@ fn usage_name(name: &str, out: &[String], at: &[u32]) -> Option<String> {
             }
         }
     }
+    let members = usage_members();
+    let mut scores = [0; USAGE_TYPES.len()];
+    for m in &seen {
+        for (kind, weight) in members.get(*m).map_or(&[][..], |list| list) {
+            scores[*kind] += weight;
+        }
+    }
     let mut best: Option<(&str, i32)> = None;
-    for (kind, members) in USAGE_TYPES {
-        let s: i32 = members.iter().filter(|(m, _)| seen.contains(m)).map(|(_, w)| *w).sum();
+    for ((kind, _), s) in USAGE_TYPES.iter().zip(scores) {
         if s != 0 && best.is_none_or(|b| s > b.1) {
             best = Some((kind, s));
         }
@@ -3650,16 +3728,18 @@ fn stored_field<'a>(line: &'a str, tail: &str) -> Option<&'a str> {
 }
 
 /// `[{,] (IDENT) = NAME[,}]` searched in the line.
-fn stored_in_table<'a>(line: &'a str, tail: &str) -> Option<&'a str> {
+fn stored_in_table<'a>(line: &'a str, name: &str) -> Option<&'a str> {
     let b = line.as_bytes();
-    let n = tail.as_bytes();
+    let n = name.as_bytes();
     let mut i = 0;
-    while let Some(p) = find_from(b, n, i) {
-        i = p + 1;
-        let e = p + n.len();
-        if e >= b.len() || (b[e] != b',' && b[e] != b'}') {
+    // from the name: a space would stop this at every word
+    while let Some(at) = find_from(b, n, i) {
+        i = at + 1;
+        let e = at + n.len();
+        if at < 3 || &b[at - 3..at] != b" = " || e >= b.len() || (b[e] != b',' && b[e] != b'}') {
             continue;
         }
+        let p = at - 3;
         let mut k = p;
         while k > 0 && is_word(b[k - 1]) {
             k -= 1;
@@ -3816,11 +3896,20 @@ pub fn defined_keys(lines: &[String]) -> Vec<String> {
 ///   * returned at the end of `GetFoo` -> foo
 ///   * used like a known Roblox type (`x.Character`, `x.UserId`) -> player
 /// Parameters take part too, and are named from their call sites first.
-/// Also says whether anything was renamed.
-pub fn more_names(lines: Vec<String>, extra: &Extra) -> (Vec<String>, bool) {
+pub fn more_names(lines: Vec<String>, extra: &Extra) -> Vec<String> {
     let mut out = lines;
+    let mut index = WordIndex::new(&out);
+    // the same pass over the same text would find nothing new
+    if name_pass(&mut out, &mut index, extra) {
+        name_pass(&mut out, &mut index, extra);
+    }
+    out
+}
+
+/// One look at every function. Says whether anything was renamed.
+fn name_pass(out: &mut Vec<String>, index: &mut WordIndex, extra: &Extra) -> bool {
     let mut renamed = false;
-    let mut funcs = functions(&out);
+    let mut funcs = functions(out);
     funcs.sort_by_key(|f| f.0);
     // the module's own table: `self` passed around in its methods is one
     let mut module: Option<String> = None;
@@ -3846,8 +3935,7 @@ pub fn more_names(lines: Vec<String>, extra: &Extra) -> (Vec<String>, bool) {
         }
     }
     let mut calls = CallMap::default();
-    collect_calls(&out, &mut calls, &asked);
-    let mut index = WordIndex::new(&out);
+    collect_calls(out, &mut calls, &asked);
     let no_sites: Vec<Vec<String>> = Vec::new();
     for (fi, fend, params) in &funcs {
         let fi = *fi;
@@ -3975,7 +4063,7 @@ pub fn more_names(lines: Vec<String>, extra: &Extra) -> (Vec<String>, bool) {
                 let tail = format!(" = {name}");
                 for j in at {
                     let l = &out[*j as usize];
-                    let m = stored_field(l, &tail).or_else(|| stored_in_table(l, &tail));
+                    let m = stored_field(l, &tail).or_else(|| stored_in_table(l, name));
                     if let (Some(f), true) = (m, defs.len() <= 1) {
                         new = Some(if !first_upper(f) || str_isupper(f) {
                             f.to_string()
@@ -4023,7 +4111,7 @@ pub fn more_names(lines: Vec<String>, extra: &Extra) -> (Vec<String>, bool) {
             touched.push(new.clone());
         }
     }
-    (out, renamed)
+    renamed
 }
 
 /// A blank line between top-level statements and function definitions.
@@ -4135,19 +4223,7 @@ fn reindent(lines: Vec<String>) -> Vec<String> {
         let w = code_words(s);
         let mut opens = (w.function + w.repeat) as i64;
         let closes = (w.end + w.until) as i64;
-        let first = s
-            .split(' ')
-            .next()
-            .unwrap()
-            .split('(')
-            .next()
-            .unwrap()
-            .split(',')
-            .next()
-            .unwrap()
-            .split(')')
-            .next()
-            .unwrap();
+        let first = s.bytes().position(|c| matches!(c, b' ' | b'(' | b',' | b')')).map_or(s, |e| &s[..e]);
         if first == "if" {
             opens += 1; // a statement if always has an `end`, wherever `then` is
         }

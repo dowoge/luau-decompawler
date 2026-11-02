@@ -47,7 +47,17 @@ const STACK: usize = 1 << 30;
 /// Everything up to the point where other scripts' call sites matter.
 fn decompile_core(m: &Module, path: Option<&str>, noflat: bool) -> Vec<String> {
     let body = decomp::decompile_lines(m, noflat);
-    let split: Vec<String> = body.join("\n").split('\n').map(String::from).collect();
+    let mut split = Vec::with_capacity(body.len());
+    for line in body {
+        if line.contains('\n') {
+            split.extend(line.split('\n').map(String::from));
+        } else {
+            split.push(line);
+        }
+    }
+    if split.is_empty() {
+        split.push(String::new());
+    }
     let lines = passes::if_expressions(split);
     let lines = passes::uninline(lines);
     let lines = passes::module_table(lines, path);
@@ -56,10 +66,7 @@ fn decompile_core(m: &Module, path: Option<&str>, noflat: bool) -> Vec<String> {
 
 /// The naming rounds that can use other scripts' call sites.
 fn name_round(lines: Vec<String>, extra: &Extra) -> Vec<String> {
-    let (lines, renamed) = passes::more_names(lines, extra);
-    // the same pass over the same text would find nothing new
-    let lines = if renamed { passes::more_names(lines, extra).0 } else { lines };
-    passes::blank_lines(lines)
+    passes::blank_lines(passes::more_names(lines, extra))
 }
 
 fn to_text(lines: &[String]) -> String {
@@ -104,14 +111,16 @@ fn par_map<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
 }
 
 /// Writing a file costs several times what reading it does, and most of what
-/// a repeat run produces is already there.
+/// a repeat run produces is already there. The length goes first: the first
+/// read of a new file can cost far more than writing it, with a virus scanner
+/// looking on, and asking its length does not.
 fn write_text(path: &Path, head: &str, text: &str) -> std::io::Result<()> {
-    if let Ok(old) = fs::read(path) {
-        let same = old.len() == head.len() + text.len()
-            && old.starts_with(head.as_bytes())
-            && old.ends_with(text.as_bytes());
-        if same {
-            return Ok(());
+    let long = (head.len() + text.len()) as u64;
+    if fs::metadata(path).is_ok_and(|m| m.len() == long) {
+        if let Ok(old) = fs::read(path) {
+            if old.starts_with(head.as_bytes()) && old.ends_with(text.as_bytes()) {
+                return Ok(());
+            }
         }
     }
     let mut f = fs::File::create(path)?;
