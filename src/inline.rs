@@ -789,6 +789,10 @@ fn match_once(m: &Module, caller: &Proto, id: usize, start: usize, assumed: &[Op
         }
         if dead_jump.is_some_and(|(at, _)| at == p.pc) {
             dead_until = dead_jump.take().map(|(_, to)| to);
+            // a jump to it goes on where the copy does
+            if let Some(c) = code.get(i) {
+                landing.entry(p.pc).or_insert(c.pc);
+            }
             continue;
         }
         // a test of a constant argument: no code in the copy, one way taken.
@@ -806,6 +810,10 @@ fn match_once(m: &Module, caller: &Proto, id: usize, start: usize, assumed: &[Op
                 return refuse("a test of a parameter not known yet");
             }
             if let Some(jumps) = jumps {
+                // a jump to the test lands where the copy goes on
+                if let Some(c) = code.get(i) {
+                    landing.entry(p.pc).or_insert(c.pc);
+                }
                 let target = p.jump_target()?;
                 if jumps {
                     dead_until = Some(target);
@@ -928,7 +936,9 @@ fn match_once(m: &Module, caller: &Proto, id: usize, start: usize, assumed: &[Op
                         walk.upvalue(u, Up::Reg(c.b()))?;
                         walk.map[p.a()] = Some(c.b());
                     }
-                    let value = (*walk.map.get(p.a())?)?;
+                    let Some(value) = walk.map.get(p.a()).copied().flatten() else {
+                        return refuse("returns a value the copy never made");
+                    };
                     let inside = walk.written.contains(&value);
                     let leaves = code.get(skip(code, i + 1)).is_some_and(|e| matches!(plain(e.op), op::JUMP | op::RETURN));
                     let moved = c.op == op::MOVE && c.b() == value;
@@ -942,8 +952,11 @@ fn match_once(m: &Module, caller: &Proto, id: usize, start: usize, assumed: &[Op
                     } else {
                         return refuse("returns a local with no store");
                     };
-                    if unused || result.is_some_and(|r| r != stored) {
-                        return None;
+                    if unused {
+                        return refuse("a value is used and not used");
+                    }
+                    if result.is_some_and(|r| r != stored) {
+                        return refuse("returns into two places");
                     }
                     result = Some(stored);
                 }
@@ -1053,7 +1066,9 @@ fn match_once(m: &Module, caller: &Proto, id: usize, start: usize, assumed: &[Op
     };
     // the jumps went where the helper's did
     for (p, c) in &walk.jumps {
-        let here = *landing.get(&land(&helper.code, *p))?;
+        let Some(&here) = landing.get(&land(&helper.code, *p)) else {
+            return refuse("a jump lands where the copy has nothing");
+        };
         let there = land(code, *c);
         // `local r = false; if x then r = f() end; return r`: where the jump
         // starts, r is already in the result
