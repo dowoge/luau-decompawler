@@ -2027,19 +2027,25 @@ pub fn if_expressions(lines: Vec<String>) -> Vec<String> {
 
 // ---------------------------------------------------------------- uninlining
 
-/// (name, params, first body line, end line) of each `local NAME = function`.
+/// (name, params, first body line, end line) of each `local NAME = function`
+/// and `local function NAME`.
 fn function_bodies(lines: &[String]) -> Vec<(String, Vec<String>, usize, usize)> {
     let mut found = Vec::new();
     for (i, line) in lines.iter().enumerate() {
-        // ^( *)local (IDENT) = function\(([^)]*)\)$
+        // ^( *)local (function )?(IDENT)( = function)?\(([^)]*)\)$
         let ind = indent_of(line);
         let Some(r) = line[ind..].strip_prefix("local ") else { continue };
+        let (r, statement) = match r.strip_prefix("function ") {
+            Some(x) => (x, true),
+            None => (r, false),
+        };
         let b = r.as_bytes();
         if b.is_empty() || !is_start(b[0]) {
             continue;
         }
         let e = word_end(b, 0);
-        let Some(rest) = r[e..].strip_prefix(" = function(") else { continue };
+        let opener = if statement { "(" } else { " = function(" };
+        let Some(rest) = r[e..].strip_prefix(opener) else { continue };
         let Some(params) = rest.strip_suffix(')') else { continue };
         if params.contains(')') {
             continue;
@@ -2833,65 +2839,70 @@ fn interpolation(lines: Vec<String>) -> Vec<String> {
     out
 }
 
-/// `local f = function(...)` -> `local function f(...)`, and
-/// `T.k = function(self, ...)` -> `function T:k(...)` when the first
-/// parameter is used as an object.
+/// `function T.k(self, ...)` -> `function T:k(...)`: when the first parameter
+/// is used as an object, or carries no name and the script calls `:k(` and
+/// never `.k(`; not when it calls `.k(` and never `:k(`. (Which functions
+/// were written as statements the emitter decided, from their names.)
 fn local_functions(lines: Vec<String>) -> Vec<String> {
     let mut out = lines;
+    // how the script calls each key: `.k(` and `:k(` outside definitions
+    let mut dot_calls: HashSet<String> = HashSet::default();
+    let mut colon_calls: HashSet<String> = HashSet::default();
+    for l in &out {
+        if l.contains("function") {
+            continue;
+        }
+        let b = l.as_bytes();
+        for (p, ch) in l.char_indices() {
+            if ch != '.' && ch != ':' {
+                continue;
+            }
+            let e = word_end(b, p + 1);
+            if e > p + 1 && is_start(b[p + 1]) && b.get(e) == Some(&b'(') && (p == 0 || b[p - 1] != b'.') {
+                let key = l[p + 1..e].to_string();
+                if ch == '.' {
+                    dot_calls.insert(key);
+                } else {
+                    colon_calls.insert(key);
+                }
+            }
+        }
+    }
     for i in 0..out.len() {
         let ind = indent_of(&out[i]);
-        let new;
-        {
+        let (hdr, first, end) = {
             let line = &out[i];
             let pad = &line[..ind];
             let s = &line[ind..];
             if s.contains('\n') {
                 continue;
             }
-            // ^( *)local (TOKEN) = function\((.*)\)$
-            let local = s.strip_prefix("local ").and_then(|r| {
-                let b = r.as_bytes();
-                if b.is_empty() || !is_start(b[0]) {
-                    return None;
-                }
-                let e = word_end(b, 0);
-                let p = r[e..].strip_prefix(" = function(")?.strip_suffix(')')?;
-                Some((&r[..e], p))
-            });
-            if let Some((name, params)) = local {
-                new = format!("{pad}local function {name}({params})");
-            } else {
-                // ^( *)(TOKEN(\.TOKEN)*)\.(TOKEN) = function\((.*)\)$
-                let b = s.as_bytes();
-                let Some(e) = ident_chain_end(b, 0) else { continue };
-                let Some(params) =
-                    s[e..].strip_prefix(" = function(").and_then(|r| r.strip_suffix(')'))
-                else {
-                    continue;
-                };
-                let Some(dot) = s[..e].rfind('.') else { continue };
-                let (obj, key) = (&s[..dot], &s[dot + 1..e]);
-                let plist = split_params(params);
-                let end = block_end(&out, i);
-                let body = &out[i + 1..end.max(i + 1)];
-                let first = plist.first().map(|x| x.as_str()).unwrap_or("");
-                let used_as_obj = !first.is_empty()
-                    && is_generated(first)
-                    && body.iter().any(|l| used_as_object(l, first));
-                let taken = body.iter().any(|l| has_word(l, "self"));
-                if used_as_obj && !taken {
-                    let hdr = format!("{pad}function {obj}:{key}({})", plist[1..].join(", "));
-                    let first = first.to_string();
-                    for l in out[i + 1..end.max(i + 1)].iter_mut() {
-                        replace_token(l, &first, "self");
-                    }
-                    out[i] = hdr;
-                    continue;
-                }
-                new = format!("{pad}function {obj}.{key}({params})");
+            // ^( *)function (TOKEN(\.TOKEN)*)\.(TOKEN)\((.*)\)$
+            let Some(r) = s.strip_prefix("function ") else { continue };
+            let Some(e) = ident_chain_end(r.as_bytes(), 0) else { continue };
+            let Some(params) = r[e..].strip_prefix('(').and_then(|x| x.strip_suffix(')')) else { continue };
+            let Some(dot) = r[..e].rfind('.') else { continue };
+            let (obj, key) = (&r[..dot], &r[dot + 1..e]);
+            let plist = split_params(params);
+            let end = block_end(&out, i);
+            let body = &out[i + 1..end.max(i + 1)];
+            let Some(first) = plist.first() else { continue };
+            let free = is_generated(first) || first == "_";
+            let used_as_obj = is_generated(first) && body.iter().any(|l| used_as_object(l, first));
+            let taken = body.iter().any(|l| has_word(l, "self"));
+            let called_plainly = dot_calls.contains(key) && !colon_calls.contains(key);
+            let called_as_method = colon_calls.contains(key) && !dot_calls.contains(key);
+            if taken || called_plainly || !(used_as_obj || (free && called_as_method)) {
+                continue;
+            }
+            (format!("{pad}function {obj}:{key}({})", plist[1..].join(", ")), first.clone(), end)
+        };
+        if first != "_" {
+            for l in out[i + 1..end.max(i + 1)].iter_mut() {
+                replace_token(l, &first, "self");
             }
         }
-        out[i] = new;
+        out[i] = hdr;
     }
     out
 }

@@ -1250,8 +1250,25 @@ impl<'c, 'm> Dec<'c, 'm> {
             self.hoist(name);
         } else {
             self.declare(key);
-            out.push(format!("{pad}local {name} = {}", x.text));
+            match self.definition_rest(&x, None) {
+                Some(rest) => out.push(format!("{pad}local function {name}{rest}")),
+                None => out.push(format!("{pad}local {name} = {}", x.text)),
+            }
         }
+    }
+
+    /// What follows `function` in a definition statement for a closure value,
+    /// when the source wrote one: the compiler names a function only for
+    /// `function f()`, `local function f()`, `function t.k()` (and a
+    /// constructor's `k = function`), never for `f = function()` or `local f =
+    /// function()`. `want`: the name the target has to match.
+    fn definition_rest(&self, x: &X, want: Option<&str>) -> Option<String> {
+        let child = x.closure?;
+        let name = self.m.protos[child].name.as_deref().filter(|n| !n.is_empty())?;
+        if want.is_some_and(|w| w != name) {
+            return None;
+        }
+        x.text.strip_prefix("function(").map(|r| format!("({r}"))
     }
 
     /// Is the variable `key` written first and then all used inside the block
@@ -4923,7 +4940,11 @@ impl<'c, 'm> Dec<'c, 'm> {
                 self.flush(out, ind, &[a]);
                 let v = self.get(a);
                 let name = kstr(m, p, aux as usize).unwrap_or("None");
-                out.push(format!("{pad}{name} = {}", v.borrow().text));
+                let rest = self.definition_rest(&v.borrow(), Some(name));
+                match rest {
+                    Some(rest) => out.push(format!("{pad}function {name}{rest}")),
+                    None => out.push(format!("{pad}{name} = {}", v.borrow().text)),
+                }
             }
             op::GETUPVAL => {
                 let t = self.upval(b);
@@ -5013,8 +5034,19 @@ impl<'c, 'm> Dec<'c, 'm> {
                     let val = self.get(a);
                     let obj = self.get(b);
                     self.flush(out, ind, &[]);
-                    let k = index_suffix(kstr_or(m, p, aux as usize, "?"));
-                    out.push(format!("{pad}{}{k} = {}", wrap(&obj, 100), val.borrow().text));
+                    let key = kstr_or(m, p, aux as usize, "?");
+                    let k = index_suffix(key);
+                    let target = wrap(&obj, 100);
+                    // `function t.k()` needs a name chain before the key
+                    let chain = target.split('.').all(|w| {
+                        w.as_bytes().first().is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_')
+                            && w.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+                    });
+                    let rest = self.definition_rest(&val.borrow(), Some(key)).filter(|_| chain && k.starts_with('.'));
+                    match rest {
+                        Some(rest) => out.push(format!("{pad}function {target}{k}{rest}")),
+                        None => out.push(format!("{pad}{target}{k} = {}", val.borrow().text)),
+                    }
                 }
             }
             op::GETTABLEN => {
