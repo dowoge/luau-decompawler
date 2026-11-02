@@ -1349,16 +1349,27 @@ fn copy_unless_guards(lines: &mut Vec<String>) {
 }
 
 fn copy_unless(lines: &mut Vec<String>, decl: usize, flag: &str) -> bool {
-    let d = indent_of(&lines[decl]);
     let set = format!("{flag} = true");
-    // the `if` right after the declaration, the check right after it
-    let Some(first) = (decl + 1..lines.len()).find(|&i| !is_blank(&lines[i])) else { return false };
-    if indent_of(&lines[first]) != d || !strip(&lines[first]).starts_with("if ") || !strip(&lines[first]).ends_with(" then") {
+    // the check, and the `if` right before it
+    let check = format!("if not {flag} then");
+    let Some(c) = (decl + 1..lines.len()).find(|&i| strip(&lines[i]) == check) else { return false };
+    let d = indent_of(&lines[c]);
+    let Some(chain_end) = (decl + 1..c).rev().find(|&i| !is_blank(&lines[i])) else { return false };
+    if indent_of(&lines[chain_end]) != d || strip(&lines[chain_end]) != "end" {
         return false;
     }
-    let Some(chain_end) = if_end(lines, first) else { return false };
-    let Some(c) = (chain_end + 1..lines.len()).find(|&i| !is_blank(&lines[i])) else { return false };
-    if indent_of(&lines[c]) != d || strip(&lines[c]) != format!("if not {flag} then") {
+    let Some(first) = (decl + 1..chain_end).rev().find(|&i| {
+        indent_of(&lines[i]) == d && !is_blank(&lines[i]) && !is_arm(strip(&lines[i]))
+    }) else {
+        return false;
+    };
+    if !strip(&lines[first]).starts_with("if ") || !strip(&lines[first]).ends_with(" then") || if_end(lines, first) != Some(chain_end) {
+        return false;
+    }
+    // declared further out: still false where the `if` starts, with no loop
+    // or function begun in between
+    let between = &lines[decl + 1..first];
+    if between.iter().any(|l| loop_open(l) || strip(l).contains("function")) {
         return false;
     }
     let mut e = c + 1;
@@ -1394,7 +1405,8 @@ fn copy_unless(lines: &mut Vec<String>, decl: usize, flag: &str) -> bool {
     if sets == 0 || copies == 0 || copies * body.len() > 32 {
         return false;
     }
-    lines.splice(decl..=e, new);
+    lines.splice(first..=e, new);
+    lines.remove(decl);
     true
 }
 
@@ -1554,22 +1566,16 @@ fn copy_guard(lines: &mut Vec<String>, decl: usize, flag: &str) -> bool {
         return false;
     }
     let body: Vec<String> = lines[c + 1..e].iter().filter(|l| !is_blank(l)).cloned().collect();
-    let plain = |l: &String| {
+    // a few lines, blocks allowed (each copy keeps its shape)
+    let fits = |l: &String| {
         let t = strip(l);
-        indent_of(l) == d + 4
-            && !t.ends_with(" then")
-            && !t.ends_with(" do")
-            && t != "repeat"
-            && !t.starts_with("local ")
-            && !t.starts_with("::")
-            && !t.contains("function")
-            && !has_any_goto(t)
+        indent_of(l) >= d + 4 && !t.starts_with("::") && !t.contains("function") && !has_any_goto(t)
     };
-    if body.is_empty() || body.len() > 2 || !body.iter().all(plain) {
+    if body.is_empty() || body.len() > 6 || !body.iter().all(fits) {
         return false;
     }
     let sets: Vec<usize> = uses.iter().copied().filter(|&i| strip(&lines[i]) == set).collect();
-    if sets.is_empty() || sets.iter().any(|&i| i < decl || i > c) || body.len() * sets.len() > 6 {
+    if sets.is_empty() || sets.iter().any(|&i| i < decl || i > c) || body.len() * sets.len() > 12 {
         return false;
     }
     // the copies read nothing the code between declares for itself
@@ -1599,8 +1605,8 @@ fn copy_guard(lines: &mut Vec<String>, decl: usize, flag: &str) -> bool {
     }
     lines.drain(c..=e);
     for &i in sets.iter().rev() {
-        let pad = spaces(indent_of(&lines[i]));
-        lines.splice(i..=i, body.iter().map(|l| format!("{pad}{}", strip(l))));
+        let at = indent_of(&lines[i]);
+        lines.splice(i..=i, body.iter().map(|l| format!("{}{}", spaces(at + indent_of(l) - (d + 4)), strip(l))));
     }
     lines.remove(decl);
     true
