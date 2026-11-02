@@ -340,6 +340,41 @@ fn is_generated_v(s: &str, allow_x: bool) -> bool {
     i == b.len()
 }
 
+/// A call, as a statement can be one: a name, then what follows it with no
+/// space outside brackets and strings, ending in `)` (`a.b:c(x, y)`,
+/// `t[k](x)`; not `f(x) + 1`, `not f(x)`, `if c then f() else g()`).
+fn is_call_text(text: &str) -> bool {
+    let b = text.as_bytes();
+    if !b.first().is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_') || b.last() != Some(&b')') {
+        return false;
+    }
+    if text.starts_with("function") || text.starts_with("not(") {
+        return false;
+    }
+    let (mut depth, mut quote) = (0i32, 0u8);
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if quote != 0 {
+            if c == b'\\' {
+                i += 1;
+            } else if c == quote {
+                quote = 0;
+            }
+        } else if matches!(c, b'"' | b'\'' | b'`') {
+            quote = c;
+        } else if matches!(c, b'(' | b'[' | b'{') {
+            depth += 1;
+        } else if matches!(c, b')' | b']' | b'}') {
+            depth -= 1;
+        } else if depth == 0 && c == b' ' {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
 /// `(?<![A-Za-z0-9_.:])name(?![A-Za-z0-9_])`
 fn contains_ident(text: &str, name: &str) -> bool {
     let t = text.as_bytes();
@@ -1850,14 +1885,11 @@ impl<'c, 'm> Dec<'c, 'm> {
             // the old value was never read: it was a statement in its own right
             let x = old.borrow();
             let has_call = x.fields.as_ref().is_some_and(|f| f.iter().any(|t| t.contains('(')));
-            if x.text.ends_with(')')
-                && !x.text.starts_with("function")
-                && !x.text.starts_with('(')
-                && x.text.contains('(')
-            {
+            if is_call_text(&x.text) {
                 out.push(format!("{}{}", sp(ind), x.text));
-            } else if has_call {
-                // a table nothing reads, built with calls: those still happen
+            } else if has_call || (x.fields.is_none() && x.text.contains('(') && !x.text.starts_with("function")) {
+                // a table nothing reads, built with calls, or another value
+                // with calls in it: those still happen
                 drop(x);
                 self.seal(&old);
                 self.assign(out, ind, r, &old);
@@ -2520,10 +2552,12 @@ impl<'c, 'm> Dec<'c, 'm> {
         self.flow.def_web(write.pc, r)
     }
 
-    /// Did the code just walked leave another value someone needs at the join?
-    /// One expression cannot say `a, b = x, y`.
+    /// Did the code just walked leave another value someone needs at the join,
+    /// or one nobody reads that still has to happen? One expression cannot
+    /// say `a, b = x, y`, and an operand carries no statement: left waiting,
+    /// the value would run later, whether or not its branch did.
     fn second_value(&self, waiting: &[usize], join: i32) -> bool {
-        self.pending.keys().any(|r| !waiting.contains(r) && self.live_at(join, *r))
+        self.pending.iter().any(|(r, e)| !waiting.contains(r) && (self.live_at(join, *r) || !e.borrow().pure_))
     }
 
     /// Is the read at `read` on a later source line than the write at `write`?
