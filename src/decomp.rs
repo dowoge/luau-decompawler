@@ -1419,6 +1419,14 @@ impl<'c, 'm> Dec<'c, 'm> {
         }
     }
 
+    /// The first read of r in [from, to) that a variable reaches: one in a
+    /// branch the compiler folded away has none.
+    fn known_read(&self, from: i32, to: i32, r: usize) -> Option<i32> {
+        let code = &self.p.code;
+        let start = code.partition_point(|i| i.pc < from);
+        code[start..].iter().take_while(|i| i.pc < to).map(|i| i.pc).find(|pc| self.flow.use_web(*pc, r).is_some())
+    }
+
     /// Put the call back where a helper's code was copied in. The pc after it.
     fn helper_call(&mut self, out: &mut Vec<String>, ind: usize, pc: i32) -> Option<i32> {
         let (call, name) = self.inline_at(pc)?;
@@ -1434,7 +1442,8 @@ impl<'c, 'm> Dec<'c, 'm> {
             args.push(match arg {
                 Some(Arg::Reg(r, read)) => {
                     self.declare_named(out, ind, *r);
-                    let old = self.key_pc.replace(*read);
+                    let at = if self.flow.use_web(*read, *r).is_some() { *read } else { self.known_read(pc, call.end, *r).unwrap_or(*read) };
+                    let old = self.key_pc.replace(at);
                     let v = self.get(*r);
                     self.key_pc = old;
                     let text = v.borrow().text.clone();
@@ -2406,8 +2415,9 @@ impl<'c, 'm> Dec<'c, 'm> {
             let s = self.mark();
             let waiting: Vec<usize> = self.pending.keys().copied().collect();
             let first = self.get(a);
+            let effects = self.impure_waiting();
             if let Some(rest) = self.value_of(nxt, target, a, ind, end) {
-                if !self.second_value(&waiting, target) {
+                if !self.second_value(&waiting, target) && !self.ran_inside(&effects) {
                     let op_ = if ins.op == op::JUMPIF { Logic::Or } else { Logic::And };
                     let e = mk_logic(op_, &first, &rest);
                     self.value_done(a, e, pc, target);
@@ -2433,6 +2443,7 @@ impl<'c, 'm> Dec<'c, 'm> {
         let s = self.mark();
         let (cond, _) = self.cond_expr(pc);
         let waiting: Vec<usize> = self.pending.keys().copied().collect();
+        let effects = self.impure_waiting();
         let enter = negate(&cond); // the branch [nxt, last) runs when this holds
         // JUMP form: both branches compute it in one register, with their
         // temporaries above it, so it is the lowest register both write
@@ -2483,7 +2494,7 @@ impl<'c, 'm> Dec<'c, 'm> {
             self.rollback(s);
             return None;
         };
-        if self.second_value(&waiting, join) {
+        if self.second_value(&waiting, join) || self.ran_inside(&effects) {
             self.rollback(s);
             return None;
         }
@@ -2550,6 +2561,18 @@ impl<'c, 'm> Dec<'c, 'm> {
             .filter(|i| full_effects(i, self.p.maxstack).1.has(r))
             .last()?;
         self.flow.def_web(write.pc, r)
+    }
+
+    /// The values waiting now that have effects (a call, a field read).
+    fn impure_waiting(&self) -> Vec<(usize, E)> {
+        self.pending.iter().filter(|(_, e)| !e.borrow().pure_).map(|(r, e)| (*r, e.clone())).collect()
+    }
+
+    /// Did a branch just walked take one of these in? Written in its arm, the
+    /// value would run only when that arm does, and after the test; it ran
+    /// first, either way.
+    fn ran_inside(&self, effects: &[(usize, E)]) -> bool {
+        effects.iter().any(|(r, e)| !self.pending.get(r).is_some_and(|now| Rc::ptr_eq(now, e)))
     }
 
     /// Did the code just walked leave another value someone needs at the join,
