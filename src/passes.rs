@@ -1907,6 +1907,7 @@ fn balanced_all(s: &str) -> bool {
     depth == 0 && quote == 0
 }
 
+#[derive(PartialEq)]
 enum Tok {
     Lit(String),
     Hole(usize),
@@ -2024,7 +2025,151 @@ fn is_assignment_tail(s: &str) -> bool {
 
 /// Luau inlines small local functions at -O2. Where the body of such a helper
 /// appears verbatim with its parameters filled in, put the call back.
+/// The helpers each line may call again: `--@copies NAME...` opens a
+/// function's body with those whose code line info shows there. A function
+/// without one has none, whatever is around it. (regions, region of each line)
+fn copies_by_line(lines: &[String]) -> (Vec<Vec<String>>, Vec<usize>) {
+    let mut regions: Vec<Vec<String>> = vec![Vec::new()];
+    let mut open: Vec<(usize, usize)> = Vec::new(); // (header indent, region)
+    let mut at = Vec::with_capacity(lines.len());
+    for line in lines {
+        if !is_blank(line) {
+            let ind = indent_of(line);
+            while open.last().is_some_and(|o| ind <= o.0) {
+                open.pop();
+            }
+            if let Some(names) = line.trim_start().strip_prefix("--@copies ") {
+                let here = open.last().map_or(0, |o| o.1);
+                regions[here] = names.split(' ').filter(|n| !n.is_empty()).map(String::from).collect();
+            }
+        }
+        at.push(open.last().map_or(0, |o| o.1));
+        if func_open(line).is_some() && !line.trim_end().ends_with("end") {
+            regions.push(Vec::new());
+            open.push((indent_of(line), regions.len() - 1));
+        }
+    }
+    (regions, at)
+}
+
+/// Text outside string literals.
+fn code_only(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut quote = None;
+    let mut esc = false;
+    for c in text.chars() {
+        match quote {
+            Some(q) => {
+                if esc {
+                    esc = false;
+                } else if c == '\\' {
+                    esc = true;
+                } else if c == q {
+                    quote = None;
+                }
+            }
+            None if c == '"' || c == '\'' || c == '`' => {
+                quote = Some(c);
+                out.push(' ');
+            }
+            None => out.push(c),
+        }
+    }
+    out
+}
+
+/// Does this text call anything? `Vector3.new(0, 1, 0)` with numbers only is
+/// how a vector constant prints, and no call.
+fn has_call(text: &str) -> bool {
+    let code = code_only(text);
+    let b = code.as_bytes();
+    (0..b.len()).any(|i| {
+        let call = b[i] == b'(' && i > 0 && (is_word(b[i - 1]) || b[i - 1] == b')' || b[i - 1] == b']');
+        if !call || !code[..i].ends_with("Vector3.new") {
+            return call;
+        }
+        let args = code[i + 1..].split(')').next().unwrap_or("");
+        !args.bytes().all(|c| c.is_ascii_digit() || b" ,.-+eE".contains(&c))
+    })
+}
+
+/// Is what follows evaluated only sometimes?
+fn branches(text: &str) -> bool {
+    let code = code_only(text);
+    let b = code.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if is_start(b[i]) && (i == 0 || !is_word(b[i - 1])) {
+            let e = word_end(b, i);
+            if matches!(&code[i..e], "and" | "or" | "if" | "then" | "else" | "elseif") {
+                return true;
+            }
+            i = e;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+/// Does this text read anything a call could change: a name that is no
+/// keyword, a field, an index?
+fn reads_state(text: &str) -> bool {
+    let code = code_only(text);
+    let b = code.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if is_start(b[i]) && (i == 0 || !is_word(b[i - 1])) {
+            let e = word_end(b, i);
+            if !matches!(&code[i..e], "and" | "or" | "not" | "nil" | "true" | "false" | "if" | "then" | "else" | "elseif") {
+                return true;
+            }
+            i = e;
+        } else {
+            i += 1;
+        }
+    }
+    false
+}
+
+/// A call evaluates its arguments, in order, before the body runs; the copy
+/// evaluated each where the body reads it. That only tells apart when an
+/// argument calls something: then it must be read once, on every path, after
+/// nothing the call could change, with the arguments in their order.
+fn order_safe(toks: &[Tok], caps: &[String]) -> bool {
+    let effects: Vec<bool> = caps.iter().map(|c| has_call(c)).collect();
+    if !effects.contains(&true) {
+        return true;
+    }
+    let mut seen: Vec<usize> = Vec::new();
+    let (mut read, mut sometimes) = (false, false);
+    for tok in toks {
+        match tok {
+            Tok::Lit(t) => {
+                read |= reads_state(t);
+                sometimes |= branches(t);
+            }
+            Tok::Hole(h) => {
+                let first = !seen.contains(h);
+                if effects[*h] && (!first || read || sometimes) {
+                    return false;
+                }
+                if first {
+                    if seen.last().is_some_and(|l| l > h) {
+                        return false;
+                    }
+                    seen.push(*h);
+                }
+            }
+        }
+    }
+    true
+}
+
 pub fn uninline(lines: Vec<String>) -> Vec<String> {
+    let mut lines = lines;
+    let (copies, region) = copies_by_line(&lines);
+    let marked: Vec<bool> = lines.iter().map(|l| l.trim_start().starts_with("--@copies ")).collect();
     let mut templates = Vec::new();
     for (name, params, b0, b1) in function_bodies(&lines) {
         let Some(expr) = return_template(&lines[b0..b1]) else { continue };
@@ -2055,18 +2200,22 @@ pub fn uninline(lines: Vec<String>) -> Vec<String> {
         }
         templates.push((name, toks, params.len(), b1));
     }
-    if templates.is_empty() {
-        return lines;
-    }
-    let mut out = lines;
-    for (name, toks, n, def_end) in &templates {
+    // two helpers one could be a copy of: neither
+    let twins: Vec<bool> = (0..templates.len())
+        .map(|i| (0..templates.len()).any(|j| j != i && templates[j].1 == templates[i].1))
+        .collect();
+    let mut out = std::mem::take(&mut lines);
+    for (k, (name, toks, n, def_end)) in templates.iter().enumerate() {
+        if twins[k] {
+            continue;
+        }
         let Tok::Lit(head) = &toks[0] else { unreachable!() };
         let tail_alnum = match &toks[toks.len() - 1] {
             Tok::Lit(s) => s.chars().next_back().is_some_and(char::is_alphanumeric),
             Tok::Hole(_) => true,
         };
-        for line in out.iter_mut().skip(def_end + 1) {
-            if !line.contains(head.as_str()) {
+        for (j, line) in out.iter_mut().enumerate().skip(def_end + 1) {
+            if !line.contains(head.as_str()) || !copies[region[j]].iter().any(|c| c == name) {
                 continue;
             }
             loop {
@@ -2084,7 +2233,7 @@ pub fn uninline(lines: Vec<String>) -> Vec<String> {
                         m = None; // `f(x) = v` is not Luau: the body is a target here
                     }
                     if let Some((end, caps)) = m {
-                        if end < b.len() && is_word(b[end]) && tail_alnum {
+                        if (end < b.len() && is_word(b[end]) && tail_alnum) || !order_safe(toks, &caps) {
                             at = next(line);
                             continue;
                         }
@@ -2100,7 +2249,13 @@ pub fn uninline(lines: Vec<String>) -> Vec<String> {
             }
         }
     }
-    out
+    let mut kept = Vec::with_capacity(out.len());
+    for (line, m) in out.into_iter().zip(marked) {
+        if !m {
+            kept.push(line);
+        }
+    }
+    kept
 }
 
 // ------------------------------------------------------------- simple passes

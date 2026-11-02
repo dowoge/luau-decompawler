@@ -1350,7 +1350,42 @@ impl<'c, 'm> Dec<'c, 'm> {
     }
 
     // -- body
+    /// The body opens with the helpers whose code the compiler copied in here,
+    /// by line info: a later pass rebuilds their calls here and nowhere else.
     fn decompile(&mut self) -> (Vec<String>, Vec<String>) {
+        let (params, mut body) = self.decompile_body();
+        let names = self.copies_here();
+        if !names.is_empty() {
+            let base = (self.depth + 1) as usize * 4;
+            body.insert(0, format!("{}--@copies {}", sp(base), names.join(" ")));
+        }
+        (params, body)
+    }
+
+    /// Named functions with a line of this function's code in their span, but
+    /// for itself and those around it: those hold the line it is defined on.
+    /// (A function that is all a copy has only its helper's lines.)
+    fn copies_here(&self) -> Vec<&'m str> {
+        let mut lines: Vec<u32> = self.p.lines.clone();
+        lines.sort_unstable();
+        lines.dedup();
+        let def = self.p.linedefined;
+        let mut names: Vec<&'m str> = Vec::new();
+        for (h, proto) in self.m.protos.iter().enumerate() {
+            let Some(name) = proto.name.as_deref().filter(|n| !n.is_empty()) else { continue };
+            let (from, to) = self.ctx.spans[h];
+            if h == self.idx || (from <= def && def <= to) || names.contains(&name) {
+                continue;
+            }
+            let k = lines.partition_point(|l| *l < from);
+            if lines.get(k).is_some_and(|l| *l <= to) {
+                names.push(name);
+            }
+        }
+        names
+    }
+
+    fn decompile_body(&mut self) -> (Vec<String>, Vec<String>) {
         let (params, body) = self.decompile_once();
         if !self.flat_regs {
             if peak_locals(&body) > 180 {

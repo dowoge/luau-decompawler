@@ -121,6 +121,7 @@ fn suite(tools: &Tools, dir: &Path) -> bool {
     let found = cases::run_suite(&suite);
     let listed = std::fs::read_to_string(dir.join("known.txt")).unwrap_or_default();
     let known: Vec<&str> = listed
+        .trim_start_matches('\u{feff}')
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
