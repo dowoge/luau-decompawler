@@ -3660,9 +3660,9 @@ impl<'c, 'm> Dec<'c, 'm> {
                     out.push(format!("{pad}goto L{}", pc + 1 + c as i32));
                 }
             }
-            op::LOADN => self.put(out, ind, a, ex_pure(d.to_string()), true),
-            op::LOADK => self.put(out, ind, a, ex_pure(kexpr(m, p, d as i64)), true),
-            op::LOADKX => self.put(out, ind, a, ex_pure(kexpr(m, p, aux as i64)), true),
+            op::LOADN => self.put(out, ind, a, ex_const(d.to_string()), true),
+            op::LOADK => self.put(out, ind, a, ex_const(kexpr(m, p, d as i64)), true),
+            op::LOADKX => self.put(out, ind, a, ex_const(kexpr(m, p, aux as i64)), true),
             op::MOVE => {
                 self.declare_named(out, ind, b); // to where copied-in code keeps it, or an argument
                 let shared = !self.pending.contains_key(&b) && self.shared(pc, b);
@@ -3887,13 +3887,15 @@ impl<'c, 'm> Dec<'c, 'm> {
             op::ADDK | op::SUBK | op::MULK | op::DIVK | op::MODK | op::POWK | op::IDIVK => {
                 let (sym, prec) = binop(o);
                 let l = self.get(b);
-                let t = format!("{} {sym} {}", wrap(&l, prec), kexpr(m, p, c as i64));
+                // `x ^ -k` needs no parentheses: a negation binds there
+                let need = if o == op::POWK { 8 } else { prec + 1 };
+                let t = format!("{} {sym} {}", wrap(&l, prec), kwrap(kexpr(m, p, c as i64), need));
                 self.put(out, ind, a, ex(t, prec), true);
             }
             op::SUBRK | op::DIVRK => {
                 let (sym, prec) = binop(o);
                 let r = self.get(c);
-                let t = format!("{} {sym} {}", kexpr(m, p, b as i64), wrap(&r, prec + 1));
+                let t = format!("{} {sym} {}", kwrap(kexpr(m, p, b as i64), prec), wrap(&r, prec + 1));
                 self.put(out, ind, a, ex(t, prec), true);
             }
             op::AND | op::OR => {

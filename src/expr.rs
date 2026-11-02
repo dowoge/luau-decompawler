@@ -96,6 +96,34 @@ pub fn ex(text: impl Into<String>, prec: i32) -> E {
     }))
 }
 
+/// How tightly a constant's text binds: `0/0` is a division, `-4` a negation.
+pub fn const_prec(t: &str) -> i32 {
+    if t == "0/0" {
+        7
+    } else if t.starts_with('-') {
+        8
+    } else {
+        100
+    }
+}
+
+/// A constant, as a value.
+pub fn ex_const(text: String) -> E {
+    let prec = const_prec(&text);
+    let e = ex(text, prec);
+    e.borrow_mut().pure_ = true;
+    e
+}
+
+/// A constant's text as an operand that must bind at least `need`.
+pub fn kwrap(t: String, need: i32) -> String {
+    if const_prec(&t) < need {
+        format!("({t})")
+    } else {
+        t
+    }
+}
+
 pub fn ex_pure(text: impl Into<String>) -> E {
     let e = ex(text, 100);
     e.borrow_mut().pure_ = true;
@@ -526,7 +554,9 @@ fn float_repr(v: f64) -> String {
 
 pub fn fmt_number(v: f64) -> String {
     if v.is_nan() {
-        return "0/0".to_string();
+        // 0/0 folds to the default NaN, its sign bit set where Luau compiles
+        // (x86); the other sign is its negation
+        return if v.is_sign_negative() { "0/0" } else { "-(0/0)" }.to_string();
     }
     if v == 0.0 && v.is_sign_negative() {
         return "-0".to_string(); // negative zero prints differently
@@ -556,7 +586,8 @@ mod tests {
         assert_eq!(fmt_number(0.0001), "0.0001");
         assert_eq!(fmt_number(1e-5), "1e-05");
         assert_eq!(fmt_number(f64::INFINITY), "math.huge");
-        assert_eq!(fmt_number(f64::NAN), "0/0");
+        assert_eq!(fmt_number(-f64::NAN), "0/0");
+        assert_eq!(fmt_number(f64::NAN.copysign(1.0)), "-(0/0)");
     }
 
     #[test]
