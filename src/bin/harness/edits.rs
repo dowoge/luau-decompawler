@@ -87,7 +87,7 @@ pub fn compare_place(tools: &Tools, dumps: &Path, output: &Path, place: &str) ->
     let files = scripts(&output.join(place));
     let paths: Vec<String> = files.keys().cloned().collect();
     let tmp = Temp::new("ed");
-    let done = tools.emit(&paths, &tmp.path("bc"), 100);
+    let done = tools.compile(&paths, &tmp.path("bc"), 100).bytecode;
     let parts = par_map(&paths, |path| {
         let Some(bc) = done.get(path) else { return (Vec::new(), 0) };
         let script = &files[path];
@@ -224,6 +224,9 @@ pub fn main(args: &Args) -> u8 {
     let count = args.num("--count", 2);
     let done: Vec<Place> = places.iter().map(|p| compare_place(&tools, &dumps, &output, p)).collect();
     let rows: Vec<Row> = done.into_iter().flat_map(|p| p.rows).collect();
+    if let Some(name) = args.opt("--save") {
+        save(name, &rows);
+    }
     println!("{} functions differ", rows.len());
     if let Some(name) = args.opt("--since") {
         let then = load(name);
@@ -238,9 +241,6 @@ pub fn main(args: &Args) -> u8 {
         let chosen: Vec<&Row> =
             worse.iter().filter(|r| pick.as_ref().is_none_or(|k| short_key(r) == *k)).copied().collect();
         examples(&chosen, count, 50, 16, &output);
-    }
-    if let Some(name) = args.opt("--save") {
-        save(name, &rows);
     }
     let keys = par_map(&rows, short_key);
     let hist = commonest(keys.iter().cloned());

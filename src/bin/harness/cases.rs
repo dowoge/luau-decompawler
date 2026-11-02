@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::luau::{clip, decompile, module, percent, read_text, repo, Args, Temp, Tools, BATCH};
+use crate::luau::{clip, decompile_many, module, percent, read_text, repo, Args, Temp, Tools, BATCH, USUAL_BUDGET};
 use crate::shape::{exact, pair, shape};
 
 struct Row {
@@ -48,29 +48,24 @@ pub fn run(args: &Args, loud: bool) -> usize {
         .collect();
     srcs.sort();
     let tmp = Temp::new("cs");
-    let bc = tools.emit(&srcs, &tmp.path("a"), BATCH);
+    let bc = tools.compile(&srcs, &tmp.path("a"), BATCH).bytecode;
     let mut decs: HashMap<String, String> = HashMap::new();
     let mut crashed: HashMap<String, String> = HashMap::new();
-    for s in &srcs {
-        let Some(code) = bc.get(s) else {
-            crashed.insert(s.clone(), "the case itself does not compile".to_string());
-            continue;
+    let compiled: Vec<&String> = srcs.iter().filter(|s| bc.contains_key(*s)).collect();
+    let code: Vec<String> = compiled.iter().map(|s| bc[*s].clone()).collect();
+    for s in srcs.iter().filter(|s| !bc.contains_key(*s)) {
+        crashed.insert(s.clone(), "the case itself does not compile".to_string());
+    }
+    for (s, text) in compiled.iter().zip(decompile_many(&binary, &code, &tmp.path("d"), 300)) {
+        match text {
+            Ok(path) => decs.insert((*s).clone(), path),
+            Err(why) => crashed.insert((*s).clone(), why),
         };
-        match decompile(&binary, code) {
-            Err(why) => {
-                crashed.insert(s.clone(), why);
-            }
-            Ok(text) => {
-                let d = tmp.path(&format!("{}.dec.luau", base(s).trim_end_matches(".luau")));
-                std::fs::write(&d, text).expect("decompiled text");
-                decs.insert(s.clone(), d);
-            }
-        }
     }
     let dec_paths: Vec<String> = srcs.iter().filter_map(|s| decs.get(s).cloned()).collect();
-    let back = tools.emit(&dec_paths, &tmp.path("b"), BATCH);
+    let back = tools.compile(&dec_paths, &tmp.path("b"), BATCH).bytecode;
     let all: Vec<String> = srcs.iter().chain(&dec_paths).cloned().collect();
-    let out = tools.outputs(&all);
+    let out = tools.outputs(&all, 60, USUAL_BUDGET);
     let mut totals = [0usize; 3];
     let mut bad_run = 0;
     print_row(loud, false, format!("{:<24} {:<4} {:>5} {:>6} {:>6}", "case", "run", "funcs", "shape", "exact"));

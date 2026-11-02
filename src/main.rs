@@ -8,6 +8,8 @@
 //!   --upstream                            input is stock Luau bytecode
 //!   luau_decompile --dir DIR [--out OUT]  every *.wire in DIR (index.tsv
 //!                                         paths name the outputs)
+//!   luau_decompile --each OUT FILE...     each file by itself, as if run alone:
+//!                                         OUT/<n>.lua, or OUT/<n>.error
 //!
 //! Output is Luau that compiles. `harness difftest` is the ground-truth test:
 //! generated programs must behave the same after a trip through here.
@@ -274,9 +276,31 @@ fn run_dir(src: &Path, dst: &Path, upstream: bool, noflat: bool) -> i32 {
     }
 }
 
+/// Starting a process costs far more than decompiling a small program, so
+/// many can share one. Nothing here depends on the others.
+fn run_each(out: &Path, files: &[String], upstream: bool, noflat: bool) -> i32 {
+    if let Err(e) = fs::create_dir_all(out) {
+        eprintln!("{}: {e}", out.display());
+        return 2;
+    }
+    let written = par_map(files.len(), |i| {
+        let one = || -> Result<String, String> {
+            let data = fs::read(&files[i]).map_err(|e| e.to_string())?;
+            let m = parse(&data, !upstream)?;
+            Ok(to_text(&name_round(decompile_core(&m, None, noflat), &Extra::default())))
+        };
+        match panic::catch_unwind(AssertUnwindSafe(one)).unwrap_or_else(|e| Err(panic_text(e))) {
+            Ok(text) => fs::write(out.join(format!("{i}.lua")), text),
+            Err(why) => fs::write(out.join(format!("{i}.error")), why),
+        }
+        .is_ok()
+    });
+    i32::from(written.contains(&false))
+}
+
 fn usage() -> i32 {
     println!(
-        "luau_decompile FILE.wire | --disasm FILE.wire | --dir DIR [--out OUT]\n\
+        "luau_decompile FILE.wire | --disasm FILE.wire | --dir DIR [--out OUT] | --each OUT FILE...\n\
          \x20 --upstream   input is stock Luau bytecode (luau_compile output)"
     );
     2
@@ -293,6 +317,9 @@ fn run(args: Vec<String>) -> i32 {
             _ => src.join("lua"),
         };
         return run_dir(&src, &dst, upstream, noflat);
+    }
+    if args.len() >= 2 && args[0] == "--each" {
+        return run_each(Path::new(&args[1]), &args[2..], upstream, noflat);
     }
     let disasm = args.iter().any(|a| a == "--disasm");
     let Some(file) = args.iter().find(|a| !a.starts_with("--")) else { return usage() };

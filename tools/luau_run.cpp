@@ -5,7 +5,7 @@
 // VM (standard libraries, sandboxed), compiled at -O2 like Roblox game
 // scripts, with an instruction budget so a broken program cannot hang.
 //
-//   luau_run FILE...
+//   luau_run [--budget N] FILE...
 // prints, per file:  "=== FILE" then its output, then "=== ok" or
 // "=== error: MESSAGE" (chunk names and line numbers stripped, since they
 // differ between a program and its decompiled form).
@@ -65,7 +65,13 @@ int main(int argc, char** argv) {
     lua_CompileOptions opts = {};
     opts.optimizationLevel = 2;
     opts.debugLevel = 1;
-    for (int i = 1; i < argc; ++i) {
+    long budget = 20000000;
+    int first = 1;
+    if (argc > 2 && std::strcmp(argv[1], "--budget") == 0) {
+        budget = std::atol(argv[2]);
+        first = 3;
+    }
+    for (int i = first; i < argc; ++i) {
         std::ifstream f(argv[i], std::ios::binary);
         std::printf("=== %s\n", argv[i]);
         if (!f) {
@@ -83,7 +89,7 @@ int main(int argc, char** argv) {
         luaL_sandbox(L);
         luaL_sandboxthread(L);
         lua_callbacks(L)->interrupt = interrupt;
-        g_budget = 20000000;
+        g_budget = budget;
         int rc = luau_load(L, "=prog", bc, size, 0);
         std::free(bc);
         if (rc == 0)

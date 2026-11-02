@@ -6,8 +6,11 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::gen;
-use crate::luau::{decompile, module, par_map, percent, read_text, Args, Temp, Tools, BATCH};
+use crate::luau::{decompile_many, module, par_map, percent, read_text, Args, Temp, Tools, BATCH, USUAL_BUDGET};
 use crate::shape::{pair, shape};
+
+const DECOMPILE_LIMIT: u64 = 300;
+const RUN_LIMIT: u64 = 60;
 
 pub struct Options {
     pub count: u64,
@@ -70,32 +73,30 @@ pub fn run(tools: &Tools, o: &Options) -> Outcome {
         path
     });
     let mut detail = Vec::new();
-    let bad_src = tools.errors(&srcs);
-    if !bad_src.is_empty() {
-        detail.push(format!("generator wrote invalid programs: {:?}", &bad_src[..bad_src.len().min(3)]));
+    let source = tools.compile(&srcs, &tmp.path("bc"), BATCH);
+    if !source.failed.is_empty() {
+        let first: Vec<&(String, String)> = source.failed.iter().take(3).collect();
+        detail.push(format!("generator wrote invalid programs: {first:?}"));
     }
-    let mapping = tools.emit(&srcs, &tmp.path("bc"), BATCH);
+    let mapping = source.bytecode;
     let compiled: Vec<&String> = srcs.iter().filter(|s| mapping.contains_key(*s)).collect();
-    let done = par_map(&compiled, |s| decompile(&o.binary, &mapping[*s]));
+    let code: Vec<String> = compiled.iter().map(|s| mapping[*s].clone()).collect();
+    let done = decompile_many(&o.binary, &code, &tmp.path("dec"), DECOMPILE_LIMIT);
 
     let mut decs: Vec<(String, String)> = Vec::new();
     let mut crashed: Vec<(String, String)> = Vec::new();
     for (s, text) in compiled.iter().zip(done) {
         match text {
-            Ok(text) => {
-                let d = format!("{}.dec.luau", s.strip_suffix(".luau").unwrap_or(s));
-                std::fs::write(&d, text).expect("decompiled text");
-                decs.push(((*s).clone(), d));
-            }
+            Ok(path) => decs.push(((*s).clone(), path)),
             Err(why) => crashed.push(((*s).clone(), why)),
         }
     }
     let dec_paths: Vec<String> = decs.iter().map(|d| d.1.clone()).collect();
-    let compile_fail: Vec<String> =
-        tools.errors(&dec_paths).iter().filter_map(|l| l.split_once(": ").map(|p| p.0.to_string())).collect();
+    let back = tools.compile(&dec_paths, &tmp.path("dbc"), BATCH);
+    let compile_fail: Vec<String> = back.failed.iter().map(|f| f.0.clone()).collect();
 
     let all: Vec<String> = srcs.iter().chain(&dec_paths).cloned().collect();
-    let out = tools.outputs(&all);
+    let out = tools.outputs(&all, RUN_LIMIT, USUAL_BUDGET);
     let (mut same, mut differ, mut skipped) = (0, 0, 0);
     let mut failures: Vec<(String, String, &str)> = Vec::new();
     for (s, d) in &decs {
@@ -117,7 +118,7 @@ pub fn run(tools: &Tools, o: &Options) -> Outcome {
     }
 
     // how many functions recompile to the original instruction sequence
-    let dmap = tools.emit(&dec_paths, &tmp.path("dbc"), BATCH);
+    let dmap = back.bytecode;
     let counted = par_map(&decs, |(s, d)| {
         let Some(back) = dmap.get(d) else { return (0, 0) };
         let (a, b) = (module(&mapping[s]), module(back));

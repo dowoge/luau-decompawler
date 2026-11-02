@@ -27,6 +27,7 @@ They are looked for in `build/Release`; set `LUAU_BIN` if they are elsewhere.
     target/release/luau_decompile --dir DUMPS --out OUTPUT    # every .wire in a folder
     target/release/luau_decompile FILE.wire                   # one script to stdout
     target/release/luau_decompile --disasm FILE.wire          # bytecode with source lines
+    target/release/luau_decompile --each OUT FILE...          # many, each as if alone
 
 `--upstream` reads stock Luau bytecode instead of wire format. Environment:
 `LUAU_NOFLAT` prints raw gotos, `LUAU_WHY` lists each flag with what was refused,
