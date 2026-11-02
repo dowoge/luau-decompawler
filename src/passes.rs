@@ -1323,7 +1323,135 @@ pub fn resolve_gotos(mut lines: Vec<String>) -> Option<Vec<String>> {
     if lines.iter().any(|l| has_any_goto(l) || parse_label(l).is_some()) {
         return None;
     }
+    copy_small_guards(&mut lines);
     Some(lines)
+}
+
+/// `local jump_N = false ... if jump_N then S end`, S a line or two, every
+/// `jump_N = true` the last thing done before the check: S in place of each
+/// of those, and no flag.
+fn copy_small_guards(lines: &mut Vec<String>) {
+    let mut k = 0;
+    while k < lines.len() {
+        let flag = strip(&lines[k])
+            .strip_prefix("local ")
+            .and_then(|r| r.strip_suffix(" = false"))
+            .filter(|f| f.strip_prefix("jump_").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())))
+            .map(str::to_string);
+        match flag {
+            Some(f) if copy_guard(lines, k, &f) => {} // the line at k is new: look again
+            _ => k += 1,
+        }
+    }
+}
+
+fn copy_guard(lines: &mut Vec<String>, decl: usize, flag: &str) -> bool {
+    let d = indent_of(&lines[decl]);
+    let set = format!("{flag} = true");
+    let uses: Vec<usize> = (0..lines.len()).filter(|&i| has_word(&lines[i], flag)).collect();
+    let reads: Vec<usize> = uses.iter().copied().filter(|&i| i != decl && strip(&lines[i]) != set).collect();
+    let [c] = reads[..] else { return false };
+    if c < decl || indent_of(&lines[c]) != d || strip(&lines[c]) != format!("if {flag} then") {
+        return false;
+    }
+    // what it guards: plain lines one level in
+    let mut e = c + 1;
+    while e < lines.len() && (is_blank(&lines[e]) || indent_of(&lines[e]) > d) {
+        e += 1;
+    }
+    if e >= lines.len() || indent_of(&lines[e]) != d || strip(&lines[e]) != "end" {
+        return false;
+    }
+    let body: Vec<String> = lines[c + 1..e].iter().filter(|l| !is_blank(l)).cloned().collect();
+    let plain = |l: &String| {
+        let t = strip(l);
+        indent_of(l) == d + 4
+            && !t.ends_with(" then")
+            && !t.ends_with(" do")
+            && t != "repeat"
+            && !t.starts_with("local ")
+            && !t.starts_with("::")
+            && !t.contains("function")
+            && !has_any_goto(t)
+    };
+    if body.is_empty() || body.len() > 2 || !body.iter().all(plain) {
+        return false;
+    }
+    let sets: Vec<usize> = uses.iter().copied().filter(|&i| strip(&lines[i]) == set).collect();
+    if sets.is_empty() || sets.iter().any(|&i| i < decl || i > c) || body.len() * sets.len() > 6 {
+        return false;
+    }
+    // the copies read nothing the code between declares for itself
+    let mut words = HashSet::default();
+    for l in &body {
+        words_into(&mut words, l);
+    }
+    for l in &lines[decl + 1..c] {
+        let mut declared = HashSet::default();
+        let t = strip(l);
+        if let Some((names, _)) = parse_local_list(t) {
+            declared.extend(names.split(", ").map(String::from));
+        } else if let Some(r) = t.strip_prefix("for ") {
+            // `for k, v in ...` and `for i = ...`
+            let head = r.split(" in ").next().unwrap_or(r);
+            let head = head.split(" = ").next().unwrap_or(head);
+            declared.extend(head.split(", ").map(|v| v.trim().to_string()));
+        } else if let Some(rest) = t.strip_prefix("local function ") {
+            declared.insert(rest.split('(').next().unwrap_or(rest).to_string());
+        }
+        if declared.iter().any(|n| words.contains(n)) {
+            return false;
+        }
+    }
+    if !sets.iter().all(|&i| goes_straight_to(lines, i, c, d)) {
+        return false;
+    }
+    lines.drain(c..=e);
+    for &i in sets.iter().rev() {
+        let pad = spaces(indent_of(&lines[i]));
+        lines.splice(i..=i, body.iter().map(|l| format!("{pad}{}", strip(l))));
+    }
+    lines.remove(decl);
+    true
+}
+
+/// From line i the next thing run is line c, at indent d: only the ends of
+/// `if`s and `do`s lie between (other arms of an `if` are passed over).
+fn goes_straight_to(lines: &[String], i: usize, c: usize, d: usize) -> bool {
+    let mut ind = indent_of(&lines[i]);
+    let mut k = i + 1;
+    while k < c {
+        if is_blank(&lines[k]) {
+            k += 1;
+            continue;
+        }
+        let li = indent_of(&lines[k]);
+        let t = strip(&lines[k]);
+        if li >= ind {
+            return false; // a statement run after it
+        }
+        let close = if is_arm(t) {
+            match if_end(lines, k) {
+                Some(e) => e,
+                None => return false,
+            }
+        } else if t == "end" {
+            k
+        } else {
+            return false;
+        };
+        // what that `end` closes: an `if` chain or a `do` block
+        let Some(open) = (0..close).rev().find(|&j| !is_blank(&lines[j]) && indent_of(&lines[j]) == li && !is_arm(strip(&lines[j]))) else {
+            return false;
+        };
+        let o = strip(&lines[open]);
+        if !(o.starts_with("if ") && o.ends_with(" then") || o == "do") {
+            return false;
+        }
+        ind = li;
+        k = close + 1;
+    }
+    k == c && ind == d
 }
 
 /// The jumps to one label, when they have a tidy form:
