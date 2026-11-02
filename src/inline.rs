@@ -72,6 +72,8 @@ pub struct Inlined {
     /// writes them through the closure. Only a closure made where its
     /// captures show can be trusted to.
     pub upval_writes: Vec<usize>,
+    /// Parameters the call left out: nil, and not written when last.
+    pub omitted: Vec<bool>,
 }
 
 fn ignored(o: u8) -> bool {
@@ -123,6 +125,8 @@ struct Walk<'a> {
     /// Parameters the helper assigns: Luau loads a constant given for one
     /// into its register before the copy, where it does not for the others.
     assigned: Vec<bool>,
+    /// Parameters the copy shows were left out (nil, not written).
+    omitted: Vec<bool>,
     upvals: Vec<Option<Up>>,
     /// Helper registers holding an upvalue the caller has not been seen to read.
     unread: HashMap<usize, usize>,
@@ -425,7 +429,30 @@ impl Walk<'_> {
                     if !only_stores || skip.contains(&at) {
                         return None;
                     }
-                    self.constant(want[at].a(), kexpr(self.m, self.caller, cval as i64))?;
+                    let text = kexpr(self.m, self.caller, cval as i64);
+                    let src = want[at].a();
+                    if src < self.helper.numparams {
+                        self.constant(src, text)?;
+                    } else {
+                        // `face or size` of two parameters, folded with the
+                        // arguments: size's value means face was left out
+                        let or = want[at - 1];
+                        let (a, b) = (or.b(), or.c());
+                        let params = a < self.helper.numparams && b < self.helper.numparams;
+                        if plain(or.op) != op::OR || or.a() != src || at - 1 <= k || !params {
+                            return None;
+                        }
+                        let Some(Some(Arg::Const(other))) = self.args.get(b).cloned() else { return None };
+                        if text == other {
+                            self.constant(a, "nil".to_string())?;
+                            self.omitted[a] = true;
+                        } else if falsy(&text) {
+                            return None;
+                        } else {
+                            self.constant(a, text)?;
+                        }
+                        skip.push(at - 1);
+                    }
                     skip.push(at);
                 }
             }
@@ -750,6 +777,7 @@ fn match_once(m: &Module, caller: &Proto, id: usize, start: usize, assumed: &[Op
         assigned: (0..helper.numparams)
             .map(|r| helper.code.iter().any(|i| !ignored(i.op) && full_effects(i, helper.maxstack).1.has(r)))
             .collect(),
+        omitted: vec![false; helper.numparams],
     };
     // helper code a folded test left out of the copy: up to this pc
     let mut dead_until: Option<i32> = None;
@@ -1113,6 +1141,7 @@ fn match_once(m: &Module, caller: &Proto, id: usize, start: usize, assumed: &[Op
         results,
         written: walk.written,
         upval_writes: walk.upval_writes,
+        omitted: walk.omitted,
     })
 }
 

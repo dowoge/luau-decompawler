@@ -1645,7 +1645,9 @@ impl<'c, 'm> Dec<'c, 'm> {
                 None => "nil".to_string(),
             });
         }
-        while args.last().is_some_and(|a| a == "nil") && call.args[args.len() - 1].is_none() {
+        while args.last().is_some_and(|a| a == "nil")
+            && (call.args[args.len() - 1].is_none() || call.omitted.get(args.len() - 1).copied().unwrap_or(false))
+        {
             args.pop();
         }
         let dropped = self.ctx.defs.values().flatten().any(|d| d.1 == call.helper);
