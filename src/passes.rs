@@ -2863,11 +2863,31 @@ fn call_name(rhs: &str) -> Option<String> {
         if !b.is_empty() && is_start(b[0]) {
             let e = word_end(b, 0);
             if b.get(e) == Some(&b'"') {
-                return Some(t[..e].to_string());
+                return Some(camel(&t[..e]));
             }
         }
     }
     None
+}
+
+/// `x = Instance.new(...)` and then `x.Name = "Coins"`: x is `coins`.
+fn named_instance(rhs: &str, name: &str, at: &[usize], out: &[String]) -> Option<String> {
+    if !rhs.starts_with("Instance.new(") {
+        return None;
+    }
+    let head = format!("{name}.Name = \"");
+    let v = at.iter().find_map(|&j| strip(&out[j]).strip_prefix(head.as_str()).and_then(|r| r.strip_suffix('"')))?;
+    let b = v.as_bytes();
+    (!b.is_empty() && is_start(b[0]) && b.iter().all(|&c| is_word(c))).then(|| camel(v))
+}
+
+/// A local's spelling of an instance's name: `Humanoid` is `humanoid`, `UI` `ui`.
+fn camel(v: &str) -> String {
+    if str_isupper(v) {
+        v.to_ascii_lowercase()
+    } else {
+        lower_first(v)
+    }
 }
 
 /// A natural variable name for a value, from how it was computed.
@@ -2930,7 +2950,7 @@ fn derive_name(rhs: &str) -> Option<String> {
                             ] {
                                 if let Some(h) = head.strip_suffix(m) {
                                     if h.ends_with('.') || h.ends_with(':') {
-                                        return Some(q[..e].to_string());
+                                        return Some(camel(&q[..e]));
                                     }
                                 }
                             }
@@ -3316,7 +3336,7 @@ fn rename_variables(lines: Vec<String>) -> Vec<String> {
             } else if defs.len() == 1 && defs[0].is_some() {
                 let st = strip(&out[defs[0].unwrap()]);
                 let rhs = st.split_once(" = ").unwrap().1;
-                new = derive_name(rhs);
+                new = named_instance(rhs, name, &at, &out).or_else(|| derive_name(rhs));
             }
             let Some(new) = new else { continue };
             if new.is_empty() || pass_keyword(&new) || !is_token(&new) {
@@ -3862,10 +3882,21 @@ fn passed_name(name: &str, out: &[String], at: &[u32], signatures: &HashMap<Stri
 fn kind_name(name: &str, out: &[String], at: &[u32], defs: &[usize]) -> Option<String> {
     let arith = |r: &str| [" + ", " - ", " * ", " / ", " // ", " % ", " ^ "].iter().any(|o| r.contains(o));
     let logic = |r: &str| [" and ", " or ", " == ", " ~= ", " < ", " > ", " <= ", " >= ", " .. "].iter().any(|o| r.contains(o));
+    let lines = || at.iter().map(|j| strip(&out[*j as usize]));
     if defs.len() == 1 {
         let st = strip(&out[defs[0]]);
         if let Some((_, rhs)) = st.split_once(" = ") {
             let r = rhs.trim();
+            // started at 0 and only ever added to: by one a count, else a total
+            if r == "0" {
+                let add = format!("{name} += ");
+                let steps: Vec<&str> = lines().filter_map(|l| l.strip_prefix(add.as_str())).collect();
+                let other = format!("{name} ");
+                let changed = lines().any(|l| l.starts_with(&other) && !l.starts_with(&add) && l.contains("= "));
+                if !steps.is_empty() && !changed {
+                    return Some(if steps.iter().all(|s| *s == "1") { "count" } else { "total" }.to_string());
+                }
+            }
             let kind = if r.starts_with('{') {
                 Some("t")
             } else if r == "true" || r == "false" {
@@ -3886,6 +3917,19 @@ fn kind_name(name: &str, out: &[String], at: &[u32], defs: &[usize]) -> Option<S
             if let Some(k) = kind {
                 return Some(k.to_string());
             }
+        }
+    }
+    // iterated: a list when its keys go unused or count, else a table
+    for l in lines() {
+        let Some((vars, src)) = l.strip_prefix("for ").and_then(|r| r.strip_suffix(" do")).and_then(|r| r.split_once(" in ")) else {
+            continue;
+        };
+        let key = vars.split(", ").next().unwrap_or("");
+        if src == name || src == format!("ipairs({name})") {
+            return Some(if key == "_" || key == "i" || src.starts_with("ipairs(") { "list" } else { "t" }.to_string());
+        }
+        if src == format!("pairs({name})") {
+            return Some("t".to_string());
         }
     }
     // by what is done with it
@@ -4197,6 +4241,34 @@ fn stored_field<'a>(line: &'a str, tail: &str) -> Option<&'a str> {
     } else {
         None
     }
+}
+
+/// `xs[k] = name` or `table.insert(xs, name)`: name is one of xs.
+fn stored_element(line: &str, name: &str) -> Option<String> {
+    let s = strip(line);
+    if let Some(lhs) = s.strip_suffix(name).and_then(|x| x.strip_suffix(" = ")) {
+        let lhs = lhs.strip_suffix(']')?;
+        // the `[` of the last index
+        let b = lhs.as_bytes();
+        let mut depth = 0;
+        let mut k = b.len();
+        while k > 0 {
+            k -= 1;
+            match b[k] {
+                b']' => depth += 1,
+                b'[' if depth == 0 => return element_noun(&lhs[..k]),
+                b'[' => depth -= 1,
+                _ => {}
+            }
+        }
+        return None;
+    }
+    let inner = s.strip_prefix("table.insert(")?.strip_suffix(')')?;
+    let args = split_top(inner);
+    if args.len() == 2 && args[1].trim() == name {
+        return element_noun(args[0].trim());
+    }
+    None
 }
 
 /// `[{,] (IDENT) = NAME[,}]` searched in the line.
@@ -4712,10 +4784,18 @@ fn name_pass(out: &mut Vec<String>, index: &mut WordIndex, extra: &Extra) -> boo
                 }
             }
             if new.is_none() {
+                let own_index = format!("{name}.__index = {name}");
+                if at.iter().any(|j| strip(&out[*j as usize]) == own_index) {
+                    new = Some("Class".to_string());
+                }
+            }
+            if new.is_none() {
                 let tail = format!(" = {name}");
                 for j in at {
                     let l = &out[*j as usize];
-                    let m = stored_field(l, &tail).or_else(|| stored_in_table(l, name));
+                    let m = stored_field(l, &tail)
+                        .or_else(|| stored_in_table(l, name))
+                        .filter(|f| !f.starts_with("__"));
                     if let (Some(f), true) = (m, defs.len() <= 1) {
                         new = Some(if !first_upper(f) || str_isupper(f) {
                             f.to_string()
@@ -4748,6 +4828,9 @@ fn name_pass(out: &mut Vec<String>, index: &mut WordIndex, extra: &Extra) -> boo
                 new = passed_name(name, &out, at, &signatures);
             }
             if new.is_none() {
+                new = at.iter().find_map(|j| stored_element(&out[*j as usize], name));
+            }
+            if new.is_none() {
                 // last: the kind of value, `n2` if `n` is taken
                 if let Some(base) = kind_name(name, &out, at, &defs) {
                     let taken = |c: &str| {
@@ -4759,7 +4842,17 @@ fn name_pass(out: &mut Vec<String>, index: &mut WordIndex, extra: &Extra) -> boo
                 }
             }
             if let Some(n) = new {
-                if !n.is_empty() {
+                // taken here: the same name with a number
+                let taken = |c: &str| {
+                    in_scope(&out, &index, c) || touched.iter().any(|t| t == c) || cands.iter().any(|x| x.1 == c)
+                };
+                let sep = if n.ends_with(|c: char| c.is_ascii_digit()) { "_" } else { "" };
+                let free = (!n.is_empty() && is_token(&n) && !pass_keyword(&n))
+                    .then(|| {
+                        std::iter::once(n.clone()).chain((2..=20).map(|k| format!("{n}{sep}{k}"))).find(|c| !taken(c))
+                    })
+                    .flatten();
+                if let Some(n) = free {
                     cands.push((name.clone(), n));
                 }
             }

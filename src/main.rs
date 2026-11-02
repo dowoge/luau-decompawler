@@ -343,8 +343,18 @@ fn run_dir(src: &Path, dst: &Path, upstream: bool, noflat: bool) -> i32 {
             eprintln!("{}: {e}", path.display());
         }
         let count = |needle: &str| finished.as_ref().map_or(0, |text| text.matches(needle).count());
+        // a flag the dispatcher left: `local jump_<pc> = `, not `local jump_height`
+        let jumps = finished.as_ref().map_or(0, |text| {
+            text.match_indices("local jump_")
+                .filter(|(i, m)| {
+                    let rest = &text[i + m.len()..];
+                    let d = rest.bytes().take_while(u8::is_ascii_digit).count();
+                    d > 0 && rest[d..].starts_with(" = ")
+                })
+                .count()
+        });
         let made = usize::from(finished.is_ok());
-        [usize::from(result.is_err()), count(" = false\n"), count("local jump_"), count("local block = 0"), made]
+        [usize::from(result.is_err()), count(" = false\n"), jumps, count("local block = 0"), made]
     });
     if timing {
         eprintln!("names and write {:?}", t0.elapsed());
