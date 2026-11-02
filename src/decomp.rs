@@ -1675,24 +1675,31 @@ impl<'c, 'm> Dec<'c, 'm> {
         let (cond, _) = self.cond_expr(pc);
         let waiting: Vec<usize> = self.pending.keys().copied().collect();
         let enter = negate(&cond); // the branch [nxt, last) runs when this holds
-        let mut reg = if li.op == op::JUMPIF { Some(li.a()) } else { None };
-        if reg.is_none() {
-            // JUMP form: find the register both branches write last
-            for r in 0..self.p.maxstack {
+        // JUMP form: both branches compute it in one register, with their
+        // temporaries above it, so it is the lowest register both write
+        let reg = if li.op == op::JUMPIF {
+            Some(li.a())
+        } else {
+            (0..self.p.maxstack).find(|r| self.written_in(nxt, last, *r) && self.written_in(target, join, *r))
+        };
+        let Some(reg) = reg else {
+            self.rollback(s);
+            return None;
+        };
+        // a value that can be computed with something waiting below it is an
+        // argument: value_region keeps those together
+        if li.op == op::JUMP {
+            let below: Vec<usize> = self.pending.keys().copied().take_while(|r| *r < reg).collect();
+            for r in below {
                 let s2 = self.mark();
                 let x = self.value_of(nxt, last, r, ind, end);
                 self.rollback(s2);
                 if x.is_some() {
-                    reg = Some(r);
-                    break;
+                    self.rollback(s);
+                    return None;
                 }
             }
-            if reg.is_none() {
-                self.rollback(s);
-                return None;
-            }
         }
-        let reg = reg.unwrap();
         // `local v` came first: each arm assigns it, as a statement
         if self.region_def(nxt, last, reg).is_some_and(|w| self.declared[(KW + w) as usize]) {
             self.rollback(s);
