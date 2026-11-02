@@ -182,23 +182,10 @@ fn alnum_len(s: &str, i: usize) -> usize {
 /// false to stop early.
 fn for_each_word<'a>(s: &'a str, mut f: impl FnMut(&'a str) -> bool) {
     let b = s.as_bytes();
+    let code = code_mask(s);
     let mut i = 0;
-    let mut quote = 0u8;
     while i < b.len() {
-        let ch = b[i];
-        if quote != 0 {
-            if ch == b'\\' {
-                i += 2;
-                continue;
-            }
-            if ch == quote {
-                quote = 0;
-            }
-            i += 1;
-            continue;
-        }
-        if ch == b'"' || ch == b'\'' {
-            quote = ch;
+        if !code[i] {
             i += 1;
             continue;
         }
@@ -221,6 +208,65 @@ fn for_each_word<'a>(s: &'a str, mut f: impl FnMut(&'a str) -> bool) {
         }
         i += 1;
     }
+}
+
+/// Which bytes of a line are code rather than string text: text is inside
+/// "..." and '...', and inside `...` but for its {} interpolations, which
+/// are code again, strings and all.
+fn code_mask(s: &str) -> Vec<bool> {
+    #[derive(Clone, Copy)]
+    enum M {
+        Code(u32), // brace depth since this code began
+        Quote(u8),
+        Tick,
+    }
+    let b = s.as_bytes();
+    let mut mask = vec![false; b.len()];
+    let mut stack = vec![M::Code(0)];
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        match *stack.last().unwrap() {
+            M::Code(depth) => match c {
+                b'"' | b'\'' => stack.push(M::Quote(c)),
+                b'`' => stack.push(M::Tick),
+                b'{' => {
+                    *stack.last_mut().unwrap() = M::Code(depth + 1);
+                    mask[i] = true;
+                }
+                b'}' if depth == 0 && stack.len() > 1 => {
+                    stack.pop(); // the end of an interpolation
+                }
+                b'}' => {
+                    *stack.last_mut().unwrap() = M::Code(depth.saturating_sub(1));
+                    mask[i] = true;
+                }
+                _ => mask[i] = true,
+            },
+            M::Quote(q) => {
+                if c == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if c == q {
+                    stack.pop();
+                }
+            }
+            M::Tick => {
+                if c == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if c == b'`' {
+                    stack.pop();
+                } else if c == b'{' {
+                    stack.push(M::Code(0));
+                }
+            }
+        }
+        i += 1;
+    }
+    mask
 }
 
 fn word_keys_into(set: &mut HashSet<u64>, line: &str) {
@@ -262,25 +308,12 @@ fn replace_token(line: &mut String, old: &str, new: &str) {
     }
     let s: &str = line;
     let b = s.as_bytes();
+    let code = code_mask(s);
     let mut out = String::with_capacity(s.len() + new.len());
     let mut i = 0;
-    let mut quote = 0u8;
     let mut plain = 0; // start of the text not yet copied
     while i < b.len() {
-        let ch = b[i];
-        if quote != 0 {
-            if ch == b'\\' && i + 1 < b.len() {
-                i += 2;
-                continue;
-            }
-            if ch == quote {
-                quote = 0;
-            }
-            i += 1;
-            continue;
-        }
-        if ch == b'"' || ch == b'\'' {
-            quote = ch;
+        if !code[i] {
             i += 1;
             continue;
         }
@@ -3732,6 +3765,87 @@ fn usage_name(name: &str, out: &[String], at: &[u32]) -> Option<String> {
     }
 }
 
+/// The first parameter of `setEnabled` is `enabled`, of `addItem` `item`, of
+/// `getItemByID` `id`: what the function's name says it takes.
+fn param_from_function_name(fname: &str) -> Option<String> {
+    let last = fname.rsplit(['.', ':']).next()?;
+    if let Some(at) = last.find("By").filter(|a| last[a + 2..].starts_with(|c: char| c.is_ascii_uppercase())) {
+        let noun = &last[at + 2..];
+        return Some(if str_isupper(noun) { noun.to_ascii_lowercase() } else { lower_first(noun) });
+    }
+    const VERBS: &[&str] = &[
+        "set", "add", "remove", "insert", "update", "destroy", "handle", "process", "apply", "show", "hide",
+        "open", "close", "equip", "unequip", "select", "register", "unregister", "track", "untrack", "spawn",
+        "kill", "damage", "heal", "give", "take", "load", "save", "play", "stop", "push", "pop", "use",
+        "toggle", "enable", "disable", "clear", "reset", "render", "draw", "build", "attach", "detach",
+        "bind", "unbind", "connect", "disconnect", "send", "fire", "on", "is", "has", "can", "with",
+    ];
+    let split = last.find(|c: char| c.is_ascii_uppercase())?;
+    let (verb, noun) = (&last[..split], &last[split..]);
+    if !VERBS.contains(&verb) || noun.len() < 2 {
+        return None;
+    }
+    let noun = if str_isupper(noun) { noun.to_ascii_lowercase() } else { lower_first(noun) };
+    (is_token(&noun) && !pass_keyword(&noun)).then_some(noun)
+}
+
+/// A variable passed to a function defined in this file takes the name that
+/// function gives the parameter in that place.
+fn passed_name(name: &str, out: &[String], at: &[u32], signatures: &HashMap<String, Vec<String>>) -> Option<String> {
+    for j in at {
+        let l = &out[*j as usize];
+        let b = l.as_bytes();
+        let mut from = 0;
+        while let Some(open) = l[from..].find('(').map(|x| x + from) {
+            from = open + 1;
+            // the callee: a dotted name right before the parenthesis
+            let mut k = open;
+            while k > 0 && (is_word(b[k - 1]) || b[k - 1] == b'.' || b[k - 1] == b':') {
+                k -= 1;
+            }
+            let callee = l[k..open].replace(':', ".");
+            let method = l[k..open].contains(':');
+            let Some(params) = signatures.get(&callee) else { continue };
+            // the arguments at the top level of these parentheses
+            let (mut depth, mut slot, mut start) = (0i32, 0usize, open + 1);
+            let mut quote = 0u8;
+            let mut i = open + 1;
+            while i < b.len() {
+                let c = b[i];
+                if quote != 0 {
+                    if c == b'\\' {
+                        i += 1;
+                    } else if c == quote {
+                        quote = 0;
+                    }
+                } else if c == b'"' || c == b'\'' || c == b'`' {
+                    quote = c;
+                } else if c == b'(' || c == b'{' || c == b'[' {
+                    depth += 1;
+                } else if (c == b')' || c == b'}' || c == b']') && depth > 0 {
+                    depth -= 1;
+                } else if (c == b',' || c == b')') && depth == 0 {
+                    if l[start..i].trim() == name {
+                        // a method call's arguments start after its self
+                        let at = if method { slot } else { slot };
+                        let p = params.get(at)?;
+                        if !is_generated(p) && p != "_" && p != "..." && p != name {
+                            return Some(p.clone());
+                        }
+                    }
+                    if c == b')' {
+                        break;
+                    }
+                    slot += 1;
+                    start = i + 1;
+                }
+                i += 1;
+            }
+        }
+    }
+    None
+}
+
 /// The kind of value a variable holds, as a short name: by the value it is
 /// given, else by what is done with it.
 fn kind_name(name: &str, out: &[String], at: &[u32], defs: &[usize]) -> Option<String> {
@@ -3765,6 +3879,7 @@ fn kind_name(name: &str, out: &[String], at: &[u32], defs: &[usize]) -> Option<S
     }
     // by what is done with it
     let (mut table, mut number, mut string) = (0, 0, 0);
+    let (mut flag, mut passed) = (0, 0);
     for j in at {
         let l = &out[*j as usize];
         let b = l.as_bytes();
@@ -3788,10 +3903,41 @@ fn kind_name(name: &str, out: &[String], at: &[u32], defs: &[usize]) -> Option<S
             if after.starts_with(" ..") || before.ends_with(".. ") {
                 string += 1;
             }
+            // compared with a constant: of its kind
+            for op in [" == ", " ~= "] {
+                let other = after.strip_prefix(op).or_else(|| before.strip_suffix(op).map(|_| ""));
+                if let Some(o) = after.strip_prefix(op) {
+                    if o.starts_with('"') {
+                        string += 1;
+                    } else if o.starts_with(|c: char| c.is_ascii_digit() || c == '-') {
+                        number += 1;
+                    }
+                }
+                let _ = other;
+            }
+            if [" < ", " > ", " <= ", " >= "].iter().any(|o| after.starts_with(o) || before.ends_with(o)) {
+                number += 1;
+            }
+            // tested for truth only
+            let s = before.trim_end();
+            if (s.ends_with("if") || s.ends_with("not") || s.ends_with("and") || s.ends_with("or") || s.ends_with("while"))
+                && (after.starts_with(" then") || after.starts_with(" and ") || after.starts_with(" or ") || after.starts_with(" do") || after.is_empty() || after.starts_with(')'))
+            {
+                flag += 1;
+            }
+            if (before.ends_with('(') || before.ends_with(", ")) && (after.starts_with(')') || after.starts_with(',')) {
+                passed += 1;
+            }
         }
     }
     let best = [(table, "t"), (number, "n"), (string, "s")].into_iter().max_by_key(|x| x.0)?;
-    (best.0 > 0).then(|| best.1.to_string())
+    if best.0 > 0 {
+        return Some(best.1.to_string());
+    }
+    if flag > 0 && passed == 0 {
+        return Some("flag".to_string());
+    }
+    (passed > 0).then(|| "value".to_string())
 }
 
 /// A name from what the variable is passed to or done with: the argument
@@ -4230,6 +4376,21 @@ fn rename_in(out: &mut [String], lo: usize, hi: usize, old: &str, new: &str) {
     rename_lines(out, &lines, old, new);
 }
 
+/// Does `w` stand as a word anywhere in the raw line, strings included?
+fn raw_word(l: &str, w: &str) -> bool {
+    let b = l.as_bytes();
+    let mut from = 0;
+    while let Some(p) = l[from..].find(w).map(|x| x + from) {
+        from = p + w.len();
+        let before = p > 0 && (is_word(b[p - 1]) || b[p - 1] == b'.');
+        let after = from < b.len() && is_word(b[from]);
+        if !before && !after {
+            return true;
+        }
+    }
+    false
+}
+
 /// Rename `old` to `new` on these lines, or leave them as they were if some
 /// use of it is out of reach (a nested interpolated string). Whether it did.
 fn rename_lines(out: &mut [String], lines: &[usize], old: &str, new: &str) -> bool {
@@ -4239,20 +4400,7 @@ fn rename_lines(out: &mut [String], lines: &[usize], old: &str, new: &str) -> bo
     }
     // raw text, strings and interpolations included: a use replace_token
     // could not reach shows there
-    let left = |l: &str| {
-        let b = l.as_bytes();
-        let mut from = 0;
-        while let Some(p) = l[from..].find(old).map(|x| x + from) {
-            from = p + old.len();
-            let before = p > 0 && (is_word(b[p - 1]) || b[p - 1] == b'.');
-            let after = from < b.len() && is_word(b[from]);
-            if !before && !after {
-                return true;
-            }
-        }
-        false
-    };
-    if lines.iter().any(|j| left(&out[*j])) {
+    if lines.iter().any(|j| raw_word(&out[*j], old)) {
         for (j, l) in lines.iter().zip(saved) {
             out[*j] = l;
         }
@@ -4419,6 +4567,16 @@ fn name_pass(out: &mut Vec<String>, index: &mut WordIndex, extra: &Extra) -> boo
     let mut calls = CallMap::default();
     collect_calls(out, &mut calls, &asked);
     let no_sites: Vec<Vec<String>> = Vec::new();
+    // what each function defined here calls its parameters, as calls name it
+    let mut signatures: HashMap<String, Vec<String>> = HashMap::default();
+    for (fi, _, params) in &funcs {
+        if *fi >= 0 {
+            if let Some(f) = function_name_of(&out[*fi as usize]) {
+                let f = f.replace(':', ".");
+                signatures.entry(f).or_insert_with(|| params.clone());
+            }
+        }
+    }
     for (fi, fend, params) in &funcs {
         // the main chunk (-1): its own locals carry no depth
         let top = *fi < 0;
@@ -4572,6 +4730,12 @@ fn name_pass(out: &mut Vec<String>, index: &mut WordIndex, extra: &Extra) -> boo
             if new.is_none() {
                 new = slot_name(name, &out, at);
             }
+            if new.is_none() && params.first() == Some(name) {
+                new = fname.as_deref().and_then(param_from_function_name);
+            }
+            if new.is_none() {
+                new = passed_name(name, &out, at, &signatures);
+            }
             if new.is_none() {
                 // last: the kind of value, `n2` if `n` is taken
                 if let Some(base) = kind_name(name, &out, at, &defs) {
@@ -4602,7 +4766,9 @@ fn name_pass(out: &mut Vec<String>, index: &mut WordIndex, extra: &Extra) -> boo
             let stop = hi;
             let hits: Vec<u32> = index.within(old, fi, stop).to_vec();
             let lines: Vec<usize> = hits.iter().map(|j| *j as usize).collect();
-            if !rename_lines(out, &lines, old, new) {
+            // a use the index does not list (inside an interpolation) stops it
+            let unlisted = (fi..stop.min(out.len())).any(|j| raw_word(&out[j], old) && !lines.contains(&j));
+            if unlisted || !rename_lines(out, &lines, old, new) {
                 continue; // a use it could not reach: inside a string's interpolation
             }
             renamed |= !hits.is_empty();
