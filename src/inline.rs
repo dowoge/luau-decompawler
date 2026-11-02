@@ -1066,7 +1066,10 @@ fn match_once(m: &Module, caller: &Proto, id: usize, start: usize, assumed: &[Op
         if plain(p.op) == op::CALL && p.c() == 2 {
             let uses_it = want.get(k + 1).is_some_and(|w| matches!(w.op, op::MOVE | op::RETURN) && (w.a() == p.a() || w.b() == p.a()));
             if let Some(e) = code.get(i).filter(|e| e.op == op::MOVE && e.b() == c.a() && e.a() < c.a()) {
-                if !uses_it {
+                // `local l = f(); for _, v in l do`: the read of the local that
+                // follows reads it in its new place, a move of its own
+                let read_there = code.get(skip(code, i + 1)).is_some_and(|n| n.op == op::MOVE && n.b() == e.a());
+                if !uses_it || read_there {
                     walk.write(p.a(), e.a())?;
                     last = e.pc;
                     i = skip(code, i + 1);
