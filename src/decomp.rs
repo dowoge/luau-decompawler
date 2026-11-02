@@ -1194,7 +1194,7 @@ impl<'c, 'm> Dec<'c, 'm> {
                 let code = &self.m.protos[call.helper].code;
                 e.borrow_mut().one = !code.iter().filter(|i| i.op == op::RETURN).all(|i| i.b() == 2);
                 self.value_done(t, e, pc, call.end);
-                if !self.read_once_from(call.end, t) {
+                if self.state_read_first(call.end, t) || !self.read_once_from(call.end, t) {
                     let e = self.get(t);
                     self.flush_impure(out, ind, t);
                     self.assign(out, ind, t, &e);
@@ -1203,6 +1203,40 @@ impl<'c, 'm> Dec<'c, 'm> {
             None => out.push(format!("{}{text}", sp(ind))),
         }
         Some(call.end)
+    }
+
+    /// After a call put back where a helper was copied in (its own line is
+    /// nowhere in the code, so no later statement shows the source kept the
+    /// value): is a global, upvalue or field read before r is, and written out
+    /// ahead of it? The call may change that, so folded in, the read would
+    /// come first. Read through a MOVE, r was a local; read in place, what
+    /// sits below it in the same list comes first. A method, or the function
+    /// of a fast call, is looked up after the arguments whatever the source
+    /// says: written out the same, it compiles the same.
+    fn state_read_first(&self, from: i32, r: usize) -> bool {
+        let code = &self.p.code;
+        let Some(mut i) = self.flow.idx(from) else { return false };
+        let mut reads: Vec<usize> = Vec::new();
+        while i < code.len() {
+            let ins = code[i];
+            let (rd, wr, barrier) = self.flow.effects[i];
+            if rd.has(r) {
+                let callee = matches!(ins.op, op::CALL | op::CALLFB).then(|| ins.a());
+                return reads.iter().any(|x| Some(*x) != callee && (ins.op == op::MOVE || *x < r));
+            }
+            let (s, n) = ins.successors();
+            if barrier || wr.has(r) || n != 1 || s[0] != ins.pc + ins.n {
+                return false;
+            }
+            if matches!(
+                ins.op,
+                op::GETGLOBAL | op::GETUPVAL | op::GETTABLE | op::GETTABLEKS | op::GETTABLEN | op::LENGTH
+            ) {
+                reads.push(ins.a());
+            }
+            i += 1;
+        }
+        false
     }
 
     /// `name` is declared at the top of the function.
