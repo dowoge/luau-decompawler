@@ -16,7 +16,7 @@ use crate::luau::{command, percent, repo, text_of, Args, Tools};
 use crate::text::undeclared;
 
 const QUICK: [(u64, usize, u64); 1] = [(300, 12, 700000)];
-const FULL: [(u64, usize, u64); 19] = [
+const FULL: [(u64, usize, u64); 30] = [
     (300, 3, 5000),
     (300, 18, 20000),
     (300, 12, 700000),
@@ -36,6 +36,20 @@ const FULL: [(u64, usize, u64); 19] = [
     (300, 9, 12000000),
     (300, 17, 13000000),
     (300, 7, 14000000),
+    // programs that each found a bug (count 1: that seed alone), and big ones:
+    // large functions reach what small ones never do (the local limit, one
+    // variable per register, tails written twice)
+    (1, 25, 9279),
+    (1, 25, 70208),
+    (1, 25, 70654),
+    (1, 120, 90008),
+    (1, 120, 90149),
+    (1, 120, 90404),
+    (1, 120, 90426),
+    (1, 120, 90462),
+    (1, 160, 55530),
+    (1, 160, 55650),
+    (60, 160, 55501),
 ];
 
 fn build() -> bool {
