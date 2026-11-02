@@ -4476,7 +4476,16 @@ impl<'c, 'm> Dec<'c, 'm> {
                 return None; // another path joins inside: not one block
             }
             if self.inline_at(q).is_some() {
+                let start = q;
                 q = self.stmt(&mut scratch, 0, q, end);
+                if !scratch.is_empty() {
+                    return None; // the call is a statement
+                }
+                // the copy's own jumps land where it ends
+                let at_end = q;
+                if self.p.code.iter().filter(|i| i.jump_target() == Some(at_end)).all(|i| (start..at_end).contains(&i.pc)) {
+                    joined = q;
+                }
                 continue;
             }
             if is_cond_jump(ins.op) {
