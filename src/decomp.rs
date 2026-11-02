@@ -394,7 +394,17 @@ struct Mark {
     _live: Rc<()>,
 }
 
-struct RegionFail;
+/// Why a value region was given up, for LUAU_WHY=all: the reason, and the
+/// statement on the way when one stopped it. (Not kept anywhere past the job
+/// that made it: a job's memory goes when the job ends, see alloc.rs.)
+struct RegionFail {
+    why: &'static str,
+    line: String,
+}
+
+fn fail(why: &'static str) -> RegionFail {
+    RegionFail { why, line: String::new() }
+}
 
 struct Dec<'c, 'm> {
     ctx: &'c Ctx<'m>,
@@ -4120,6 +4130,12 @@ impl<'c, 'm> Dec<'c, 'm> {
             self.region_head = None;
             let got = self.walk_value(pc, j, &before);
             self.in_region = false;
+            if let Err(f) = &got {
+                if self.ctx.why && WHY_ALL.get().copied().unwrap_or(false) {
+                    let within = self.p.name.as_deref().unwrap_or("(anon)");
+                    eprintln!("REGION\t{within}\t{pc}\t{j}\t{}\t{}", f.why, f.line.trim());
+                }
+            }
             if let Ok((r, expr)) = got {
                 // `local v` came first: each arm assigns it, as a statement
                 let declared = self.region_def(pc, j, r).is_some_and(|w| self.declared[(KW + w) as usize]);
@@ -4191,7 +4207,7 @@ impl<'c, 'm> Dec<'c, 'm> {
         loop {
             self.region_steps += 1;
             if self.region_steps > 400 {
-                return Err(RegionFail);
+                return Err(fail("too many steps"));
             }
             if q == j {
                 // what waited before the first test may not run after it
@@ -4200,7 +4216,7 @@ impl<'c, 'm> Dec<'c, 'm> {
                         head.contains(r) && !e.borrow().pure_ && !self.pending.contains_key(r)
                     });
                     if moved {
-                        return Err(RegionFail);
+                        return Err(fail("a value made before the first test would run after it"));
                     }
                 }
                 let mut new: Option<usize> = None;
@@ -4208,26 +4224,26 @@ impl<'c, 'm> Dec<'c, 'm> {
                     let same = before.iter().any(|b| b.0 == *r && Rc::ptr_eq(&b.1, e));
                     if !same {
                         if new.is_some() {
-                            return Err(RegionFail);
+                            return Err(fail("two values are new at the join"));
                         }
                         new = Some(*r);
                     }
                 }
-                let r = new.ok_or(RegionFail)?;
+                let r = new.ok_or_else(|| fail("no new value at the join"))?;
                 let e = self.get(r);
                 return Ok((r, e));
             }
             if q > j || !self.valid(q) || self.is_loop_head(q) || self.is_repeat_head(q) {
-                return Err(RegionFail);
+                return Err(fail("past the join, or a loop"));
             }
             if q != self.region_pc && self.label_pcs.contains(&q) {
-                return Err(RegionFail); // a goto lands here: it stays a statement
+                return Err(fail("a goto lands inside")); // it stays a statement
             }
             if let Some((call, _)) = self.inline_at(q) {
                 let mut scratch = Vec::new();
                 let next = self.stmt(&mut scratch, 0, q, j);
                 if !scratch.is_empty() {
-                    return Err(RegionFail);
+                    return Err(fail("a helper's call is a statement"));
                 }
                 if let Some(r) = call.result {
                     self.region_written.add(r);
@@ -4253,13 +4269,13 @@ impl<'c, 'm> Dec<'c, 'm> {
                 let (cond, t) = self.cond_expr(q);
                 let f = q + ins.n;
                 if t <= q || t > j {
-                    return Err(RegionFail);
+                    return Err(fail("a test jumps out of the region"));
                 }
                 if self.region_head.is_none() {
                     self.region_head = Some(self.pending.keys().copied().collect());
                 }
                 if tested.is_some() && self.live_at(f, a) {
-                    return Err(RegionFail); // the other path would read the tested value
+                    return Err(fail("the other path reads the tested value"));
                 }
                 let snap = self.mark();
                 if let Some(v) = tested.as_ref().filter(|_| self.live_at(t, a)) {
@@ -4269,7 +4285,7 @@ impl<'c, 'm> Dec<'c, 'm> {
                 self.rollback(snap);
                 let (rf, vf) = self.walk_value(f, j, before)?;
                 if rt != rf {
-                    return Err(RegionFail);
+                    return Err(fail("the arms make values in different registers"));
                 }
                 if let Some(v) = &tested {
                     if Rc::ptr_eq(&vt, v) {
@@ -4278,7 +4294,7 @@ impl<'c, 'm> Dec<'c, 'm> {
                     }
                     let id = v.borrow().id;
                     if vt.borrow().uses.contains(&id) || vf.borrow().uses.contains(&id) {
-                        return Err(RegionFail);
+                        return Err(fail("an arm reads a value made before"));
                     }
                 }
                 // `B or Z` loads true, then skips Z when B holds; `B and Z` loads
@@ -4299,7 +4315,7 @@ impl<'c, 'm> Dec<'c, 'm> {
             if matches!(ins.op, op::JUMP | op::JUMPX) {
                 let t = ins.jump_target().unwrap();
                 if t <= q {
-                    return Err(RegionFail);
+                    return Err(fail("a jump backward"));
                 }
                 q = t;
                 continue;
@@ -4324,13 +4340,14 @@ impl<'c, 'm> Dec<'c, 'm> {
                     | op::DUPTABLE
             ) || is_for(ins.op)
             {
-                return Err(RegionFail);
+                return Err(fail("a store, table or closure on the way"));
             }
             let mut scratch = Vec::new();
             let wr = full_effects(&ins, self.p.maxstack).1;
             let q2 = self.stmt(&mut scratch, 0, q, j);
             if !scratch.is_empty() {
-                return Err(RegionFail);
+                let line = scratch.swap_remove(0);
+                return Err(RegionFail { why: "code on the way is a statement", line });
             }
             for w in 0..wr.0.len() {
                 self.region_written.0[w] |= wr.0[w];
