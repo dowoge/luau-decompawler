@@ -304,6 +304,43 @@ fn has_word(line: &str, name: &str) -> bool {
     found
 }
 
+/// Is the word at byte p (n long) a key of a table constructor, `{k = v}`?
+/// It is followed by ` = `, and the innermost bracket open before it is `{`.
+fn table_key_at(line: &str, p: usize, n: usize) -> bool {
+    if !line[p + n..].starts_with(" = ") {
+        return false;
+    }
+    let b = line.as_bytes();
+    let mut depth = 0;
+    for k in (0..p).rev() {
+        match b[k] {
+            b')' | b']' | b'}' => depth += 1,
+            b'(' | b'[' | b'{' if depth == 0 => return b[k] == b'{',
+            b'(' | b'[' | b'{' => depth -= 1,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// has_word, but not as a constructor's key: that names no variable.
+fn has_var_word(line: &str, name: &str) -> bool {
+    if !line.contains(name) {
+        return false;
+    }
+    let base = line.as_ptr() as usize;
+    let mut found = false;
+    for_each_word(line, |w| {
+        if w == name && !table_key_at(line, w.as_ptr() as usize - base, w.len()) {
+            found = true;
+            false
+        } else {
+            true
+        }
+    });
+    found
+}
+
 /// Rename identifier `old` (a variable, not a field) outside strings.
 fn replace_token(line: &mut String, old: &str, new: &str) {
     if !line.contains(old) {
@@ -4374,7 +4411,7 @@ fn stored_in_table<'a>(line: &'a str, name: &str) -> Option<&'a str> {
             // but then what precedes it is a word character, not a space
             continue;
         }
-        if k >= 2 && b[k - 1] == b' ' && (b[k - 2] == b'{' || b[k - 2] == b',') {
+        if k >= 2 && b[k - 1] == b' ' && (b[k - 2] == b'{' || b[k - 2] == b',') || k >= 1 && b[k - 1] == b'{' {
             return Some(&line[k..p]);
         }
     }
@@ -4853,7 +4890,7 @@ fn name_pass(out: &mut Vec<String>, index: &mut WordIndex, extra: &Extra) -> boo
         let fname = function_name_of(&header).map(str::to_string);
         let scope_end = (hi + 1).min(out.len());
         let in_scope = |out: &[String], index: &WordIndex, word: &str| {
-            index.within(word, fi, scope_end).iter().any(|j| has_word(&out[*j as usize], word))
+            index.within(word, fi, scope_end).iter().any(|j| has_var_word(&out[*j as usize], word))
         };
         // names this function's renames have used or given up
         let mut touched: Vec<String> = Vec::new();
@@ -4933,9 +4970,16 @@ fn name_pass(out: &mut Vec<String>, index: &mut WordIndex, extra: &Extra) -> boo
         }
         let mut own: HashSet<String> = params.iter().cloned().collect();
         for l in &out[lo..hi.max(lo)] {
-            if let Some((names, _)) = parse_local_list(l.trim_start_matches(' ')) {
+            let s = l.trim_start_matches(' ');
+            if let Some((names, _)) = parse_local_list(s) {
                 for n in names.split(", ") {
                     own.insert(n.to_string());
+                }
+            } else if let Some(rest) = s.strip_prefix("local function ") {
+                // a local function is a local too
+                let e = word_end(rest.as_bytes(), 0);
+                if e > 0 && rest[e..].starts_with('(') {
+                    own.insert(rest[..e].to_string());
                 }
             }
         }
