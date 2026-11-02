@@ -328,7 +328,7 @@ impl Flow {
         let mut def_idx: Vec<u32> = Vec::new(); // def id -> instruction
         for (i, w) in writes.iter().enumerate() {
             def_at.push(def_list.len() as u32);
-            for r in write_order(w, code[i].op == op::FORGLOOP) {
+            for r in w.iter() {
                 let id = def_idx.len() as u32;
                 def_list.push((r as u32, id));
                 reg_defs[r].push(id);
@@ -720,26 +720,6 @@ impl Flow {
         }
         out
     }
-}
-
-/// The order definitions are numbered in within one instruction: the slot
-/// order of the Python set this tool started from (hash tables of 8, or
-/// larger for many results). Web roots sort by that number, which decides
-/// the numbering of shared variables in register-named dispatcher output.
-fn write_order(w: &RegSet, loop_vars: bool) -> Vec<usize> {
-    let mut regs: Vec<usize> = w.iter().collect();
-    let n = regs.len();
-    if n > 1 {
-        let table = if n <= 4 {
-            8
-        } else if loop_vars {
-            32
-        } else {
-            (2 * n + 1).next_power_of_two()
-        };
-        regs.sort_by_key(|r| r & (table - 1));
-    }
-    regs
 }
 
 fn clear_bits(words: &mut [u64], lo: usize, hi: usize) {
