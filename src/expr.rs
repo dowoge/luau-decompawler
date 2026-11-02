@@ -543,7 +543,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn numbers_print_like_python_repr() {
+    fn numbers_print_shortest() {
         assert_eq!(fmt_number(0.5), "0.5");
         assert_eq!(fmt_number(-4.0), "-4");
         assert_eq!(fmt_number(-0.0), "-0");

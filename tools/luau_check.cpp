@@ -1,15 +1,15 @@
 // luau_check.cpp — compile Luau source files and report syntax errors.
 //
-// Checks that tools/luau_decompile.py writes valid Luau: each file is run
-// through the real Luau compiler. Prints "path: error" per failure and a
-// summary; exit status 1 when any file fails.
+// Checks that the decompiler writes valid Luau: each file is run through the
+// real Luau compiler. Prints "path: error" per failure and a summary; exit
+// status 1 when any file fails.
 //
 //   luau_check FILE...
 //   luau_check --emit DIR FILE...   also write each file's bytecode, compiled
 //                                   the way Roblox compiles game scripts
 //                                   (-O2), to DIR/<n>.bc, and print "n path"
-//                                   (tools/luau_roundtrip.py compares them
-//                                   with the original bytecode)
+//                                   (the harness compares them with the
+//                                   original bytecode)
 #include "Luau/Common.h"
 #include "luacode.h"
 

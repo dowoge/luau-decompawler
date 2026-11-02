@@ -9,8 +9,8 @@
 //!   luau_decompile --dir DIR [--out OUT]  every *.wire in DIR (index.tsv
 //!                                         paths name the outputs)
 //!
-//! Output is Luau that compiles. tools/luau_difftest.py is the ground-truth
-//! test: generated programs must behave the same after a trip through here.
+//! Output is Luau that compiles. `harness difftest` is the ground-truth test:
+//! generated programs must behave the same after a trip through here.
 //!
 //! LUAU_NOFLAT=1 prints leftover jumps as `goto` instead of restructuring them.
 //! LUAU_THREADS=N limits the workers; LUAU_TIMING=1 prints stage times;

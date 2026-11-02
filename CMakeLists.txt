@@ -1,6 +1,6 @@
 # luau_check and luau_run: the real Luau compiler and VM, which the test harness
-# in tools/ compares the decompiler against. The decompiler itself is the Rust
-# crate at the root and needs none of this.
+# compares the decompiler against. These are C++ because Luau is. The decompiler
+# and the harness are the Rust crate at the root.
 #
 #   git submodule update --init
 #   cmake -S . -B build

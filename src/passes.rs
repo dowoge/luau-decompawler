@@ -74,7 +74,7 @@ fn ident_chain_end(b: &[u8], i: usize) -> Option<usize> {
     Some(e)
 }
 
-/// Python `s[a:-b]`, which is empty when the two ends cross.
+/// `s` without its first `a` and last `b` bytes, empty when the two ends cross.
 fn inner(s: &str, a: usize, b: usize) -> &str {
     if a + b >= s.len() {
         ""
@@ -108,8 +108,7 @@ fn find_from(hay: &[u8], needle: &[u8], start: usize) -> Option<usize> {
     None
 }
 
-/// Byte length of the character at `i` when it is a letter or `_` (Python
-/// `isalpha`), else 0.
+/// Byte length of the character at `i` when it is a letter or `_`, else 0.
 #[inline]
 fn alpha_len(s: &str, i: usize) -> usize {
     let b = s.as_bytes()[i];

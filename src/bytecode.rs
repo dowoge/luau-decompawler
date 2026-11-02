@@ -183,7 +183,7 @@ pub fn is_forgprep(o: u8) -> bool {
     matches!(o, 59 | 61 | 76)
 }
 
-/// `name.startswith("JUMP")`.
+/// Every instruction whose name starts with JUMP.
 fn is_jump_family(o: u8) -> bool {
     matches!(o, 23..=32 | 67 | 77..=80)
 }

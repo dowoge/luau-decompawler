@@ -1,7 +1,7 @@
 // luau_run.cpp — run Luau source files and print what they print.
 //
-// For differential tests of tools/luau_decompile.py: a generated program and
-// its decompiled version must print the same thing. Each file runs in a fresh
+// For the decompiler's differential tests: a generated program and its
+// decompiled version must print the same thing. Each file runs in a fresh
 // VM (standard libraries, sandboxed), compiled at -O2 like Roblox game
 // scripts, with an instruction budget so a broken program cannot hang.
 //

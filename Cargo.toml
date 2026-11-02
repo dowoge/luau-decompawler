@@ -3,6 +3,7 @@ name = "luau_decompile"
 version = "0.1.0"
 edition = "2021"
 description = "Roblox game-script bytecode (wire v14) to readable Luau"
+default-run = "luau_decompile"
 
 # std only: this reads untrusted bytecode and has no need of dependencies.
 [dependencies]
