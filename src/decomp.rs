@@ -850,7 +850,7 @@ impl<'c, 'm> Dec<'c, 'm> {
     }
 
     fn live_after(&self, pc: i32, r: usize) -> bool {
-        self.shared(pc, r) || self.flow.idx(pc).is_some_and(|i| self.flow.live_out(i).has(r))
+        self.shared(pc, r) || self.flow.idx(pc).is_some_and(|i| self.flow.live_out(&self.p.code, i).has(r))
     }
 
     fn live_at(&self, pc: i32, r: usize) -> bool {
@@ -1481,7 +1481,7 @@ impl<'c, 'm> Dec<'c, 'm> {
             let ins = code[i];
             let q = ins.pc;
             tests.retain(|t| t.0 > q);
-            let (rd, wr, barrier) = self.flow.effects(i);
+            let (rd, wr, barrier) = self.effects_at(i);
             let (with_val, with_st) = (rd.intersects(&val), rd.intersects(&st));
             if with_val && with_st {
                 return state_operand_first(&ins, &val, &st, i.checked_sub(1).map(|k| code[k]));
@@ -2529,7 +2529,7 @@ impl<'c, 'm> Dec<'c, 'm> {
                 }
                 let (rd, wr, barrier) = match top {
                     Some(top) => effects(&ins, top),
-                    None => self.flow.effects(i),
+                    None => self.effects_at(i),
                 };
                 if rd.has(r) && twice(&ins, r) {
                     break; // `x * x`: two reads in one instruction
@@ -2642,7 +2642,7 @@ impl<'c, 'm> Dec<'c, 'm> {
                     break; // all of a call or `...`: the last item, nothing joins behind it
                 }
             } else {
-                let (rd, wr, barrier) = self.flow.effects(i);
+                let (rd, wr, barrier) = self.effects_at(i);
                 let joined = self.has_label(ins.pc) && self.first_jump[ins.pc as usize] <= pc;
                 if rd.has(r) || wr.has(r) || (left == 0 && (barrier || joined)) {
                     break;
@@ -2660,7 +2660,7 @@ impl<'c, 'm> Dec<'c, 'm> {
         let Some(mut i) = self.flow.idx(pc).map(|k| k + 1) else { return regs };
         while i < code.len() {
             let ins = code[i];
-            let (rd, wr, _) = self.flow.effects(i);
+            let (rd, wr, _) = self.effects_at(i);
             let store = matches!(ins.op, op::SETTABLEKS | op::SETTABLE | op::SETTABLEN) && ins.b() == r
                 || ins.op == op::SETLIST && ins.a() == r;
             if store {
@@ -2697,7 +2697,7 @@ impl<'c, 'm> Dec<'c, 'm> {
             } else if ins.op == op::SETLIST && ins.a() == r {
                 return None; // a list: sized by its items, as it is printed
             } else {
-                let (rd, wr, barrier) = self.flow.effects(i);
+                let (rd, wr, barrier) = self.effects_at(i);
                 let joined = self.has_label(ins.pc) && self.first_jump[ins.pc as usize] <= pc;
                 if rd.has(r) || wr.has(r) || (left == 0 && (barrier || joined)) {
                     break;
@@ -2805,7 +2805,7 @@ impl<'c, 'm> Dec<'c, 'm> {
             if is_forgprep(ins.op) && qa == r {
                 return true; // a loop's iterator: its header
             }
-            let (rd, wr, barrier) = self.flow.effects(i);
+            let (rd, wr, barrier) = self.effects_at(i);
             if rd.has(r) {
                 return !twice(&ins, r) && (wr.has(r) || !self.live_after(q, r));
             }
@@ -3132,6 +3132,16 @@ impl<'c, 'm> Dec<'c, 'm> {
                     && i.pc + 1 + i.c() as i32 == pc
             })
             .is_some_and(|i| builtin_returns_one(i.a()))
+    }
+
+    /// effects() of instruction i, kept by the analysis or asked again.
+    #[inline]
+    fn effects_at(&self, i: usize) -> (RegSet, RegSet, bool) {
+        if self.flow.has_effects() {
+            self.flow.effects(i)
+        } else {
+            effects(&self.p.code[i], self.p.maxstack)
+        }
     }
 
     fn read_once_from(&mut self, j: i32, r: usize) -> bool {

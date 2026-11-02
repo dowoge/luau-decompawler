@@ -214,16 +214,22 @@ pub struct Flow {
     pub used_web: Vec<bool>,
     /// Per web: first write, first read and last touch, as pcs.
     pub web_span: Vec<(i32, i32, i32)>,
-    /// live_in and live_out of every instruction, `words` words each: most
-    /// functions use one word of registers, and RegSet holds four.
+    /// live_in of every instruction, `words` words each: most functions use
+    /// one word of registers, and RegSet holds four. live_out is what the
+    /// successors take in.
     live: Vec<u64>,
     /// effects() of every instruction, the end of a list being the stack's
     /// (reads and writes as `live`). The printer's look-aheads ask again and
-    /// again, for the same few.
+    /// again, for the same few; a huge function asks effects() instead.
     eff: Vec<u64>,
     barriers: Vec<bool>,
+    cached: bool,
     words: usize,
 }
+
+/// Functions longer than this keep no effects() of their own: it is cheap to
+/// ask again, and four register sets an instruction add up.
+const EFFECTS_KEPT: usize = 4096;
 
 fn find(parent: &mut [u32], mut x: u32) -> u32 {
     while parent[x as usize] != x {
@@ -379,35 +385,29 @@ impl Flow {
                 }
             }
         }
-        let mut live_in = vec![RegSet::EMPTY; n];
-        let mut live_out = vec![RegSet::EMPTY; n];
-        for b in 0..nb {
-            let mut o = block_out[b];
-            for i in (starts[b]..bend(b)).rev() {
-                live_out[i] = o;
-                for w in 0..WORDS {
-                    o.0[w] = reads[i].0[w] | (o.0[w] & !writes[i].0[w]);
-                }
-                live_in[i] = o;
-            }
-        }
-
-        let effs: Vec<(RegSet, RegSet, bool)> = code.iter().map(|ins| effects(ins, p.maxstack)).collect();
+        // as wide as any register read or written: what is live was read
+        let cached = n <= EFFECTS_KEPT;
+        let effs: Vec<(RegSet, RegSet, bool)> =
+            if cached { code.iter().map(|ins| effects(ins, p.maxstack)).collect() } else { Vec::new() };
         let used = |s: &RegSet| s.0.iter().rposition(|w| *w != 0).map_or(0, |k| k + 1);
-        let set_words = live_in
+        let set_words = reads
             .iter()
-            .chain(&live_out)
+            .chain(&writes)
             .chain(effs.iter().flat_map(|e| [&e.0, &e.1]))
             .map(used)
             .max()
             .unwrap_or(0)
             .max(1);
-        let mut live = Vec::with_capacity(2 * n * set_words);
-        for (i, o) in live_in.iter().zip(&live_out) {
-            live.extend_from_slice(&i.0[..set_words]);
-            live.extend_from_slice(&o.0[..set_words]);
+        let mut live = vec![0u64; n * set_words];
+        for b in 0..nb {
+            let mut o = block_out[b];
+            for i in (starts[b]..bend(b)).rev() {
+                for w in 0..WORDS {
+                    o.0[w] = reads[i].0[w] | (o.0[w] & !writes[i].0[w]);
+                }
+                live[i * set_words..(i + 1) * set_words].copy_from_slice(&o.0[..set_words]);
+            }
         }
-        drop((live_in, live_out));
         let mut eff = Vec::with_capacity(2 * effs.len() * set_words);
         for e in &effs {
             eff.extend_from_slice(&e.0 .0[..set_words]);
@@ -803,8 +803,14 @@ impl Flow {
             live,
             eff,
             barriers,
+            cached,
             words: set_words,
         }
+    }
+
+    /// Does it keep effects() for each instruction?
+    pub fn has_effects(&self) -> bool {
+        self.cached
     }
 
     #[inline]
@@ -817,13 +823,22 @@ impl Flow {
     /// Registers live before instruction i (an index into the code).
     #[inline]
     pub fn live_in(&self, i: usize) -> RegSet {
-        self.set_at(&self.live, 2 * i)
+        self.set_at(&self.live, i)
     }
 
-    /// Registers live after instruction i.
-    #[inline]
-    pub fn live_out(&self, i: usize) -> RegSet {
-        self.set_at(&self.live, 2 * i + 1)
+    /// Registers live after instruction i: what its successors take in.
+    pub fn live_out(&self, code: &[Insn], i: usize) -> RegSet {
+        let (s, c) = code[i].successors();
+        let mut o = RegSet::EMPTY;
+        for t in &s[..c] {
+            if let Some(x) = self.idx(*t) {
+                let l = self.live_in(x);
+                for w in 0..WORDS {
+                    o.0[w] |= l.0[w];
+                }
+            }
+        }
+        o
     }
 
     /// effects() of instruction i.
