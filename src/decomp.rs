@@ -4357,12 +4357,15 @@ impl<'c, 'm> Dec<'c, 'm> {
                     None => return Some(q),
                 }
             }
+            // (a LOADB that skips the next is a value made by a test; a plain
+            // one, `true` as an argument, is a constant)
             if matches!(
                 ins.op,
                 op::JUMP | op::JUMPBACK | op::JUMPX | op::RETURN | op::NEWCLOSURE | op::DUPCLOSURE
                     | op::SETTABLEKS | op::SETTABLE | op::SETTABLEN | op::SETGLOBAL | op::SETUPVAL
-                    | op::NEWTABLE | op::DUPTABLE | op::SETLIST | op::CAPTURE | op::LOADB
-            ) || is_for(ins.op)
+                    | op::NEWTABLE | op::DUPTABLE | op::SETLIST | op::CAPTURE
+            ) || (ins.op == op::LOADB && ins.c() != 0)
+                || is_for(ins.op)
             {
                 return None;
             }
