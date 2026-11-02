@@ -1837,8 +1837,53 @@ fn wrap_value(v: &str) -> String {
     }
 }
 
+/// Where NAME is declared for line i, looking back through the blocks that
+/// hold that line: the declaring line, and whether it is a `local` list with
+/// no value. None when nothing encloses a declaration of it: a global.
+fn declaration_of(lines: &[String], i: usize, name: &str) -> Option<(usize, bool)> {
+    let mut limit = indent_of(&lines[i]);
+    for j in (0..i).rev() {
+        let l = &lines[j];
+        if is_blank(l) || l.contains('\n') {
+            continue;
+        }
+        let k = indent_of(l);
+        if k > limit {
+            continue; // a block that closed before line i
+        }
+        let s = &l[k..];
+        if let Some((names, value)) = parse_local_list(s) {
+            if k == limit && names.split(", ").any(|n| n == name) {
+                return Some((j, value.is_none()));
+            }
+        }
+        if k == limit && s.strip_prefix("local function ").and_then(|r| r.split_once('(')).is_some_and(|(n, _)| n == name) {
+            return Some((j, false));
+        }
+        if k < limit {
+            // the header of a block holding line i: a function's parameters
+            // and a loop's variables are declared for it
+            let params = func_open(l).map(split_params).unwrap_or_default();
+            let vars: Vec<String> = parse_for_in(l)
+                .map(|(v, _)| v.split(',').map(|x| x.trim().to_string()).collect())
+                .or_else(|| parse_for_num(l).map(|v| vec![v.to_string()]))
+                .unwrap_or_default();
+            if params.iter().chain(&vars).any(|p| p == name) {
+                return Some((j, false));
+            }
+            limit = k;
+        }
+    }
+    None
+}
+
 /// `if c then x = a elseif d then x = b else x = c end`, one assignment per
-/// branch, becomes `x = if c then a elseif d then b else c`.
+/// branch, becomes `x = if c then a elseif d then b else c` where the code
+/// says so: for a local declared with no value (the compiler loaded nothing
+/// into it first, so the value is the declaration's). Stores to a global or a
+/// field happen in each arm in the statement form but once after an
+/// if-expression, and for any other local the two compile the same, so the
+/// statement stays as it is most often written.
 pub fn if_expressions(lines: Vec<String>) -> Vec<String> {
     const LIMIT: usize = 150;
     let mut out = Vec::with_capacity(lines.len());
@@ -1897,7 +1942,14 @@ pub fn if_expressions(lines: Vec<String>) -> Vec<String> {
                     break;
                 }
             }
-            if let Some((name, conds, vals, after)) = got {
+            let declared_bare = |name: &str| {
+                let b = name.as_bytes();
+                !b.is_empty()
+                    && is_start(b[0])
+                    && b.iter().all(|c| is_word(*c))
+                    && declaration_of(&lines, i, name).is_some_and(|(_, bare)| bare)
+            };
+            if let Some((name, conds, vals, after)) = got.filter(|g| declared_bare(&g.0)) {
                 let vals: Vec<String> = vals.iter().map(|v| wrap_value(v)).collect();
                 let mut expr = format!("if {} then {}", conds[0], vals[0]);
                 for (c, v) in conds[1..].iter().zip(vals[1..vals.len() - 1].iter()) {
