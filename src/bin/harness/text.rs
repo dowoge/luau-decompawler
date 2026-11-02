@@ -202,8 +202,9 @@ fn tree(root: &str) -> BTreeMap<String, String> {
 
 /// Line endings do not count.
 pub fn same_main(args: &Args) -> u8 {
-    let [a, b] = args.0.as_slice() else {
-        eprintln!("harness same A B");
+    let dirs: Vec<&String> = args.0.iter().filter(|a| !a.starts_with("--")).collect();
+    let [a, b] = dirs.as_slice() else {
+        eprintln!("harness same A B [--all]");
         return 2;
     };
     let (ta, tb) = (tree(a), tree(b));
@@ -221,7 +222,7 @@ pub fn same_main(args: &Args) -> u8 {
     }
     let common = ta.len() - missing;
     println!("{} files: {} identical, {} differ, {missing} missing, {extra} extra", ta.len(), common - differ.len(), differ.len());
-    for d in differ.iter().take(5) {
+    for d in differ.iter().take(if args.flag("--all") { usize::MAX } else { 5 }) {
         println!("{d}");
     }
     u8::from(!differ.is_empty() || missing > 0 || extra > 0)

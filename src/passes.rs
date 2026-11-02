@@ -2172,7 +2172,10 @@ pub fn uninline(lines: Vec<String>) -> Vec<String> {
     let marked: Vec<bool> = lines.iter().map(|l| l.trim_start().starts_with("--@copies ")).collect();
     let mut templates = Vec::new();
     for (name, params, b0, b1) in function_bodies(&lines) {
-        let Some(expr) = return_template(&lines[b0..b1]) else { continue };
+        // the copies marker opening a helper that holds copies itself is no
+        // statement of it
+        let body: Vec<String> = (b0..b1).filter(|i| !marked[*i]).map(|i| lines[i].clone()).collect();
+        let Some(expr) = return_template(&body) else { continue };
         if params.is_empty() {
             continue;
         }
