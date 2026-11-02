@@ -115,6 +115,19 @@ fn par_map<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
     slots.into_iter().map(|s| s.into_inner().unwrap().unwrap()).collect()
 }
 
+/// par_map for jobs of very different sizes: the biggest start first, so the
+/// longest are not left for last on one worker.
+fn par_map_sized<T: Send>(sizes: &[u64], f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+    let mut order: Vec<usize> = (0..sizes.len()).collect();
+    order.sort_by_key(|i| std::cmp::Reverse(sizes[*i]));
+    let picks = par_map(order.len(), |k| (order[k], f(order[k])));
+    let mut slots: Vec<Option<T>> = (0..sizes.len()).map(|_| None).collect();
+    for (i, v) in picks {
+        slots[i] = Some(v);
+    }
+    slots.into_iter().map(|s| s.unwrap()).collect()
+}
+
 /// Writing a file costs several times what reading it does, and most of what
 /// a repeat run produces is already there. The length goes first: the first
 /// read of a new file can cost far more than writing it, with a virus scanner
@@ -182,14 +195,18 @@ fn run_dir(src: &Path, dst: &Path, upstream: bool, noflat: bool) -> i32 {
     let t0 = std::time::Instant::now();
     let timing = std::env::var_os("LUAU_TIMING").is_some();
     // Script by script, in parallel: the work that needs no other script.
-    let core: Vec<Result<Vec<String>, String>> = par_map(files.len(), |i| {
-        let run = || -> Result<Vec<String>, String> {
+    // Each is kept as one string until it is written: a place's text is
+    // tens of megabytes, and as separate lines it costs half as much again.
+    let sizes: Vec<u64> = files.iter().map(|f| fs::metadata(src.join(f)).map_or(0, |m| m.len())).collect();
+    let core: Vec<Result<String, String>> = par_map_sized(&sizes, |i| {
+        let run = || -> Result<String, String> {
             let data = fs::read(src.join(&files[i])).map_err(|e| e.to_string())?;
             let m = parse(&data, !upstream)?;
-            Ok(decompile_core(&m, names.get(sids[i]).map(String::as_str), noflat))
+            Ok(decompile_core(&m, names.get(sids[i]).map(String::as_str), noflat).join("\n"))
         };
         panic::catch_unwind(AssertUnwindSafe(run)).unwrap_or_else(|e| Err(panic_text(e)))
     });
+    let lines_of = |text: &str| -> Vec<String> { text.split('\n').map(String::from).collect() };
 
     if timing {
         eprintln!("core  {:?}", t0.elapsed());
@@ -199,21 +216,21 @@ fn run_dir(src: &Path, dst: &Path, upstream: bool, noflat: bool) -> i32 {
     // the result stands unless one of those functions has call sites elsewhere.
     let mut extra = Extra::default();
     let defined: Vec<Vec<String>> = par_map(core.len(), |i| match &core[i] {
-        Ok(lines) => passes::defined_keys(lines),
+        Ok(text) => passes::defined_keys(&lines_of(text)),
         Err(_) => Vec::new(),
     });
     extra.want(defined.iter().flatten().cloned());
     let alone = Extra::default();
     let wanted = extra.wanted();
-    let name_and_tally = |lines: &[String], seen: &Extra| {
-        let named = name_round(lines.to_vec(), seen);
+    let name_and_tally = |text: &str, seen: &Extra| {
+        let named = name_round(lines_of(text), seen);
         let mut calls = CallMap::default();
         passes::collect_calls(&named, &mut calls, wanted);
-        (named, passes::tally(&calls))
+        (to_text(&named), passes::tally(&calls))
     };
-    let mut draft: Vec<Option<(Vec<String>, Tally)>> = par_map(core.len(), |i| {
-        let lines = core[i].as_ref().ok()?;
-        panic::catch_unwind(AssertUnwindSafe(|| name_and_tally(lines, &alone))).ok()
+    let mut draft: Vec<Option<(String, Tally)>> = par_map(core.len(), |i| {
+        let text = core[i].as_ref().ok()?;
+        panic::catch_unwind(AssertUnwindSafe(|| name_and_tally(text, &alone))).ok()
     });
     if timing {
         eprintln!("draft {:?}", t0.elapsed());
@@ -260,8 +277,8 @@ fn run_dir(src: &Path, dst: &Path, upstream: bool, noflat: bool) -> i32 {
                     seen.add(key, &sites[*j][key]);
                 }
             }
-            let Ok(lines) = &core[i] else { return Tally::default() };
-            panic::catch_unwind(AssertUnwindSafe(|| name_and_tally(lines, &seen).1)).unwrap_or_default()
+            let Ok(text) = &core[i] else { return Tally::default() };
+            panic::catch_unwind(AssertUnwindSafe(|| name_and_tally(text, &seen).1)).unwrap_or_default()
         });
         changed.clear();
         for (i, new) in todo.iter().zip(fresh) {
@@ -282,22 +299,17 @@ fn run_dir(src: &Path, dst: &Path, upstream: bool, noflat: bool) -> i32 {
         eprintln!("calls {:?} ({redone} redone over {rounds} rounds)", t0.elapsed());
     }
 
-    let finished: Vec<Result<String, String>> = par_map(files.len(), |i| {
-        let lines = match &core[i] {
-            Ok(lines) => lines,
-            Err(e) => return Err(e.clone()),
-        };
+    // a script none of whose functions is called elsewhere keeps its draft
+    let drafts: Vec<Mutex<Option<String>>> = draft.into_iter().map(|d| Mutex::new(d.map(|d| d.0))).collect();
+    let finish = |i: usize| -> Result<String, String> {
+        let text = core[i].as_ref().map_err(Clone::clone)?;
         if !defined[i].iter().any(|k| extra.knows(k)) {
-            if let Some((named, _)) = &draft[i] {
-                return Ok(to_text(named));
+            if let Some(named) = drafts[i].lock().unwrap().take() {
+                return Ok(named);
             }
         }
-        panic::catch_unwind(AssertUnwindSafe(|| to_text(&name_round(lines.clone(), &extra))))
-            .map_err(panic_text)
-    });
-    if timing {
-        eprintln!("names {:?}", t0.elapsed());
-    }
+        panic::catch_unwind(AssertUnwindSafe(|| to_text(&name_round(lines_of(text), &extra)))).map_err(panic_text)
+    };
 
     // Paths in order (a repeated game path decides who gets the suffix), then
     // the writes in parallel.
@@ -319,24 +331,27 @@ fn run_dir(src: &Path, dst: &Path, upstream: bool, noflat: bool) -> i32 {
     for dir in &dirs {
         let _ = fs::create_dir_all(dir);
     }
-    let ok = finished.iter().filter(|r| r.is_ok()).count();
-    let failures = finished.len() - ok;
-    let written: Vec<[usize; 4]> = par_map(files.len(), |i| {
+    // each written as soon as its text is final: none waits on the others
+    let written: Vec<[usize; 5]> = par_map(files.len(), |i| {
+        let finished = finish(i);
         let (path, head) = &targets[i];
-        let result = match &finished[i] {
+        let result = match &finished {
             Ok(t) => write_text(path, head, t),
             Err(e) => fs::write(path, format!("{head}-- decompile failed: {e}\n")),
         };
         if let Err(e) = &result {
             eprintln!("{}: {e}", path.display());
         }
-        let count = |needle: &str| finished[i].as_ref().map_or(0, |text| text.matches(needle).count());
-        [usize::from(result.is_err()), count(" = false\n"), count("local jump_"), count("local block = 0")]
+        let count = |needle: &str| finished.as_ref().map_or(0, |text| text.matches(needle).count());
+        let made = usize::from(finished.is_ok());
+        [usize::from(result.is_err()), count(" = false\n"), count("local jump_"), count("local block = 0"), made]
     });
     if timing {
-        eprintln!("write {:?}", t0.elapsed());
+        eprintln!("names and write {:?}", t0.elapsed());
     }
     let total = |k: usize| written.iter().map(|w| w[k]).sum::<usize>();
+    let ok = total(4);
+    let failures = written.len() - ok;
     let bad = failures + total(0);
     let (flags, blocks) = (total(1).min(total(2)), total(3));
     println!("{ok} decompiled, {bad} failed, {flags} flags, {blocks} dispatchers -> {}", dst.display());
