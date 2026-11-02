@@ -84,6 +84,33 @@ fn kindex(p: &Proto, i: i64) -> usize {
 }
 
 /// Fields a DUPTABLE template already holds (type 8 keeps values).
+/// A template's keys in order, as a constructor's fields: those with a value
+/// as `key = value`, the others as slots their stores fill.
+fn template_slots(m: &Module, p: &Proto, i: i64) -> Vec<String> {
+    let K::TableK(v) = &p.k[kindex(p, i)] else { return Vec::new() };
+    let mut out = Vec::with_capacity(v.len());
+    for (key, val) in v {
+        let name = if (*key as usize) < p.k.len() { kstr(m, p, *key as usize) } else { None };
+        let Some(name) = name else { continue };
+        let field = field_text(name);
+        if *val < 0 {
+            out.push(format!("{SLOT}{field}"));
+        } else {
+            out.push(format!("{field} = {}", kexpr(m, p, *val as i64)));
+        }
+    }
+    out
+}
+
+/// A key as a constructor writes it: `name`, or `["any text"]`.
+fn field_text(name: &str) -> String {
+    if is_ident(name) && !is_keyword(name) {
+        name.to_string()
+    } else {
+        format!("[{}]", lua_string(name.as_bytes()))
+    }
+}
+
 fn template_fields(m: &Module, p: &Proto, i: i64) -> Vec<String> {
     let K::TableK(v) = &p.k[kindex(p, i)] else { return Vec::new() };
     let mut out = Vec::with_capacity(v.len());
@@ -189,6 +216,8 @@ enum Undo {
     Consumed(usize, u32),
     /// A constructor had this many fields.
     Fields(E, usize),
+    /// A constructor's field at this index was this.
+    Field(E, usize, String),
     /// A constructor was complete: its fields and text before that.
     Sealed(E, Vec<String>, String),
 }
@@ -738,6 +767,13 @@ impl<'c, 'm> Dec<'c, 'm> {
                         f.truncate(n);
                     }
                 }
+                Undo::Field(e, at, old) => {
+                    if let Some(f) = e.borrow_mut().fields.as_mut() {
+                        if at < f.len() {
+                            f[at] = old;
+                        }
+                    }
+                }
                 Undo::Sealed(e, fields, text) => {
                     let mut x = e.borrow_mut();
                     x.fields = Some(fields);
@@ -752,6 +788,17 @@ impl<'c, 'm> Dec<'c, 'm> {
             }
         }
         self.decl_log.truncate(m.decl);
+    }
+
+    /// A store gives a template key its value, in the key's place.
+    fn fill_slot(&mut self, e: &E, at: usize, text: String) {
+        let mut x = e.borrow_mut();
+        let x = &mut *x;
+        let names = text.as_bytes().split(|c| !is_ident_byte(*c));
+        x.names_read.extend(names.filter(|n| !n.is_empty()).map(key));
+        let f = x.fields.as_mut().expect("a table under construction");
+        let old = std::mem::replace(&mut f[at], text);
+        self.trail.push(Undo::Field(e.clone(), at, old));
     }
 
     /// These fields join the constructor e.
@@ -3958,13 +4005,14 @@ impl<'c, 'm> Dec<'c, 'm> {
                     let table = self.pending[&b].clone();
                     let val = self.get(a);
                     self.pset(b, table.clone());
-                    let field = if is_ident(key) && !is_keyword(key) {
-                        key.to_string()
-                    } else {
-                        format!("[{}]", lua_string(key.as_bytes()))
-                    };
+                    let field = field_text(key);
                     let f = format!("{field} = {}", val.borrow().text);
-                    self.add_fields(&table, [f]);
+                    let slot = format!("{SLOT}{field}");
+                    let at = table.borrow().fields.as_ref().and_then(|fs| fs.iter().position(|x| *x == slot));
+                    match at {
+                        Some(at) => self.fill_slot(&table, at, f),
+                        None => self.add_fields(&table, [f]),
+                    }
                     self.finish_table(out, ind, b, &table, pc);
                 } else {
                     self.flush(out, ind, &[a, b]);
@@ -4134,7 +4182,7 @@ impl<'c, 'm> Dec<'c, 'm> {
                 let table = ex("{}", 100);
                 table.borrow_mut().constructor = true;
                 table.borrow_mut().fields = Some(if o == op::DUPTABLE {
-                    template_fields(m, p, d as i64)
+                    template_slots(m, p, d as i64)
                 } else {
                     Vec::new()
                 });

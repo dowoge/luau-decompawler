@@ -135,12 +135,22 @@ pub fn ex_pure(text: impl Into<String>) -> E {
     e
 }
 
+/// A template key no store has given its value yet, in its place among the
+/// fields: Luau makes a template's keys in order, so where a key is decides
+/// the table's layout.
+pub const SLOT: char = '\u{1}';
+
 impl X {
     pub fn render(&self) -> String {
         match &self.fields {
             None => self.text.clone(),
             Some(f) if f.is_empty() => "{}".to_string(),
-            Some(f) => format!("{{{}}}", f.join(", ")),
+            Some(f) => {
+                // a slot never filled stays in the template, with nothing in it
+                let shown: Vec<String> =
+                    f.iter().map(|x| x.strip_prefix(SLOT).map_or_else(|| x.clone(), |k| format!("{k} = nil"))).collect();
+                format!("{{{}}}", shown.join(", "))
+            }
         }
     }
 }

@@ -13,4 +13,3 @@ open_list_tail_after_branch_split.luau         an open list after a split constr
 open_list_varargs_after_split_prefix.luau      an open list after a split constructor is a loop of stores: the array grows otherwise
 scoped_closures_exceed_local_limit.luau        more than 200 locals: the decompiled text does not compile
 table_shape_after_folded_stores.luau           a copied-in helper with constant arguments loses folded stores: the plain stores left give a smaller array part
-template_field_after_nil_with_collection.luau  a store folded into a template after a field with no value: a call-valued field moves behind the constant ones
