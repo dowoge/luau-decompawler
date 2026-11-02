@@ -116,10 +116,10 @@ pub fn wrap(e: &E, prec: i32) -> String {
     let x = e.borrow();
     let t = &x.text;
     if prec >= 100
-        && (t.starts_with('"')
+        && (t.starts_with(['"', '\'', '`', '['])
             || t.starts_with('{')
             || t.starts_with("function")
-            || t == "..."
+            || matches!(t.as_str(), "..." | "nil" | "true" | "false")
             || t.as_bytes().first().is_some_and(u8::is_ascii_digit)
             || t.starts_with('-'))
     {
