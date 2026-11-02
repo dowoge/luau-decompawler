@@ -3672,6 +3672,15 @@ const USAGE_TYPES: &[(&str, &[(&str, i32)])] = &[
     ("tween", &[("Play", 1), ("Cancel", 2), ("Completed", 2)]),
 ];
 
+/// What only an Instance has.
+const INSTANCE_MEMBERS: &[&str] = &[
+    "FindFirstChild", "WaitForChild", "GetChildren", "GetDescendants", "FindFirstChildOfClass",
+    "FindFirstChildWhichIsA", "FindFirstAncestor", "FindFirstAncestorOfClass", "FindFirstAncestorWhichIsA",
+    "IsDescendantOf", "IsAncestorOf", "ClearAllChildren", "GetAttribute", "SetAttribute",
+    "GetAttributeChangedSignal", "GetPropertyChangedSignal", "ChildAdded", "ChildRemoved",
+    "DescendantAdded", "DescendantRemoving", "IsA",
+];
+
 /// Which lines mention which word. A line listed for a word may no longer
 /// use it (renames leave entries behind), the word may sit in a string, and
 /// words are known by their key, so this only narrows down the lines the exact
@@ -3812,6 +3821,32 @@ fn usage_name(name: &str, out: &[String], at: &[u32]) -> Option<String> {
     }
 }
 
+/// Used with what only an Instance has (`x:FindFirstChild(...)`,
+/// `x.ChildAdded`): an instance, when nothing says more of what it is.
+fn instance_name(name: &str, out: &[String], at: &[u32]) -> Option<String> {
+    let n = name.as_bytes();
+    for j in at {
+        let l = &out[*j as usize];
+        let b = l.as_bytes();
+        let mut i = 0;
+        // (?<![A-Za-z0-9_.])NAME[.:](IDENT)
+        while let Some(p) = find_from(b, n, i) {
+            i = p + 1;
+            if p > 0 && (is_word(b[p - 1]) || b[p - 1] == b'.') {
+                continue;
+            }
+            let e = p + n.len();
+            if e + 1 < b.len() && (b[e] == b'.' || b[e] == b':') && is_start(b[e + 1]) {
+                let member = &l[e + 1..word_end(b, e + 1)];
+                if INSTANCE_MEMBERS.contains(&member) {
+                    return Some("instance".to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 /// The first parameter of `setEnabled` is `enabled`, of `addItem` `item`, of
 /// `getItemByID` `id`: what the function's name says it takes.
 fn param_from_function_name(fname: &str) -> Option<String> {
@@ -3899,20 +3934,22 @@ fn kind_name(name: &str, out: &[String], at: &[u32], defs: &[usize]) -> Option<S
     let arith = |r: &str| [" + ", " - ", " * ", " / ", " // ", " % ", " ^ "].iter().any(|o| r.contains(o));
     let logic = |r: &str| [" and ", " or ", " == ", " ~= ", " < ", " > ", " <= ", " >= ", " .. "].iter().any(|o| r.contains(o));
     let lines = || at.iter().map(|j| strip(&out[*j as usize]));
+    // started at 0 and only ever added to, or set back to 0: by one a count,
+    // else a total
+    let zero = |j: &usize| strip(&out[*j]).split_once(" = ").is_some_and(|(_, r)| r.trim() == "0");
+    if !defs.is_empty() && defs.iter().all(zero) {
+        let add = format!("{name} += ");
+        let steps: Vec<&str> = lines().filter_map(|l| l.strip_prefix(add.as_str())).collect();
+        let (other, reset) = (format!("{name} "), format!("{name} = 0"));
+        let changed = lines().any(|l| l.starts_with(&other) && !l.starts_with(&add) && l != reset && l.contains("= "));
+        if !steps.is_empty() && !changed {
+            return Some(if steps.iter().all(|s| *s == "1") { "count" } else { "total" }.to_string());
+        }
+    }
     if defs.len() == 1 {
         let st = strip(&out[defs[0]]);
         if let Some((_, rhs)) = st.split_once(" = ") {
             let r = rhs.trim();
-            // started at 0 and only ever added to: by one a count, else a total
-            if r == "0" {
-                let add = format!("{name} += ");
-                let steps: Vec<&str> = lines().filter_map(|l| l.strip_prefix(add.as_str())).collect();
-                let other = format!("{name} ");
-                let changed = lines().any(|l| l.starts_with(&other) && !l.starts_with(&add) && l.contains("= "));
-                if !steps.is_empty() && !changed {
-                    return Some(if steps.iter().all(|s| *s == "1") { "count" } else { "total" }.to_string());
-                }
-            }
             let kind = if r.starts_with('{') {
                 Some("t")
             } else if r == "true" || r == "false" {
@@ -4975,6 +5012,9 @@ fn name_pass(out: &mut Vec<String>, index: &mut WordIndex, extra: &Extra) -> boo
             }
             if new.is_none() {
                 new = at.iter().find_map(|j| stored_element(&out[*j as usize], name));
+            }
+            if new.is_none() {
+                new = instance_name(name, &out, at);
             }
             if new.is_none() {
                 // last: the kind of value, `n2` if `n` is taken
