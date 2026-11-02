@@ -227,10 +227,12 @@ enum Undo {
     Sealed(E, Vec<String>, String),
 }
 
-#[derive(Clone, Copy)]
+/// A point to roll back to. While one lives, the trail behind it stays.
+#[derive(Clone)]
 struct Mark {
     trail: usize,
     decl: usize,
+    _live: Rc<()>,
 }
 
 struct RegionFail;
@@ -285,6 +287,8 @@ struct Dec<'c, 'm> {
     region_lines: Option<Vec<String>>,
     iter_call: Option<(usize, String)>,
     trail: Vec<Undo>,
+    /// One more count for every Mark alive: none, and the trail can go.
+    marks: Rc<()>,
     decl_log: Vec<usize>,
     watch_used: bool,
     flat_used: Option<HashSet<Rc<str>>>,
@@ -683,6 +687,7 @@ impl<'c, 'm> Dec<'c, 'm> {
             region_lines: None,
             iter_call: None,
             trail: Vec::new(),
+            marks: Rc::new(()),
             decl_log: Vec::new(),
             watch_used: false,
             flat_used: None,
@@ -898,7 +903,7 @@ impl<'c, 'm> Dec<'c, 'm> {
     }
 
     fn mark(&self) -> Mark {
-        Mark { trail: self.trail.len(), decl: self.decl_log.len() }
+        Mark { trail: self.trail.len(), decl: self.decl_log.len(), _live: self.marks.clone() }
     }
 
     fn rollback(&mut self, m: Mark) {
@@ -1008,7 +1013,17 @@ impl<'c, 'm> Dec<'c, 'm> {
         self.trail.push(Undo::DefKey(e.clone(), old));
     }
 
+    /// What no mark can roll back to holds every value the function made
+    /// until now: let it go.
+    #[inline]
+    fn forget(&mut self) {
+        if self.trail.len() > 4096 && Rc::strong_count(&self.marks) == 1 {
+            self.trail.clear();
+        }
+    }
+
     fn pset(&mut self, r: usize, e: E) {
+        self.forget();
         let old = self.pending.insert(r, e);
         self.trail.push(Undo::Pending(r, old));
     }
@@ -1016,6 +1031,7 @@ impl<'c, 'm> Dec<'c, 'm> {
     fn ppop(&mut self, r: usize) -> Option<E> {
         let old = self.pending.remove(&r);
         if old.is_some() {
+            self.forget();
             self.trail.push(Undo::Pending(r, old.clone()));
         }
         old
@@ -1963,7 +1979,9 @@ impl<'c, 'm> Dec<'c, 'm> {
         let shared = self.share_closures(base);
         // The first pass learns which jumps stay gotos. Few functions have any:
         // then what it printed is final, since labels are all a second pass adds.
-        let start = self.mark();
+        // what printing it again with new labels starts from; the rest is
+        // cleared then (a mark here would keep every value it ever made)
+        let (start_names, start_declared, start_used) = (self.regname.clone(), self.declared.clone(), self.used.clone());
         self.base_indent = base as i32;
         let mut out = Vec::new();
         self.reset_defs();
@@ -1974,7 +1992,14 @@ impl<'c, 'm> Dec<'c, 'm> {
                 break;
             }
             let targets = std::mem::take(&mut self.goto_targets);
-            self.rollback(start);
+            if self.watch_used {
+                // the dispatcher form reserves the names known at this point
+                self.flat_used = Some(self.used.clone());
+                self.watch_used = false;
+            }
+            self.regname.clone_from(&start_names);
+            self.declared.clone_from(&start_declared);
+            self.used.clone_from(&start_used);
             self.pending.clear();
             self.trail.clear();
             self.decl_log.clear();
