@@ -3725,6 +3725,78 @@ fn usage_name(name: &str, out: &[String], at: &[u32]) -> Option<String> {
     }
 }
 
+/// A name from what the variable is passed to or done with: the argument
+/// slot of a well-known call, a class it is tested for, being called.
+fn slot_name(name: &str, out: &[String], at: &[u32]) -> Option<String> {
+    // (text before the name, text after it, the name it gives), strongest first
+    const SLOTS: &[(&str, &str, &str)] = &[
+        (":FireClient(", "", "player"),
+        (":InvokeClient(", "", "player"),
+        (":GetPlayerFromCharacter(", ")", "character"),
+        (":FindFirstChild(", ")", "childName"),
+        (":WaitForChild(", "", "childName"),
+        (":GetAttribute(", ")", "attribute"),
+        (":SetAttribute(", ",", "attribute"),
+        (":GetService(", ")", "serviceName"),
+        ("require(", ")", "module"),
+        ("task.wait(", ")", "seconds"),
+        ("task.delay(", ",", "seconds"),
+        ("ipairs(", ")", "list"),
+        ("table.insert(", ",", "list"),
+        ("table.remove(", "", "list"),
+        ("table.sort(", "", "list"),
+        ("table.concat(", "", "list"),
+        ("table.find(", ",", "list"),
+        ("string.format(", ",", "format"),
+        ("pairs(", ")", "map"),
+    ];
+    let mut class: Option<String> = None;
+    let mut called = false;
+    let mut found: Option<(usize, &str)> = None;
+    for j in at {
+        let l = &out[*j as usize];
+        // NAME:IsA("Class")
+        let isa = format!("{name}:IsA(\"");
+        if let Some(p) = l.find(&isa) {
+            let ok = p == 0 || !is_word(l.as_bytes()[p - 1]);
+            let rest = &l[p + isa.len()..];
+            if let Some(c) = rest.split('"').next().filter(|c| ok && is_token(c)) {
+                class = Some(lower_first(c));
+            }
+        }
+        for (k, (before, after, n)) in SLOTS.iter().enumerate() {
+            let mut from = 0;
+            while let Some(p) = l[from..].find(before).map(|x| x + from) {
+                from = p + before.len();
+                let rest = &l[from..];
+                if rest.starts_with(name) && (after.is_empty() || rest[name.len()..].starts_with(after)) {
+                    let next = rest.as_bytes().get(name.len()).copied().unwrap_or(b' ');
+                    if !is_word(next) && found.is_none_or(|f| k < f.0) {
+                        found = Some((k, n));
+                    }
+                }
+            }
+        }
+        // NAME( called, not NAME.f( or a.NAME(
+        let b = l.as_bytes();
+        let mut from = 0;
+        while let Some(p) = l[from..].find(name).map(|x| x + from) {
+            from = p + name.len();
+            let before_ok = p == 0 || !(is_word(b[p - 1]) || b[p - 1] == b'.' || b[p - 1] == b':');
+            if before_ok && b.get(from) == Some(&b'(') {
+                called = true;
+            }
+        }
+    }
+    if let Some(c) = class {
+        return Some(c);
+    }
+    if let Some((_, n)) = found {
+        return Some(n.to_string());
+    }
+    called.then(|| "callback".to_string())
+}
+
 /// `^(?:get|Get|...|calculate|Calculate)([A-Z][A-Za-z0-9_]*)$`: the group.
 fn getter_noun(s: &str) -> Option<&str> {
     for p in [
@@ -4150,7 +4222,7 @@ fn event_params(out: &mut [String]) {
         }) else {
             continue;
         };
-        let end = block_end(out, i);
+        let end = block_end(out, i).saturating_sub(1).max(i); // its `end` line is not its own
         for (k, p) in params.iter().enumerate() {
             let Some(new) = names.get(k) else { break };
             if is_generated(p) && !word_in(out, i, end, new) {
@@ -4254,7 +4326,21 @@ fn unused_params(out: &mut [String]) {
         if !params.iter().any(|p| is_generated(p)) {
             continue;
         }
-        let end = block_end(out, i);
+        let end = block_end(out, i).saturating_sub(1).max(i); // its `end` line is not its own
+        // a `_` the body reads (a global, say) would become this parameter;
+        // one a loop or local declares there is its own
+        let declares_underscore = |l: &str| {
+            let s = l.trim_start();
+            let names = s
+                .strip_prefix("for ")
+                .and_then(|r| r.split(" in ").next().map(|n| n.split(" = ").next().unwrap_or(n)))
+                .or_else(|| s.strip_prefix("local ").and_then(|r| r.split(" = ").next()));
+            names.is_some_and(|n| n.split(',').any(|v| v.trim() == "_"))
+        };
+        let reads_underscore = (i + 1..=end).any(|j| has_word(&out[j], "_") && !declares_underscore(&out[j]));
+        if reads_underscore {
+            continue;
+        }
         for p in &params {
             if is_generated(p) && !word_in(out, i + 1, end, p) {
                 replace_token(&mut out[i], p, "_");
@@ -4454,6 +4540,9 @@ fn name_pass(out: &mut Vec<String>, index: &mut WordIndex, extra: &Extra) -> boo
             if new.is_none() {
                 new = usage_name(name, &out, at);
             }
+            if new.is_none() {
+                new = slot_name(name, &out, at);
+            }
             if let Some(n) = new {
                 if !n.is_empty() {
                     cands.push((name.clone(), n));
@@ -4468,7 +4557,9 @@ fn name_pass(out: &mut Vec<String>, index: &mut WordIndex, extra: &Extra) -> boo
             {
                 continue;
             }
-            let stop = if hi < out.len() { hi + 1 } else { hi };
+            // up to the line that ends the function: what follows its `end`
+            // there is the enclosing code's (`end}, function(a)` opens the next)
+            let stop = hi;
             let hits: Vec<u32> = index.within(old, fi, stop).to_vec();
             for j in &hits {
                 replace_token(&mut out[*j as usize], old, new);
