@@ -3627,8 +3627,11 @@ impl<'c, 'm> Dec<'c, 'm> {
             if (joined && left == 0) || self.is_loop_head(q) {
                 return false; // another path joins while it is being built
             }
+            // (at -O0 a constructor's `k = v` stores from a key register)
             let keyed = matches!(ins.op, op::SETTABLEKS | op::SETTABLEN)
-                || ins.op == op::SETTABLE && ins.c() != r && self.template_key_store(pc, i);
+                || ins.op == op::SETTABLE
+                    && ins.c() != r
+                    && (self.template_key_store(pc, i) || (self.insn(pc).op == op::NEWTABLE && self.settable_key(i).is_some()));
             if keyed && qb == r && qa != r {
                 if open {
                     return false; // a store of its own: the constructor ended
@@ -5247,7 +5250,10 @@ impl<'c, 'm> Dec<'c, 'm> {
                     match slot {
                         Some((n, at)) => self.fill_slot(&table, at, format!("{} = {}", field_text(n), val.borrow().text)),
                         None => {
-                            let f = format!("[{}] = {}", key.borrow().text, val.borrow().text);
+                            let f = match named.filter(|_| temp) {
+                                Some(n) => format!("{} = {}", field_text(n), val.borrow().text),
+                                None => format!("[{}] = {}", key.borrow().text, val.borrow().text),
+                            };
                             self.add_fields(&table, [f]);
                         }
                     }
