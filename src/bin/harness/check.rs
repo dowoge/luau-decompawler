@@ -16,7 +16,7 @@ use crate::luau::{command, percent, repo, text_of, Args, Tools};
 use crate::text::undeclared;
 
 const QUICK: [(u64, usize, u64); 1] = [(300, 12, 700000)];
-const FULL: [(u64, usize, u64); 33] = [
+const FULL: [(u64, usize, u64); 36] = [
     (300, 3, 5000),
     (300, 18, 20000),
     (300, 12, 700000),
@@ -44,6 +44,9 @@ const FULL: [(u64, usize, u64); 33] = [
     (1, 25, 70654),
     (1, 25, 32271),
     (1, 25, 33554),
+    (1, 25, 34394),
+    (1, 25, 35640),
+    (1, 80, 82039),
     (1, 120, 90008),
     (1, 120, 90149),
     (1, 120, 90404),
