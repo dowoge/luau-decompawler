@@ -110,6 +110,10 @@ fn real_scripts(tools: &Tools, dumps: &str) -> bool {
         let said = text_of(&run.stdout) + &text_of(&run.stderr);
         let line = said.trim().lines().last().unwrap_or("").to_string();
         println!("{line}");
+        if !run.status.success() {
+            println!("  the decompiler stopped on {}: {}", place, run.status);
+            good = false;
+        }
         let found = compare_place(tools, root, &output, place);
         let same = found.functions - found.rows.len();
         println!("  {} functions, {same} identical ({})", found.functions, percent(same, found.functions));
