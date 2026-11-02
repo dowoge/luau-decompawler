@@ -4517,7 +4517,8 @@ impl<'c, 'm> Dec<'c, 'm> {
                             let ex_ = if else_end == end { self.range_exit() } else { Some(else_end) };
                             self.emit_range(&mut body, ind + 4, t2, else_end, None, ex_);
                             self.flush(&mut body, ind + 4, &[]);
-                            out.extend(passes::merge_elseif(body, ind));
+                            let round = self.jump_word(else_end) == Some("continue");
+                            out.extend(passes::merge_elseif(body, ind, round));
                             out.push(format!("{pad}end"));
                             return else_end;
                         }
@@ -4578,7 +4579,8 @@ impl<'c, 'm> Dec<'c, 'm> {
                 let ex_ = if ee == end { self.range_exit() } else { Some(ee) };
                 self.emit_range(&mut body, ind + 4, target, ee, None, ex_);
                 self.flush(&mut body, ind + 4, &[]);
-                out.extend(passes::merge_elseif(body, ind));
+                let round = self.jump_word(ee) == Some("continue");
+                out.extend(passes::merge_elseif(body, ind, round));
                 out.push(format!("{pad}end"));
                 return ee;
             }
@@ -4616,7 +4618,8 @@ impl<'c, 'm> Dec<'c, 'm> {
             let ex_ = self.range_exit();
             self.emit_range(&mut body, ind + 4, nxt, end, None, ex_);
             self.flush(&mut body, ind + 4, &[]);
-            out.extend(passes::merge_elseif(body, ind));
+            let round = self.jump_word(end) == Some("continue");
+            out.extend(passes::merge_elseif(body, ind, round));
             out.push(format!("{pad}end"));
             return end;
         }

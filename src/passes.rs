@@ -844,8 +844,10 @@ pub fn wrap_mid_block_exits(lines: Vec<String>) -> Vec<String> {
     out
 }
 
-/// An else block that is one if statement becomes elseif branches.
-pub fn merge_elseif(body: Vec<String>, ind: usize) -> Vec<String> {
+/// An else block that is one if statement becomes elseif branches. With
+/// `goes_round` (the if ends where its loop goes round), one that opens with
+/// `if X then continue end` does too: `elseif not X then <the rest>`.
+pub fn merge_elseif(body: Vec<String>, ind: usize, goes_round: bool) -> Vec<String> {
     let pad = spaces(ind);
     let inner_pad = spaces(ind + 4);
     let if_head = format!("{inner_pad}if ");
@@ -872,10 +874,118 @@ pub fn merge_elseif(body: Vec<String>, ind: usize) -> Vec<String> {
             return out;
         }
     }
+    // `if X then continue end` and more: the arm runs when X does not hold,
+    // and where the if ends the loop goes round anyway
+    let guard = |s: &str| -> Option<(String, &'static str)> {
+        let test = s.strip_prefix(&if_head)?.strip_suffix(" then continue end")?;
+        Some((test.to_string(), "continue"))
+    };
+    let three = |b: &[String]| -> Option<(String, &'static str)> {
+        let test = b.first()?.strip_prefix(&if_head)?.strip_suffix(" then")?;
+        let exit = b.get(1).filter(|l| **l == format!("{inner_pad}    continue")).map(|_| "continue")?;
+        (b.get(2).is_some_and(|l| *l == inner_end)).then(|| (test.to_string(), exit))
+    };
+    let found = if goes_round {
+        body.first().and_then(|l| guard(l)).map(|g| (g, 1)).or_else(|| three(&body).map(|g| (g, 3)))
+    } else {
+        None
+    };
+    if let Some(((test, _), skip)) = found {
+        if skip < body.len() && !test.contains('\n') {
+            let mut out = Vec::with_capacity(body.len());
+            out.push(format!("{pad}elseif {} then", negated_test(&test)));
+            out.extend(body[skip..].iter().cloned());
+            return out;
+        }
+    }
     let mut out = Vec::with_capacity(body.len() + 1);
     out.push(format!("{pad}else"));
     out.extend(body);
     out
+}
+
+/// The test that holds when `c` does not: `a ~= b` and `a == b` swap (Lua's
+/// `~=` is `not ==`, metamethods too), `not x` loses its `not`; any other is
+/// `not (c)` (`<` and friends do not swap: NaN).
+fn negated_test(c: &str) -> String {
+    let b = c.as_bytes();
+    // top-level operators only
+    let mut depth = 0;
+    let mut quote: Option<u8> = None;
+    let mut found: Vec<(usize, &str)> = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        let ch = b[i];
+        if let Some(q) = quote {
+            if ch == b'\\' {
+                i += 2;
+                continue;
+            }
+            if ch == q {
+                quote = None;
+            }
+        } else {
+            match ch {
+                b'"' | b'\'' | b'`' => quote = Some(ch),
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => depth -= 1,
+                _ if depth == 0 => {
+                    for op in [" ~= ", " == ", " and ", " or ", " < ", " > ", " <= ", " >= "] {
+                        if c[i..].starts_with(op) {
+                            found.push((i, op));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    if let [(at, op)] = found.as_slice() {
+        let swapped = match *op {
+            " ~= " => Some(" == "),
+            " == " => Some(" ~= "),
+            _ => None,
+        };
+        if let Some(s) = swapped {
+            return format!("{}{s}{}", &c[..*at], &c[at + op.len()..]);
+        }
+    }
+    if let Some(inner) = c.strip_prefix("not ") {
+        // one operand: no space outside brackets and strings (printed binary
+        // operators are spaced), so `not` applies to all of it
+        if one_operand(inner) {
+            return inner.to_string();
+        }
+    }
+    negated(c)
+}
+
+/// No space outside brackets and strings: one operand, as this code prints.
+fn one_operand(s: &str) -> bool {
+    let b = s.as_bytes();
+    let (mut depth, mut quote, mut i) = (0i32, None::<u8>, 0);
+    while i < b.len() {
+        let ch = b[i];
+        match quote {
+            Some(q) => {
+                if ch == b'\\' {
+                    i += 1;
+                } else if ch == q {
+                    quote = None;
+                }
+            }
+            None => match ch {
+                b'"' | b'\'' | b'`' => quote = Some(ch),
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => depth -= 1,
+                b' ' if depth == 0 => return false,
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    !s.is_empty() && depth == 0 && quote.is_none()
 }
 
 /// `^ *(for .* do|while .* do|repeat)$`
