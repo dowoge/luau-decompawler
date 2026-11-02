@@ -1,6 +1,5 @@
 # Programs that do not behave yet, and why. A listed one that behaves
 # fails the check until it is taken off.
-bracketed_index_keys_then_fields.luau          table built differently (stores folded into or split from its constructor): Luau sizes it otherwise and pairs order changes
 conditional_arguments_past_local_limit.luau    more than 200 locals: the decompiled text does not compile
 dupclosure_cache_follows_first_capture.luau    one function literal reached from several closure loads is printed once per load: closures equal in Luau no longer are
 empty_table_sized_by_conditional_stores.luau   constructor split into {} and stores: the stores after it size the table, pairs order changes

@@ -2382,7 +2382,13 @@ impl<'c, 'm> Dec<'c, 'm> {
             return None;
         }
         // `{}` then the stores: sized by the distinct `.name` fields stored
-        let mut names: Vec<&str> = stores.iter().filter(|s| s.op == op::SETTABLEKS).filter_map(name_of).collect();
+        // into that local anywhere in the function
+        let web = self.flow.def_web(pc, r);
+        let mut names: Vec<&str> = code
+            .iter()
+            .filter(|s| s.op == op::SETTABLEKS && s.a() != s.b() && web.is_some() && self.flow.use_web(s.pc, s.b()) == web)
+            .filter_map(name_of)
+            .collect();
         names.sort_unstable();
         names.dedup();
         if hash_class(names.len()) == want {
