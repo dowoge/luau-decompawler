@@ -1197,6 +1197,23 @@ impl<'c, 'm> Dec<'c, 'm> {
         }
     }
 
+    /// A call is about to write out the waiting values not in `keep`. A value
+    /// with effects made before one of those (a lower register) goes too:
+    /// kept, it would be written after it. Constructors still being built stay.
+    fn keep_older_effects(&self, keep: &mut Vec<usize>) {
+        let effect = |r: &usize| {
+            let x = self.pending[r].borrow();
+            match &x.fields {
+                None => !x.pure_,
+                Some(f) => f.iter().any(|t| t.contains('(')), // built with a call already
+            }
+        };
+        let lowest = self.pending.keys().filter(|r| !keep.contains(r) && effect(r)).min().copied();
+        if let Some(low) = lowest {
+            keep.retain(|r| !effect(r) || *r > low);
+        }
+    }
+
     /// Put the call back where a helper's code was copied in. The pc after it.
     fn helper_call(&mut self, out: &mut Vec<String>, ind: usize, pc: i32) -> Option<i32> {
         let (call, name) = self.inline_at(pc)?;
@@ -1242,12 +1259,13 @@ impl<'c, 'm> Dec<'c, 'm> {
             }
             name.to_string()
         };
-        let keep: Vec<usize> = self
+        let mut keep: Vec<usize> = self
             .pending
             .iter()
             .filter(|(r, e)| e.borrow().pure_ || self.flows_from(call.end, call.result, **r))
             .map(|(r, _)| *r)
             .collect();
+        self.keep_older_effects(&mut keep);
         self.flush(out, ind, &keep);
         // that may have just given the helper's closure its name
         let current = self.ctx.helpers.borrow().iter().find(|h| h.0 == call.helper).map(|h| h.1.clone());
@@ -1514,12 +1532,18 @@ impl<'c, 'm> Dec<'c, 'm> {
         if let Some(old) = self.ppop(r) {
             // the old value was never read: it was a statement in its own right
             let x = old.borrow();
+            let has_call = x.fields.as_ref().is_some_and(|f| f.iter().any(|t| t.contains('(')));
             if x.text.ends_with(')')
                 && !x.text.starts_with("function")
                 && !x.text.starts_with('(')
                 && x.text.contains('(')
             {
                 out.push(format!("{}{}", sp(ind), x.text));
+            } else if has_call {
+                // a table nothing reads, built with calls: those still happen
+                drop(x);
+                self.seal(&old);
+                self.assign(out, ind, r, &old);
             }
         }
         let pc = self.cur_pc;
@@ -4085,12 +4109,13 @@ impl<'c, 'm> Dec<'c, 'm> {
                         self.ppop(r);
                     }
                 }
-                let keep: Vec<usize> = self
+                let mut keep: Vec<usize> = self
                     .pending
                     .iter()
                     .filter(|(r, e)| **r < a && (e.borrow().pure_ || self.flows_with_call(pc, **r)))
                     .map(|(r, _)| *r)
                     .collect();
+                self.keep_older_effects(&mut keep);
                 self.flush(out, ind, &keep);
                 if c == 1 {
                     out.push(format!("{pad}{}", call.borrow().text));
@@ -4268,7 +4293,11 @@ impl<'c, 'm> Dec<'c, 'm> {
                     if let Some(list) = open_end {
                         let at = aux as u64 + texts.len() as u64;
                         out.push(format!("{pad}for i_, v_ in {{{list}}} do"));
-                        out.push(format!("{pad}    {tbl}[i_ + {}] = v_", at - 1));
+                        if at == 1 {
+                            out.push(format!("{pad}    {tbl}[i_] = v_"));
+                        } else {
+                            out.push(format!("{pad}    {tbl}[i_ + {}] = v_", at - 1));
+                        }
                         out.push(format!("{pad}end"));
                     }
                 }

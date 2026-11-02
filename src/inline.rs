@@ -633,6 +633,23 @@ pub fn match_call(m: &Module, caller: &Proto, id: usize, start: usize) -> Option
                         i = skip(code, i + 1);
                     }
                 }
+                // `return value` of a parameter given a constant (or first read
+                // here): the copy loads that constant where the result goes
+                2 if p.a() < walk.helper.numparams
+                    && walk.map[p.a()].is_none()
+                    && result.is_none_or(|r| r == c.a())
+                    && walk.load_text(c).is_some_and(|t| match walk.args.get(p.a()) {
+                        Some(Some(Arg::Const(k))) => *k == t,
+                        Some(None) => true,
+                        _ => false,
+                    }) =>
+                {
+                    let text = walk.load_text(c)?;
+                    walk.args[p.a()] = Some(Arg::Const(text));
+                    result = Some(c.a());
+                    last = c.pc;
+                    i = skip(code, i + 1);
+                }
                 _ if p.b() != 1 && walk.map[p.a()].is_none() && !walk.unread.contains_key(&p.a()) => {
                     if result.is_some() {
                         return refuse("a value is used and not used");
