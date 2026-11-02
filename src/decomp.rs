@@ -1103,6 +1103,20 @@ impl<'c, 'm> Dec<'c, 'm> {
         None
     }
 
+    /// A named function in r still waiting to be written goes out now, under
+    /// its name, for what reads r to read that: moved on or passed, it was a
+    /// local in the source (a function written in a call has no name).
+    fn declare_named(&mut self, out: &mut Vec<String>, ind: usize, r: usize) {
+        let named = self.pending.get(&r).is_some_and(|e| {
+            let x = e.borrow();
+            x.closure.is_some() && x.hint.as_deref().is_some_and(|h| !h.is_empty())
+        });
+        if named {
+            let e = self.get(r);
+            self.assign(out, ind, r, &e);
+        }
+    }
+
     /// Put the call back where a helper's code was copied in. The pc after it.
     fn helper_call(&mut self, out: &mut Vec<String>, ind: usize, pc: i32) -> Option<i32> {
         let (call, name) = self.inline_at(pc)?;
@@ -1110,6 +1124,7 @@ impl<'c, 'm> Dec<'c, 'm> {
         for arg in &call.args {
             args.push(match arg {
                 Some(Arg::Reg(r, read)) => {
+                    self.declare_named(out, ind, *r);
                     let old = self.key_pc.replace(*read);
                     let v = self.get(*r);
                     self.key_pc = old;
@@ -2101,6 +2116,9 @@ impl<'c, 'm> Dec<'c, 'm> {
             } else if ins.op == op::SETLIST && qa == r {
                 listed = true;
                 last = Some(ins.pc);
+                if ins.c() == 0 {
+                    break; // all of a call or `...`: the last item, nothing joins behind it
+                }
             } else {
                 let (rd, wr, barrier) = self.flow.effects[i];
                 let joined = self.has_label(ins.pc) && self.first_jump[ins.pc as usize] <= pc;
@@ -2135,6 +2153,7 @@ impl<'c, 'm> Dec<'c, 'm> {
         let code = &self.p.code;
         let mut i = self.flow.idx(pc).unwrap() + 1;
         let mut left = self.template_holes(pc);
+        let mut open = false; // the list ended in all of a call or `...`
         while i < code.len() {
             let ins = code[i];
             let q = ins.pc;
@@ -2144,11 +2163,15 @@ impl<'c, 'm> Dec<'c, 'm> {
                 return false; // another path joins while it is being built
             }
             if matches!(ins.op, op::SETTABLEKS | op::SETTABLEN) && qb == r && qa != r {
+                if open {
+                    return false; // a store of its own: the constructor ended
+                }
                 left = left.saturating_sub(1);
                 i += 1;
                 continue;
             }
             if ins.op == op::SETLIST && qa == r {
+                open = ins.c() == 0;
                 i += 1;
                 continue;
             }
@@ -3553,18 +3576,13 @@ impl<'c, 'm> Dec<'c, 'm> {
             op::LOADK => self.put(out, ind, a, ex_pure(kexpr(m, p, d as i64)), true),
             op::LOADKX => self.put(out, ind, a, ex_pure(kexpr(m, p, aux as i64)), true),
             op::MOVE => {
+                self.declare_named(out, ind, b); // to where copied-in code keeps it, or an argument
                 let shared = !self.pending.contains_key(&b) && self.shared(pc, b);
                 let v = self.get(b);
                 if shared {
                     v.borrow_mut().pure_ = false; // a call may change it
                 }
-                // a named function made in a temporary (copied-in code returned
-                // it) and moved to where it is kept: declared there, by name
-                let named = {
-                    let x = v.borrow();
-                    x.closure.is_some() && x.hint.as_deref().is_some_and(|h| !h.is_empty())
-                };
-                self.put(out, ind, a, v, !named);
+                self.put(out, ind, a, v, true);
             }
             op::GETGLOBAL => {
                 let t = match kstr(m, p, aux as usize) {
@@ -3702,16 +3720,7 @@ impl<'c, 'm> Dec<'c, 'm> {
                 self.pset(a + 1, s);
             }
             op::CALL | op::CALLFB => {
-                // a named function (inlined code kept it in a temporary) is
-                // called by its name, not written out in the call
-                let named = self.pending.get(&a).is_some_and(|e| {
-                    let x = e.borrow();
-                    x.closure.is_some() && x.hint.as_deref().is_some_and(|h| !h.is_empty())
-                });
-                if named {
-                    let e = self.get(a);
-                    self.assign(out, ind, a, &e);
-                }
+                self.declare_named(out, ind, a); // copied-in code returned it
                 let f = self.get(a);
                 let mut nargs = b as i32 - 1;
                 let self_call = self.pending.get(&(a + 1)).is_some_and(|e| e.borrow().text == "<self>");

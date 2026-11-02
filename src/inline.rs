@@ -474,10 +474,17 @@ impl Walk<'_> {
             }
             op::SETLIST => {
                 ((pcc, p.aux) == (cc, c.aux)).then_some(())?;
-                if pcc == 0 {
-                    return None;
-                }
                 self.read(pa, ca, pc)?;
+                if pcc == 0 {
+                    // up to the last open list, which sits in a register above
+                    self.read(pb, cb, pc)?;
+                    let mut i = 1;
+                    while self.map.get(pb + i).is_some_and(|m| m.is_some()) {
+                        self.read(pb + i, cb + i, pc)?;
+                        i += 1;
+                    }
+                    return Some(());
+                }
                 self.range(pb, cb, pcc - 1, pc)
             }
             op::JUMP => self.jump(p, c),
