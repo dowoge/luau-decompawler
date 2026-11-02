@@ -6,8 +6,13 @@
 //!   luau_decompile FILE.wire              readable Luau to stdout
 //!   luau_decompile --disasm FILE.wire     annotated disassembly
 //!   --upstream                            input is stock Luau bytecode
+//!   --key N                               opcodes stored times N (203: a
+//!                                         Roblox client's bytecode)
 //!   luau_decompile --dir DIR [--out OUT]  every *.wire in DIR (index.tsv
-//!                                         paths name the outputs)
+//!                                         paths name the outputs; with
+//!                                         --key also .lua .luau .txt .bin)
+//!
+//! Bytecode saved as text, a `--` line and then base64, is read as such.
 //!   luau_decompile --stream               bytecode as records on stdin, each
 //!                                         by itself as if run alone; results
 //!                                         go out as records, and last a line
@@ -40,7 +45,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use bytecode::{parse, Module};
+use bytecode::{Module, Opcodes};
 use hash::{HashMap, HashSet};
 use pack::Packed;
 use passes::{CallMap, Extra, Tally};
@@ -266,13 +271,25 @@ fn read_index(src: &Path) -> HashMap<String, String> {
     names
 }
 
-fn run_dir(src: &Path, dst: &Path, upstream: bool, noflat: bool) -> i32 {
+/// A bytecode file's module: bytecode itself, or saved as text.
+fn load(data: &[u8], opcodes: Opcodes) -> Result<Module, String> {
+    let text = bytecode::saved_text(data);
+    bytecode::parse_as(text.as_deref().unwrap_or(data), opcodes)
+}
+
+fn run_dir(src: &Path, dst: &Path, opcodes: Opcodes, noflat: bool) -> i32 {
     let names = read_index(src);
+    // dumps of a game's wire bytecode, or with a key other saved scripts
+    let keyed = matches!(opcodes, Opcodes::Key(_));
+    let input = |f: &str| {
+        f.ends_with(".wire") || keyed && [".lua", ".luau", ".txt", ".bin"].iter().any(|x| f.ends_with(x))
+    };
     let mut files: Vec<String> = match fs::read_dir(src) {
         Ok(d) => d
             .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
             .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|f| f.ends_with(".wire"))
+            .filter(|f| input(f))
             .collect(),
         Err(e) => {
             eprintln!("{}: {e}", src.display());
@@ -280,7 +297,7 @@ fn run_dir(src: &Path, dst: &Path, upstream: bool, noflat: bool) -> i32 {
         }
     };
     files.sort();
-    let sids: Vec<&str> = files.iter().map(|f| &f[..f.len() - 5]).collect();
+    let sids: Vec<&str> = files.iter().map(|f| f.rsplit_once('.').map_or(f.as_str(), |x| x.0)).collect();
 
     let t0 = std::time::Instant::now();
     let timing = std::env::var_os("LUAU_TIMING").is_some();
@@ -345,7 +362,7 @@ fn run_dir(src: &Path, dst: &Path, upstream: bool, noflat: bool) -> i32 {
     let core: Vec<Core> = par_map_sized(&sizes, budget, |i| {
         let run = || -> Result<String, String> {
             let data = fs::read(src.join(&files[i])).map_err(|e| e.to_string())?;
-            let m = parse(&data, !upstream)?;
+            let m = load(&data, opcodes)?;
             Ok(decompile_core(&m, names.get(sids[i]).map(String::as_str), noflat).join("\n"))
         };
         alloc::job(
@@ -518,7 +535,7 @@ fn read_records(all: &[u8]) -> Vec<&[u8]> {
 /// Starting a process costs far more than decompiling a small program, so
 /// many can share one, and files would only carry them there and back. Each
 /// result goes out as soon as it is ready: a crash later keeps what was done.
-fn run_stream(upstream: bool, noflat: bool) -> i32 {
+fn run_stream(opcodes: Opcodes, noflat: bool) -> i32 {
     let mut all = Vec::new();
     if let Err(e) = std::io::stdin().read_to_end(&mut all) {
         eprintln!("stdin: {e}");
@@ -528,7 +545,7 @@ fn run_stream(upstream: bool, noflat: bool) -> i32 {
     let out = Mutex::new(std::io::stdout());
     let written = par_map(items.len(), |i| {
         let one = || -> Result<String, String> {
-            let m = parse(items[i], !upstream)?;
+            let m = load(items[i], opcodes)?;
             Ok(to_text(&name_round(decompile_core(&m, None, noflat), &Extra::default())))
         };
         let result = panic::catch_unwind(AssertUnwindSafe(one)).unwrap_or_else(|e| Err(panic_text(e)));
@@ -549,7 +566,11 @@ fn usage() -> i32 {
     println!(
         "luau_decompile FILE.wire | --disasm FILE.wire | --dir DIR [--out OUT] | --stream\n\
          \x20 --upstream   input is stock Luau bytecode (luau_compile output)\n\
-         \x20 --tabs       indent with tabs"
+         \x20 --key N      opcodes stored multiplied: the opcode is a byte times N mod 256\n\
+         \x20              (203 for a Roblox client's bytecode); with --dir, .lua, .luau,\n\
+         \x20              .txt and .bin files are read too\n\
+         \x20 --tabs       indent with tabs\n\
+         Bytecode saved as text, a `--` line and then base64, is read as such."
     );
     2
 }
@@ -558,17 +579,32 @@ fn run(args: Vec<String>) -> i32 {
     let noflat = std::env::var_os("LUAU_NOFLAT").is_some_and(|v| !v.is_empty());
     let upstream = args.iter().any(|a| a == "--upstream");
     TABS.store(args.iter().any(|a| a == "--tabs"), std::sync::atomic::Ordering::Relaxed);
-    let args: Vec<String> = args.into_iter().filter(|a| a != "--upstream" && a != "--tabs").collect();
+    let key = match args.iter().position(|a| a == "--key") {
+        Some(i) => match args.get(i + 1).and_then(|v| v.parse::<u8>().ok()) {
+            Some(k) => Some(k),
+            None => return usage(),
+        },
+        None => None,
+    };
+    let opcodes = match key {
+        Some(k) => Opcodes::Key(k),
+        None if upstream => Opcodes::Stock,
+        None => Opcodes::Wire,
+    };
+    let mut args: Vec<String> = args.into_iter().filter(|a| a != "--upstream" && a != "--tabs").collect();
+    if let Some(i) = args.iter().position(|a| a == "--key") {
+        args.drain(i..i + 2);
+    }
     if args.len() >= 2 && args[0] == "--dir" {
         let src = PathBuf::from(&args[1]);
         let dst = match args.iter().position(|a| a == "--out") {
             Some(i) if i + 1 < args.len() => PathBuf::from(&args[i + 1]),
             _ => src.join("lua"),
         };
-        return run_dir(&src, &dst, upstream, noflat);
+        return run_dir(&src, &dst, opcodes, noflat);
     }
     if args.first().is_some_and(|a| a == "--stream") {
-        return run_stream(upstream, noflat);
+        return run_stream(opcodes, noflat);
     }
     let disasm = args.iter().any(|a| a == "--disasm");
     let Some(file) = args.iter().find(|a| !a.starts_with("--")) else { return usage() };
@@ -579,7 +615,7 @@ fn run(args: Vec<String>) -> i32 {
             return 2;
         }
     };
-    let text = match parse(&data, !upstream) {
+    let text = match load(&data, opcodes) {
         Ok(m) if disasm => decomp::disassemble(&m),
         Ok(m) => to_text(&name_round(decompile_core(&m, None, noflat), &Extra::default())),
         Err(e) => {

@@ -357,7 +357,7 @@ pub fn decompile_many(binary: &str, bytecode: &[Vec<u8>], seconds: u64) -> Vec<R
 
 /// Parses bytecode the compiler just wrote.
 pub fn module(bc: &[u8]) -> crate::bytecode::Module {
-    crate::bytecode::parse(bc, false).expect("the compiler's own bytecode parses")
+    crate::bytecode::parse_as(bc, crate::bytecode::Opcodes::Stock).expect("the compiler's own bytecode parses")
 }
 
 pub fn percent(part: usize, whole: usize) -> String {

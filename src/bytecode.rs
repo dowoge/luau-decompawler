@@ -382,9 +382,60 @@ impl Reader<'_> {
     }
 }
 
-/// Reads a whole bytecode blob. `scrambled` is true for Roblox wire bytecode,
-/// false for stock Luau output.
-pub fn parse(data: &[u8], scrambled: bool) -> R<Module> {
+/// How a blob stores its opcodes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Opcodes {
+    /// Roblox wire bytecode: through the two tables above
+    Wire,
+    /// stock Luau output
+    Stock,
+    /// multiplied by a key: the opcode is the stored byte times it, mod 256
+    /// (203 for the bytecode a Roblox client keeps in memory)
+    Key(u8),
+}
+
+/// Bytecode saved as text (a `--` line, then base64), as exporters write it;
+/// None when the data is no such text. Bytecode itself starts with its version.
+pub fn saved_text(data: &[u8]) -> Option<Vec<u8>> {
+    if data.first().is_none_or(|b| (1..=14).contains(b)) || data[0] == 0 {
+        return None;
+    }
+    let mut b64 = Vec::with_capacity(data.len());
+    for line in data.split(|c| *c == b'\n') {
+        if line.starts_with(b"--") {
+            continue;
+        }
+        b64.extend(line.iter().filter(|c| !c.is_ascii_whitespace()));
+    }
+    let value = |c: u8| -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        } as u32)
+    };
+    while b64.last() == Some(&b'=') {
+        b64.pop();
+    }
+    if b64.is_empty() || b64.len() % 4 == 1 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(b64.len() * 3 / 4);
+    for chunk in b64.chunks(4) {
+        let mut n = 0u32;
+        for (i, c) in chunk.iter().enumerate() {
+            n |= value(*c)? << (18 - 6 * i);
+        }
+        out.extend_from_slice(&n.to_be_bytes()[1..chunk.len()]);
+    }
+    Some(out)
+}
+
+/// Reads a whole bytecode blob whose opcodes are stored as `opcodes` says.
+pub fn parse_as(data: &[u8], opcodes: Opcodes) -> R<Module> {
     let mut r = Reader { d: data, o: 0 };
     let version = r.u8()?;
     if version == 0 {
@@ -440,7 +491,11 @@ pub fn parse(data: &[u8], scrambled: bool) -> R<Module> {
         while pc < sizecode {
             let w = word(pc);
             let b = (w & 0xFF) as usize;
-            let o = if scrambled { T2[T1[b] as usize] } else { b as u8 };
+            let o = match opcodes {
+                Opcodes::Wire => T2[T1[b] as usize],
+                Opcodes::Stock => b as u8,
+                Opcodes::Key(k) => (b as u8).wrapping_mul(k),
+            };
             let n = insn_len(o);
             let aux = if n == 2 && pc + 1 < sizecode { word(pc + 1) } else { 0 };
             code.push(Insn { pc: pc as i32, op: o, w, aux, n });

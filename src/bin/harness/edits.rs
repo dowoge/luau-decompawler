@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::bytecode::{parse, Module};
+use crate::bytecode::{parse_as, Module, Opcodes};
 use crate::diff::{Matcher, Tag};
 use crate::luau::{clip, module, par_map, read_text, repo, walk, Args, Item, Tools};
 use crate::shape::{pair, shape};
@@ -93,7 +93,7 @@ pub fn compare_place(tools: &Tools, dumps: &Path, output: &Path, place: &str) ->
         let Ok(bc) = bc else { return (Vec::new(), 0) };
         let script = &files[*path];
         let data = std::fs::read(wire.join(format!("{script}.wire"))).expect("the original script");
-        let orig: Module = parse(&data, true).expect("the original script parses");
+        let orig: Module = parse_as(&data, Opcodes::Wire).expect("the original script parses");
         let back = module(bc);
         let paired = pair(&orig, &back);
         let mut rows = Vec::new();
