@@ -18,14 +18,15 @@
 //! LUAU_THREADS=N limits the workers; LUAU_TIMING=1 prints stage times;
 //! LUAU_WHY=1 lists each `jump_N` flag and what stopped its helper coming back.
 
+mod alloc;
 mod analysis;
 mod bytecode;
 mod decomp;
 mod expr;
+mod hash;
 mod inline;
 mod passes;
 
-use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::panic::{self, AssertUnwindSafe};
@@ -34,7 +35,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use bytecode::{parse, Module};
-use passes::{CallMap, Extra};
+use hash::{HashMap, HashSet};
+use passes::{CallMap, Extra, Tally};
+
+#[global_allocator]
+static ALLOC: alloc::Alloc = alloc::Alloc;
 
 /// Deeply nested scripts recurse deeply; a worker's stack is reserved, not committed.
 const STACK: usize = 1 << 30;
@@ -51,8 +56,9 @@ fn decompile_core(m: &Module, path: Option<&str>, noflat: bool) -> Vec<String> {
 
 /// The naming rounds that can use other scripts' call sites.
 fn name_round(lines: Vec<String>, extra: &Extra) -> Vec<String> {
-    let lines = passes::more_names(lines, extra);
-    let lines = passes::more_names(lines, extra);
+    let (lines, renamed) = passes::more_names(lines, extra);
+    // the same pass over the same text would find nothing new
+    let lines = if renamed { passes::more_names(lines, extra).0 } else { lines };
     passes::blank_lines(lines)
 }
 
@@ -97,6 +103,22 @@ fn par_map<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
     slots.into_iter().map(|s| s.into_inner().unwrap().unwrap()).collect()
 }
 
+/// Writing a file costs several times what reading it does, and most of what
+/// a repeat run produces is already there.
+fn write_text(path: &Path, head: &str, text: &str) -> std::io::Result<()> {
+    if let Ok(old) = fs::read(path) {
+        let same = old.len() == head.len() + text.len()
+            && old.starts_with(head.as_bytes())
+            && old.ends_with(text.as_bytes());
+        if same {
+            return Ok(());
+        }
+    }
+    let mut f = fs::File::create(path)?;
+    f.write_all(head.as_bytes())?;
+    f.write_all(text.as_bytes())
+}
+
 fn sanitize(rel: &str, sid: &str) -> String {
     let clean: String = rel
         .chars()
@@ -114,7 +136,7 @@ fn sanitize(rel: &str, sid: &str) -> String {
 }
 
 fn read_index(src: &Path) -> HashMap<String, String> {
-    let mut names = HashMap::new();
+    let mut names = HashMap::default();
     if let Ok(data) = fs::read(src.join("index.tsv")) {
         let text = String::from_utf8_lossy(&data);
         for line in text.lines() {
@@ -169,42 +191,81 @@ fn run_dir(src: &Path, dst: &Path, upstream: bool, noflat: bool) -> i32 {
     extra.want(defined.iter().flatten().cloned());
     let alone = Extra::default();
     let wanted = extra.wanted();
-    let draft: Vec<Option<(Vec<String>, CallMap)>> = par_map(core.len(), |i| {
+    let name_and_tally = |lines: &[String], seen: &Extra| {
+        let named = name_round(lines.to_vec(), seen);
+        let mut calls = CallMap::default();
+        passes::collect_calls(&named, &mut calls, wanted);
+        (named, passes::tally(&calls))
+    };
+    let mut draft: Vec<Option<(Vec<String>, Tally)>> = par_map(core.len(), |i| {
         let lines = core[i].as_ref().ok()?;
-        let run = || {
-            let named = name_round(lines.clone(), &alone);
-            let mut calls = CallMap::new();
-            passes::collect_calls(&named, &mut calls, wanted);
-            (named, calls)
-        };
-        panic::catch_unwind(AssertUnwindSafe(run)).ok()
+        panic::catch_unwind(AssertUnwindSafe(|| name_and_tally(lines, &alone))).ok()
     });
     if timing {
         eprintln!("draft {:?}", t0.elapsed());
     }
 
-    // Call sites across the place. Each script sees the calls of those before
-    // it, so this one step is sequential and in order.
-    let mut redone = 0usize;
-    for (i, d) in draft.iter().enumerate() {
-        let Ok(lines) = &core[i] else { continue };
-        if defined[i].iter().any(|k| extra.knows(k)) {
-            redone += 1;
-            let run = || {
-                let named = name_round(lines.clone(), &extra);
-                let mut calls = CallMap::new();
-                passes::collect_calls(&named, &mut calls, extra.wanted());
-                calls
-            };
-            if let Ok(calls) = panic::catch_unwind(AssertUnwindSafe(run)) {
-                extra.add(calls);
+    // Call sites across the place: each script sees the calls of those before
+    // it, and of those only the functions it defines (a rename cannot change
+    // those keys: it leaves words after `.` and `:` alone). What it calls in
+    // turn depends only on scripts further back, so there is one answer however
+    // it is reached: in rounds, redo what saw something change until nothing
+    // does, which costs one pass in file order only if each waits on the last.
+    let mut sites: Vec<Tally> =
+        draft.iter_mut().map(|d| d.as_mut().map(|d| std::mem::take(&mut d.1)).unwrap_or_default()).collect();
+    // key -> the first script whose call sites of it changed; the drafts saw nothing
+    let mut changed: HashMap<String, usize> = HashMap::default();
+    for (j, calls) in sites.iter().enumerate().rev() {
+        changed.extend(calls.keys().map(|key| (key.clone(), j)));
+    }
+    let (mut redone, mut rounds) = (0usize, 0usize);
+    loop {
+        let todo: Vec<usize> = (0..sites.len())
+            .filter(|i| defined[*i].iter().any(|k| changed.get(k).is_some_and(|j| j < i)))
+            .collect();
+        if todo.is_empty() {
+            break;
+        }
+        redone += todo.len();
+        rounds += 1;
+        let mut callers: HashMap<&str, Vec<usize>> = HashMap::default();
+        for (j, calls) in sites.iter().enumerate() {
+            for key in calls.keys() {
+                callers.entry(key).or_default().push(j);
             }
-        } else if let Some((_, calls)) = d {
-            extra.add(calls.clone());
+        }
+        let fresh: Vec<Tally> = par_map(todo.len(), |t| {
+            let i = todo[t];
+            let mut seen = Extra::default();
+            for key in &defined[i] {
+                if seen.knows(key) {
+                    continue; // defined twice
+                }
+                let before = callers.get(key.as_str()).map_or(&[][..], |list| list);
+                for j in before.iter().take_while(|j| **j < i) {
+                    seen.add(key, &sites[*j][key]);
+                }
+            }
+            let Ok(lines) = &core[i] else { return Tally::default() };
+            panic::catch_unwind(AssertUnwindSafe(|| name_and_tally(lines, &seen).1)).unwrap_or_default()
+        });
+        changed.clear();
+        for (i, new) in todo.iter().zip(fresh) {
+            let old = std::mem::replace(&mut sites[*i], new);
+            for key in old.keys().chain(sites[*i].keys()) {
+                if old.get(key) != sites[*i].get(key) && !changed.contains_key(key) {
+                    changed.insert(key.clone(), *i);
+                }
+            }
+        }
+    }
+    for calls in &sites {
+        for (key, list) in calls {
+            extra.add(key, list);
         }
     }
     if timing {
-        eprintln!("calls {:?} ({redone} of {} redone)", t0.elapsed(), core.len());
+        eprintln!("calls {:?} ({redone} redone over {rounds} rounds)", t0.elapsed());
     }
 
     let finished: Vec<Result<String, String>> = par_map(files.len(), |i| {
@@ -226,8 +287,8 @@ fn run_dir(src: &Path, dst: &Path, upstream: bool, noflat: bool) -> i32 {
 
     // Paths in order (a repeated game path decides who gets the suffix), then
     // the writes in parallel.
-    let mut written: HashSet<PathBuf> = HashSet::new();
-    let mut dirs: HashSet<PathBuf> = HashSet::new();
+    let mut written: HashSet<PathBuf> = HashSet::default();
+    let mut dirs: HashSet<PathBuf> = HashSet::default();
     let mut targets: Vec<(PathBuf, String)> = Vec::with_capacity(files.len());
     for sid in &sids {
         let rel = sanitize(names.get(*sid).map_or(sid, String::as_str), sid);
@@ -246,28 +307,24 @@ fn run_dir(src: &Path, dst: &Path, upstream: bool, noflat: bool) -> i32 {
     }
     let ok = finished.iter().filter(|r| r.is_ok()).count();
     let failures = finished.len() - ok;
-    let write_errors: usize = par_map(files.len(), |i| {
+    let written: Vec<[usize; 4]> = par_map(files.len(), |i| {
         let (path, head) = &targets[i];
         let result = match &finished[i] {
-            Ok(t) => fs::File::create(path)
-                .and_then(|mut f| f.write_all(head.as_bytes()).and_then(|_| f.write_all(t.as_bytes()))),
+            Ok(t) => write_text(path, head, t),
             Err(e) => fs::write(path, format!("{head}-- decompile failed: {e}\n")),
         };
-        match result {
-            Ok(()) => 0,
-            Err(e) => {
-                eprintln!("{}: {e}", path.display());
-                1
-            }
+        if let Err(e) = &result {
+            eprintln!("{}: {e}", path.display());
         }
-    })
-    .into_iter()
-    .sum();
-    let bad = failures + write_errors;
-    let count = |needle: &str| -> usize {
-        finished.iter().flatten().map(|text| text.matches(needle).count()).sum()
-    };
-    let (flags, blocks) = (count(" = false\n").min(count("local jump_")), count("local block = 0"));
+        let count = |needle: &str| finished[i].as_ref().map_or(0, |text| text.matches(needle).count());
+        [usize::from(result.is_err()), count(" = false\n"), count("local jump_"), count("local block = 0")]
+    });
+    if timing {
+        eprintln!("write {:?}", t0.elapsed());
+    }
+    let total = |k: usize| written.iter().map(|w| w[k]).sum::<usize>();
+    let bad = failures + total(0);
+    let (flags, blocks) = (total(1).min(total(2)), total(3));
     println!("{ok} decompiled, {bad} failed, {flags} flags, {blocks} dispatchers -> {}", dst.display());
     if bad == 0 {
         0

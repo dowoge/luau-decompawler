@@ -13,7 +13,7 @@
 //! code no longer matches and is left alone.
 
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use crate::hash::{HashMap, HashSet};
 
 use crate::bytecode::{is_for, is_forgprep, op, op_name, Insn, Module, Proto, K};
 use crate::decomp::{import_expr, kexpr};
@@ -564,18 +564,18 @@ pub fn match_call(m: &Module, caller: &Proto, id: usize, start: usize) -> Option
         args: vec![None; helper.numparams],
         written: Vec::new(),
         jumps: Vec::new(),
-        loaded: HashMap::new(),
+        loaded: HashMap::default(),
         upvals: vec![None; helper.nups],
-        unread: HashMap::new(),
-        held: HashSet::new(),
+        unread: HashMap::default(),
+        held: HashSet::default(),
     };
-    let mut landing: HashMap<i32, i32> = HashMap::new();
+    let mut landing: HashMap<i32, i32> = HashMap::default();
     let mut to_end: Vec<i32> = Vec::new();
     let mut copied_return: Option<(usize, usize)> = None;
     // a return's store into the result: its pc, the pc after, helper register
-    let mut stores: HashMap<i32, (i32, usize)> = HashMap::new();
+    let mut stores: HashMap<i32, (i32, usize)> = HashMap::default();
     // the caller's way out of each return in the middle of the helper
-    let mut exits: HashSet<i32> = HashSet::new();
+    let mut exits: HashSet<i32> = HashSet::default();
     let mut result: Option<usize> = None;
     let mut results = 0;
     let mut unused = false;

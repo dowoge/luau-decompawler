@@ -6,7 +6,7 @@
 //! ("is this the value that was tested?"), so an `E` is a handle.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use crate::hash::HashSet;
 use std::rc::Rc;
 
 pub type E = Rc<RefCell<X>>;
@@ -87,10 +87,10 @@ pub fn ex(text: impl Into<String>, prec: i32) -> E {
         build_end: None,
         ifparts: None,
         ifelse: None,
-        uses: HashSet::new(),
+        uses: HashSet::default(),
         closure: None,
         constructor: false,
-        field_names: HashSet::new(),
+        field_names: HashSet::default(),
     }))
 }
 

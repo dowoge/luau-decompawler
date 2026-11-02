@@ -6,13 +6,14 @@
 //! `rollback()` replace copying the name tables at every conditional jump.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use std::sync::OnceLock;
 
 use crate::analysis::{effects, full_effects, twice, Flow, RegSet};
 use crate::bytecode::{is_cond_jump, is_for, is_forgprep, op, op_name, Insn, Module, Proto, K};
 use crate::expr::*;
+use crate::hash::{HashMap, HashSet};
 use crate::inline::{last_refusal, match_call, Arg, Inlined, Up};
 use crate::passes;
 
@@ -124,7 +125,7 @@ pub fn kexpr(m: &Module, p: &Proto, i: i64) -> String {
 }
 
 fn module_globals(m: &Module) -> HashSet<String> {
-    let mut names = HashSet::new();
+    let mut names = HashSet::default();
     for p in &m.protos {
         for ins in &p.code {
             match ins.op {
@@ -344,7 +345,7 @@ pub fn decompile_lines(m: &Module, noflat: bool) -> Vec<String> {
         .iter()
         .map(|p| (p.linedefined, p.lines.iter().copied().max().unwrap_or(0)))
         .collect();
-    let mut made: HashSet<usize> = HashSet::new();
+    let mut made: HashSet<usize> = HashSet::default();
     for p in &m.protos {
         for ins in &p.code {
             if ins.op == op::NEWCLOSURE {
@@ -364,7 +365,7 @@ pub fn decompile_lines(m: &Module, noflat: bool) -> Vec<String> {
     let orphans: Vec<usize> = (0..m.protos.len()).filter(closureless).filter(|i| unnamed(*i)).collect();
     // `local function f`, every call inlined: the compiler made no closure,
     // but the source had the definition, inside the smallest function around it
-    let mut defs: HashMap<usize, Vec<(u32, usize)>> = HashMap::new();
+    let mut defs: HashMap<usize, Vec<(u32, usize)>> = HashMap::default();
     let mut helpers = Vec::new();
     for i in (0..m.protos.len()).filter(closureless).filter(|i| !unnamed(*i)) {
         let (from, to) = spans[i];
@@ -380,7 +381,7 @@ pub fn decompile_lines(m: &Module, noflat: bool) -> Vec<String> {
     let ctx = Ctx {
         m,
         globals: module_globals(m),
-        memo: RefCell::new(HashMap::new()),
+        memo: RefCell::new(HashMap::default()),
         helper_names: std::cell::Cell::new(0),
         why: std::env::var_os("LUAU_WHY").is_some(),
         noflat,
@@ -388,7 +389,7 @@ pub fn decompile_lines(m: &Module, noflat: bool) -> Vec<String> {
         spans,
         orphans,
         defs,
-        def_upvals: RefCell::new(HashMap::new()),
+        def_upvals: RefCell::new(HashMap::default()),
     };
     let mut d = Dec::new(&ctx, m.main, Vec::new(), -1);
     let (_, body) = d.decompile();
@@ -429,9 +430,9 @@ impl<'c, 'm> Dec<'c, 'm> {
             flat_regs: false,
             flat: false,
             param_names: Vec::new(),
-            once_cache: HashMap::new(),
+            once_cache: HashMap::default(),
             hoisted: Vec::new(),
-            hoisted_set: HashSet::new(),
+            hoisted_set: HashSet::default(),
             exits: Vec::new(),
             ranges: Vec::new(),
             loops: Vec::new(),
@@ -461,7 +462,7 @@ impl<'c, 'm> Dec<'c, 'm> {
             flat_used: None,
             skip_to: None,
             joined_value: None,
-            inlined: RefCell::new(HashMap::new()),
+            inlined: RefCell::new(HashMap::default()),
             refusals: RefCell::new(Vec::new()),
             defs_left: Vec::new(),
             in_value: false,
@@ -2166,7 +2167,7 @@ impl<'c, 'm> Dec<'c, 'm> {
         for l in lines {
             let s = l.trim_start();
             if s.starts_with("local jump_") && l.len() - s.len() >= own {
-                let mut seen = HashSet::new();
+                let mut seen = HashSet::default();
                 let list: Vec<&str> =
                     refused.iter().map(|r| r.1.as_str()).filter(|r| seen.insert(*r)).take(4).collect();
                 eprintln!("FLAG\t{name}\t{}\t{}", s.split(' ').nth(1).unwrap_or(""), list.join(" | "));
@@ -2886,7 +2887,7 @@ impl<'c, 'm> Dec<'c, 'm> {
         }
         let last = blocks[blocks.len() - 1].1;
         let region_end = last + self.insn(last).n;
-        let mut preds: HashMap<i32, i32> = HashMap::new();
+        let mut preds: HashMap<i32, i32> = HashMap::default();
         for n in &nodes {
             *preds.entry(n.t).or_insert(0) += 1;
             *preds.entry(n.f).or_insert(0) += 1;

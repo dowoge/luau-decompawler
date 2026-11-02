@@ -4,7 +4,7 @@
 //! The matchers are hand-written: each one states the pattern it implements,
 //! with the same greedy/anchored meaning the pattern would have.
 
-use std::collections::{HashMap, HashSet};
+use crate::hash::{HashMap, HashSet};
 
 pub type CallMap = HashMap<String, Vec<Vec<String>>>;
 
@@ -1139,7 +1139,7 @@ fn neat_goto(lines: &mut Vec<String>, li: usize, lab_ind: usize, n: &str, gotos:
                 return None;
             }
         }
-        let mut later = HashSet::new();
+        let mut later = HashSet::default();
         for l in &lines[li + 1..] {
             words_into(&mut later, l);
         }
@@ -1167,7 +1167,7 @@ fn neat_goto(lines: &mut Vec<String>, li: usize, lab_ind: usize, n: &str, gotos:
         }
         let mut repl = Vec::with_capacity(new_body.len() + 3);
         if !hoist.is_empty() {
-            let mut seen = HashSet::new();
+            let mut seen = HashSet::default();
             let uniq: Vec<&str> = hoist
                 .iter()
                 .filter(|x| seen.insert(x.as_str()))
@@ -1217,7 +1217,7 @@ fn neat_goto(lines: &mut Vec<String>, li: usize, lab_ind: usize, n: &str, gotos:
         }
         targets.push(name);
     }
-    let mut loop_words = HashSet::new();
+    let mut loop_words = HashSet::default();
     for l in &lines[lo..=lend] {
         match simple_assign(strip(l)) {
             Some((_, value)) => words_into(&mut loop_words, value),
@@ -1322,7 +1322,7 @@ fn guard_lines(
     test: &str,
     block_stop: usize,
 ) -> Option<()> {
-    let mut later = HashSet::new();
+    let mut later = HashSet::default();
     for l in &lines[to..block_stop.min(lines.len())] {
         words_into(&mut later, l);
     }
@@ -1423,7 +1423,7 @@ fn eliminate_label(mut lines: Vec<String>, n: &str) -> Option<Vec<String>> {
                 let e = arm_end(&lines, to);
                 let stop = if_end(&lines, to)?;
                 // what the arm declares before the label must not be needed after it
-                let mut tail_words = HashSet::new();
+                let mut tail_words = HashSet::default();
                 for l in &lines[li + 1..e] {
                     words_into(&mut tail_words, l);
                 }
@@ -2134,7 +2134,7 @@ fn generic_for(lines: Vec<String>) -> Vec<String> {
                                 break;
                             }
                         }
-                        let mut later = HashSet::new();
+                        let mut later = HashSet::default();
                         for l in &out[i + 1..fend] {
                             words_into(&mut later, l);
                         }
@@ -2942,6 +2942,7 @@ fn rename_variables(lines: Vec<String>) -> Vec<String> {
     let mut out = lines;
     let mut funcs = functions(&out);
     funcs.sort_by_key(|f| f.0);
+    let mut index: Option<WordIndex> = None;
     for (fi, fend, _) in &funcs {
         let fi = *fi;
         let lo = (fi + 1) as usize;
@@ -2950,7 +2951,7 @@ fn rename_variables(lines: Vec<String>) -> Vec<String> {
             continue;
         }
         // the generated names that belong to this function: declared in it
-        let mut own: HashSet<String> = HashSet::new();
+        let mut own: HashSet<String> = HashSet::default();
         for l in &out[lo..hi] {
             let s = l.trim_start_matches(' ');
             if let Some((names, _)) = parse_local_list(s) {
@@ -2979,14 +2980,18 @@ fn rename_variables(lines: Vec<String>) -> Vec<String> {
             continue;
         }
         own.sort();
+        let index = index.get_or_insert_with(|| WordIndex::new(&out));
         // names in use anywhere in this function (and so unavailable)
-        let mut used: HashSet<String> = HashSet::new();
+        let mut used: HashSet<String> = HashSet::default();
         for l in &out[(fi.max(0) as usize)..hi] {
             words_into(&mut used, l);
         }
         for name in &own {
+            // a generated name is never the tail of a number, as `x10` can be
+            // of `0x10`: it is a word of its own wherever it stands
+            let at: Vec<usize> = index.within(name, lo, hi).iter().map(|j| *j as usize).collect();
             let mut defs: Vec<Option<usize>> = Vec::new();
-            for j in lo..hi {
+            for &j in &at {
                 match def_kind(strip(&out[j]), name) {
                     Some(DefKind::Single) => defs.push(Some(j)),
                     Some(DefKind::Other) => defs.push(None),
@@ -2994,18 +2999,12 @@ fn rename_variables(lines: Vec<String>) -> Vec<String> {
                 }
             }
             let mut new: Option<String> = None;
-            let fors: Vec<usize> = (lo..hi).filter(|&j| for_mentions(&out[j], name)).collect();
+            let fors: Vec<usize> = at.iter().copied().filter(|&j| for_mentions(&out[j], name)).collect();
             if !fors.is_empty() && defs.is_empty() {
                 let (vars, src) = parse_for_in(&out[fors[0]]).unwrap();
                 let vars_: Vec<&str> = vars.split(',').map(strip).collect();
                 let end = block_end(&out, fors[0]);
-                let mut body_uses = false;
-                for j in fors[0] + 1..end {
-                    if has_word(&out[j], name) {
-                        body_uses = true;
-                        break;
-                    }
-                }
+                let body_uses = at.iter().any(|&j| fors[0] < j && j < end && has_word(&out[j], name));
                 let idx = vars_.iter().position(|x| *x == name.as_str());
                 let mut base = for_base(src);
                 if let Some(b) = &base {
@@ -3061,7 +3060,7 @@ fn rename_variables(lines: Vec<String>) -> Vec<String> {
                     }
                 }
             }
-            if (lo..s_lo).chain(s_hi..hi).any(|j| has_word(&out[j], name)) {
+            if at.iter().any(|&j| (j < s_lo || s_hi <= j) && has_word(&out[j], name)) {
                 s_lo = lo; // used outside that block after all
                 s_hi = hi;
             }
@@ -3077,9 +3076,11 @@ fn rename_variables(lines: Vec<String>) -> Vec<String> {
                     continue;
                 }
             }
-            for l in out[s_lo..s_hi].iter_mut() {
-                replace_token(l, name, &new);
+            let hits: Vec<u32> = at.iter().filter(|j| (s_lo..s_hi).contains(*j)).map(|j| *j as u32).collect();
+            for j in &hits {
+                replace_token(&mut out[*j as usize], name, &new);
             }
+            index.add(&new, &hits);
             used.insert(new);
         }
     }
@@ -3150,7 +3151,7 @@ fn callback_params(lines: Vec<String>) -> Vec<String> {
         let Some(names) = signal_params(sig) else { continue };
         let params = split_params(params);
         let end = block_end(&out, i);
-        let mut taken = HashSet::new();
+        let mut taken = HashSet::default();
         for l in &out[i..=end] {
             words_into(&mut taken, l);
         }
@@ -3206,7 +3207,7 @@ fn pcall_results(lines: Vec<String>) -> Vec<String> {
                 break;
             }
         }
-        let mut taken = HashSet::new();
+        let mut taken = HashSet::default();
         for l in &out[i..end] {
             words_into(&mut taken, l);
         }
@@ -3368,7 +3369,7 @@ struct WordIndex {
 
 impl WordIndex {
     fn new(lines: &[String]) -> WordIndex {
-        let mut index = WordIndex { ids: HashMap::new(), lines: Vec::new() };
+        let mut index = WordIndex { ids: HashMap::default(), lines: Vec::new() };
         for (j, l) in lines.iter().enumerate() {
             let b = l.as_bytes();
             let mut i = 0;
@@ -3424,7 +3425,7 @@ impl WordIndex {
 
 /// What a value is, from the members it is used with.
 fn usage_name(name: &str, out: &[String], at: &[u32]) -> Option<String> {
-    let mut seen: HashSet<&str> = HashSet::new();
+    let mut seen: HashSet<&str> = HashSet::default();
     let n = name.as_bytes();
     for j in at {
         let l = &out[*j as usize];
@@ -3590,6 +3591,7 @@ fn key_of(kind: &str, name: &str) -> String {
 pub fn collect_calls(lines: &[String], calls: &mut CallMap, wanted: &HashSet<String>) {
     let mut key = String::new();
     for l in lines {
+        let Some(first) = l.find('(') else { continue };
         if func_open(l).is_some() {
             // ^ *(local )?function : a definition, not a call
             let t = l.trim_start_matches(' ');
@@ -3598,33 +3600,18 @@ pub fn collect_calls(lines: &[String], calls: &mut CallMap, wanted: &HashSet<Str
             }
         }
         let b = l.as_bytes();
-        let mut i = 0;
-        while i < b.len() {
+        let mut next = Some(first);
+        while let Some(e) = next {
+            next = l[e + 1..].find('(').map(|p| e + 1 + p);
             // (?:(?<![A-Za-z0-9_.:])|([.:]))(IDENT)\(
-            let mut hit: Option<(usize, usize, usize)> = None; // kind len, name start, name end
-            if is_start(b[i])
-                && (i == 0 || !(is_word(b[i - 1]) || b[i - 1] == b'.' || b[i - 1] == b':'))
-            {
-                let e = word_end(b, i);
-                if e < b.len() && b[e] == b'(' {
-                    hit = Some((0, i, e));
-                }
+            let mut st = e;
+            while st > 0 && is_word(b[st - 1]) {
+                st -= 1;
             }
-            if hit.is_none()
-                && (b[i] == b'.' || b[i] == b':')
-                && i + 1 < b.len()
-                && is_start(b[i + 1])
-            {
-                let e = word_end(b, i + 1);
-                if e < b.len() && b[e] == b'(' {
-                    hit = Some((1, i + 1, e));
-                }
-            }
-            let Some((k, st, e)) = hit else {
-                i += 1;
+            if st == e || !is_start(b[st]) {
                 continue;
-            };
-            i = e + 1; // non-overlapping: resume after the `(`
+            }
+            let k = usize::from(st > 0 && (b[st - 1] == b'.' || b[st - 1] == b':'));
             let name = &l[st..e];
             key.clear();
             key.push_str(&l[st - k..st]);
@@ -3711,17 +3698,53 @@ fn vote_name(arg: &str) -> Option<String> {
 }
 
 /// How often each name was passed for one parameter, first seen first.
-#[derive(Default)]
+#[derive(Default, Clone, PartialEq)]
 pub struct ParamVotes {
     order: Vec<(String, usize)>,
     at: HashMap<String, usize>,
 }
 
-/// The call sites of one `t.f` / `t:f` across a place.
-#[derive(Default)]
+impl ParamVotes {
+    fn vote(&mut self, name: &str, count: usize) {
+        match self.at.get(name) {
+            Some(&at) => self.order[at].1 += count,
+            None => {
+                self.at.insert(name.to_string(), self.order.len());
+                self.order.push((name.to_string(), count));
+            }
+        }
+    }
+}
+
+/// The call sites of one `t.f` / `t:f`.
+#[derive(Default, Clone, PartialEq)]
 pub struct KeyVotes {
     total: usize,
     params: Vec<ParamVotes>,
+}
+
+/// One script's call sites as other scripts see them. Finding what an argument
+/// suggests is the costly part, and this is the only place it is done.
+pub type Tally = HashMap<String, KeyVotes>;
+
+pub fn tally(calls: &CallMap) -> Tally {
+    let mut out = Tally::default();
+    for (key, sites) in calls {
+        let kv = out.entry(key.clone()).or_default();
+        kv.total = sites.len();
+        for args in sites {
+            if kv.params.len() < args.len() {
+                kv.params.resize_with(args.len(), ParamVotes::default);
+            }
+            for (i, a) in args.iter().enumerate() {
+                let Some(n) = vote_name(a) else { continue };
+                if !n.is_empty() && (n == "self" || !is_generated(&n)) {
+                    kv.params[i].vote(&n, 1);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Call sites in the other scripts of a place. Only what parameter naming
@@ -3749,32 +3772,20 @@ impl Extra {
         self.keys.contains_key(key)
     }
 
-    /// One script's call sites.
-    pub fn add(&mut self, calls: CallMap) {
-        for (key, sites) in calls {
-            if !self.wanted.contains(&key) {
-                continue;
-            }
-            let kv = self.keys.entry(key).or_default();
-            kv.total += sites.len();
-            for args in &sites {
-                if kv.params.len() < args.len() {
-                    kv.params.resize_with(args.len(), ParamVotes::default);
-                }
-                for (i, a) in args.iter().enumerate() {
-                    let Some(n) = vote_name(a) else { continue };
-                    if n.is_empty() || (n != "self" && is_generated(&n)) {
-                        continue;
-                    }
-                    let p = &mut kv.params[i];
-                    match p.at.get(&n) {
-                        Some(&at) => p.order[at].1 += 1,
-                        None => {
-                            p.at.insert(n.clone(), p.order.len());
-                            p.order.push((n, 1));
-                        }
-                    }
-                }
+    /// One script's call sites of one function, after those of earlier scripts:
+    /// a name keeps its place from the first time anyone passed it.
+    pub fn add(&mut self, key: &str, votes: &KeyVotes) {
+        let Some(kv) = self.keys.get_mut(key) else {
+            self.keys.insert(key.to_string(), votes.clone());
+            return;
+        };
+        kv.total += votes.total;
+        if kv.params.len() < votes.params.len() {
+            kv.params.resize_with(votes.params.len(), ParamVotes::default);
+        }
+        for (p, q) in kv.params.iter_mut().zip(&votes.params) {
+            for (n, count) in &q.order {
+                p.vote(n, *count);
             }
         }
     }
@@ -3805,8 +3816,10 @@ pub fn defined_keys(lines: &[String]) -> Vec<String> {
 ///   * returned at the end of `GetFoo` -> foo
 ///   * used like a known Roblox type (`x.Character`, `x.UserId`) -> player
 /// Parameters take part too, and are named from their call sites first.
-pub fn more_names(lines: Vec<String>, extra: &Extra) -> Vec<String> {
+/// Also says whether anything was renamed.
+pub fn more_names(lines: Vec<String>, extra: &Extra) -> (Vec<String>, bool) {
     let mut out = lines;
+    let mut renamed = false;
     let mut funcs = functions(&out);
     funcs.sort_by_key(|f| f.0);
     // the module's own table: `self` passed around in its methods is one
@@ -3823,7 +3836,7 @@ pub fn more_names(lines: Vec<String>, extra: &Extra) -> Vec<String> {
         }
     }
     // which call sites this file asks about
-    let mut asked: HashSet<String> = HashSet::new();
+    let mut asked: HashSet<String> = HashSet::default();
     for (fi, _, _) in &funcs {
         if *fi >= 0 {
             let header = &out[*fi as usize];
@@ -3832,7 +3845,7 @@ pub fn more_names(lines: Vec<String>, extra: &Extra) -> Vec<String> {
             }
         }
     }
-    let mut calls = CallMap::new();
+    let mut calls = CallMap::default();
     collect_calls(&out, &mut calls, &asked);
     let mut index = WordIndex::new(&out);
     let no_sites: Vec<Vec<String>> = Vec::new();
@@ -3872,7 +3885,7 @@ pub fn more_names(lines: Vec<String>, extra: &Extra) -> Vec<String> {
                     continue;
                 }
                 let mut votes: Vec<(String, usize)> = Vec::new();
-                let mut seen: HashMap<String, usize> = HashMap::new();
+                let mut seen: HashMap<String, usize> = HashMap::default();
                 let self_name = match &module {
                     Some(m) if kind != ":" => Some(lower_first(m)),
                     _ => None,
@@ -4004,12 +4017,13 @@ pub fn more_names(lines: Vec<String>, extra: &Extra) -> Vec<String> {
             for j in &hits {
                 replace_token(&mut out[*j as usize], old, new);
             }
+            renamed |= !hits.is_empty();
             index.add(new, &hits);
             touched.push(old.clone());
             touched.push(new.clone());
         }
     }
-    out
+    (out, renamed)
 }
 
 /// A blank line between top-level statements and function definitions.

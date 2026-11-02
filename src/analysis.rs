@@ -26,8 +26,13 @@ impl RegSet {
         r < WORDS * 64 && self.0[r / 64] >> (r % 64) & 1 != 0
     }
     pub fn add_range(&mut self, lo: usize, hi: usize) {
-        for r in lo..hi {
-            self.add(r);
+        let hi = hi.min(WORDS * 64);
+        let mut r = lo;
+        while r < hi {
+            let word = r / 64;
+            let end = hi.min((word + 1) * 64);
+            self.0[word] |= (!0u64 >> (64 - (end - r))) << (r % 64);
+            r = end;
         }
     }
     pub fn iter(&self) -> impl Iterator<Item = usize> + '_ {
@@ -288,29 +293,79 @@ impl Flow {
             (out, m)
         };
 
-        // liveness: the least fixed point, by sweeping backwards
-        let mut live_in = vec![RegSet::EMPTY; n];
-        let mut live_out = vec![RegSet::EMPTY; n];
+        // basic blocks
+        let mut leader = vec![false; n + 1];
+        if n > 0 {
+            leader[0] = true;
+        }
+        for i in 0..n {
+            let (s, c) = succ_of(i);
+            if !(c == 1 && s[0] == i + 1) {
+                leader[i + 1] = true;
+                for t in &s[..c] {
+                    leader[*t] = true;
+                }
+            }
+        }
+        let mut block_of = vec![0u32; n];
+        let mut starts: Vec<usize> = Vec::new();
+        for i in 0..n {
+            if leader[i] {
+                starts.push(i);
+            }
+            block_of[i] = starts.len() as u32 - 1;
+        }
+        let nb = starts.len();
+        let bend = |b: usize| if b + 1 < nb { starts[b + 1] } else { n };
+
+        // liveness: the least fixed point. Blocks first, summed up as what each
+        // reads before writing it and what it writes: few instructions end one
+        let mut block_reads = vec![RegSet::EMPTY; nb];
+        let mut block_writes = vec![RegSet::EMPTY; nb];
+        for b in 0..nb {
+            let (mut rd, mut wr) = (RegSet::EMPTY, RegSet::EMPTY);
+            for i in (starts[b]..bend(b)).rev() {
+                for w in 0..WORDS {
+                    rd.0[w] = reads[i].0[w] | (rd.0[w] & !writes[i].0[w]);
+                    wr.0[w] |= writes[i].0[w];
+                }
+            }
+            block_reads[b] = rd;
+            block_writes[b] = wr;
+        }
+        let mut block_in = block_reads.clone();
+        let mut block_out = vec![RegSet::EMPTY; nb];
         let mut changed = true;
         while changed {
             changed = false;
-            for i in (0..n).rev() {
-                let (s, c) = succ_of(i);
+            for b in (0..nb).rev() {
+                let (s, c) = succ_of(bend(b) - 1);
                 let mut o = RegSet::EMPTY;
                 for t in &s[..c] {
+                    let there = &block_in[block_of[*t] as usize];
                     for w in 0..WORDS {
-                        o.0[w] |= live_in[*t].0[w];
+                        o.0[w] |= there.0[w];
                     }
                 }
-                let mut li = RegSet::EMPTY;
-                for w in 0..WORDS {
-                    li.0[w] = reads[i].0[w] | (o.0[w] & !writes[i].0[w]);
-                }
-                if o != live_out[i] || li != live_in[i] {
-                    live_out[i] = o;
-                    live_in[i] = li;
+                if o != block_out[b] {
+                    block_out[b] = o;
+                    for w in 0..WORDS {
+                        block_in[b].0[w] = block_reads[b].0[w] | (o.0[w] & !block_writes[b].0[w]);
+                    }
                     changed = true;
                 }
+            }
+        }
+        let mut live_in = vec![RegSet::EMPTY; n];
+        let mut live_out = vec![RegSet::EMPTY; n];
+        for b in 0..nb {
+            let mut o = block_out[b];
+            for i in (starts[b]..bend(b)).rev() {
+                live_out[i] = o;
+                for w in 0..WORDS {
+                    o.0[w] = reads[i].0[w] | (o.0[w] & !writes[i].0[w]);
+                }
+                live_in[i] = o;
             }
         }
 
@@ -353,30 +408,6 @@ impl Flow {
         }
         let words = ndefs / 64 + 1;
 
-        // basic blocks
-        let mut leader = vec![false; n + 1];
-        if n > 0 {
-            leader[0] = true;
-        }
-        for i in 0..n {
-            let (s, c) = succ_of(i);
-            if !(c == 1 && s[0] == i + 1) {
-                leader[i + 1] = true;
-                for t in &s[..c] {
-                    leader[*t] = true;
-                }
-            }
-        }
-        let mut block_of = vec![0u32; n];
-        let mut starts: Vec<usize> = Vec::new();
-        for i in 0..n {
-            if leader[i] {
-                starts.push(i);
-            }
-            block_of[i] = starts.len() as u32 - 1;
-        }
-        let nb = starts.len();
-        let bend = |b: usize| if b + 1 < nb { starts[b + 1] } else { n };
         let mut preds: Vec<Vec<u32>> = vec![Vec::new(); nb];
         // the registers each block writes, with the bit of its last write
         let mut gen: Vec<Vec<(u32, u32)>> = vec![Vec::new(); nb];
