@@ -1194,7 +1194,7 @@ impl<'c, 'm> Dec<'c, 'm> {
                 let code = &self.m.protos[call.helper].code;
                 e.borrow_mut().one = !code.iter().filter(|i| i.op == op::RETURN).all(|i| i.b() == 2);
                 self.value_done(t, e, pc, call.end);
-                if self.state_read_first(call.end, t) || !self.read_once_from(call.end, t) {
+                if self.state_printed_first(call.end, t) || !self.read_once_from(call.end, t) {
                     let e = self.get(t);
                     self.flush_impure(out, ind, t);
                     self.assign(out, ind, t, &e);
@@ -1205,36 +1205,80 @@ impl<'c, 'm> Dec<'c, 'm> {
         Some(call.end)
     }
 
-    /// After a call put back where a helper was copied in (its own line is
-    /// nowhere in the code, so no later statement shows the source kept the
-    /// value): is a global, upvalue or field read before r is, and written out
-    /// ahead of it? The call may change that, so folded in, the read would
-    /// come first. Read through a MOVE, r was a local; read in place, what
-    /// sits below it in the same list comes first. A method, or the function
-    /// of a fast call, is looked up after the arguments whatever the source
-    /// says: written out the same, it compiles the same.
-    fn state_read_first(&self, from: i32, r: usize) -> bool {
+    /// A value is in r from the code before `from`, made by a call or by one put
+    /// back for copied-in code. Is a global, upvalue or field read after it
+    /// written out ahead of it, where the two first meet in one expression?
+    /// The call may change what was read, so folded together the read would
+    /// come first, and the value has to be a local. Both are followed through
+    /// the straight code from `from`.
+    fn state_printed_first(&self, from: i32, r: usize) -> bool {
         let code = &self.p.code;
-        let Some(mut i) = self.flow.idx(from) else { return false };
-        let mut reads: Vec<usize> = Vec::new();
-        while i < code.len() {
+        let Some(start) = self.flow.idx(from) else { return false };
+        let (mut val, mut st) = (RegSet::EMPTY, RegSet::EMPTY);
+        val.add(r);
+        // tests inside the expression (`v and 1 or 0`): what each arm writes
+        // depends on what was tested, up to where the arms join
+        let mut tests: Vec<(i32, bool, bool)> = Vec::new(); // (join, on the value, on the read)
+        for i in start..code.len() {
             let ins = code[i];
+            let q = ins.pc;
+            tests.retain(|t| t.0 > q);
             let (rd, wr, barrier) = self.flow.effects[i];
-            if rd.has(r) {
-                let callee = matches!(ins.op, op::CALL | op::CALLFB).then(|| ins.a());
-                return reads.iter().any(|x| Some(*x) != callee && (ins.op == op::MOVE || *x < r));
+            let (with_val, with_st) = (rd.intersects(&val), rd.intersects(&st));
+            if with_val && with_st {
+                return state_operand_first(&ins, &val, &st, i.checked_sub(1).map(|k| code[k]));
             }
             let (s, n) = ins.successors();
-            if barrier || wr.has(r) || n != 1 || s[0] != ins.pc + ins.n {
+            let forward = s[..n].iter().all(|t| *t > q);
+            if barrier || ins.op == op::RETURN || !forward {
                 return false;
             }
-            if matches!(
-                ins.op,
-                op::GETGLOBAL | op::GETUPVAL | op::GETTABLE | op::GETTABLEKS | op::GETTABLEN | op::LENGTH
-            ) {
-                reads.push(ins.a());
+            if n == 2 {
+                let target = s[..n].iter().copied().max().unwrap_or(q);
+                tests.push((target, with_val, with_st));
+            } else if s[0] != q + ins.n {
+                // the end of the first arm: the other one is under the test too
+                if let Some(last) = tests.last_mut() {
+                    last.0 = last.0.max(s[0]);
+                }
             }
-            i += 1;
+            let (under_val, under_st) = tests.iter().fold((false, false), |a, t| (a.0 || t.1, a.1 || t.2));
+            // a field of the value itself is read after it, as written
+            let reads_state = !with_val
+                && matches!(
+                    ins.op,
+                    op::GETGLOBAL | op::GETUPVAL | op::GETTABLE | op::GETTABLEKS | op::GETTABLEN | op::LENGTH
+                );
+            // read is used up: its expression goes on in what this writes, if
+            // anything (a store or a call statement ends it)
+            let was_val = val;
+            for x in rd.iter() {
+                val.remove(x);
+                st.remove(x);
+            }
+            for w in wr.iter() {
+                let (v, s) = (with_val || under_val, with_st || reads_state || under_st);
+                if v && (w < r || (rd.has(w) && !was_val.has(w))) {
+                    return false; // into a local, below the temporaries or in place: written
+                }
+                if v && s && !val.has(w) && !st.has(w) {
+                    // they meet in an arm: what was tested is written first
+                    return under_st && !under_val;
+                }
+                if tests.is_empty() {
+                    val.remove(w);
+                    st.remove(w);
+                }
+                if v {
+                    val.add(w);
+                }
+                if s {
+                    st.add(w);
+                }
+            }
+            if val.is_empty() && !tests.iter().any(|t| t.1) {
+                return false; // used up, and nothing tested on it decides more
+            }
         }
         false
     }
@@ -2021,6 +2065,8 @@ impl<'c, 'm> Dec<'c, 'm> {
             let code = &self.p.code;
             let mut top: Option<usize> = None; // first register past the last multi-value result
             let mut other_arm = -1; // up to here, a jumped-over path still needs r
+            let made_by_call = matches!(self.insn(pc).op, op::CALL | op::CALLFB);
+            let mut state_read = false; // a global, upvalue or field read on the way
             let mut i = self.flow.idx(pc).expect("no instruction at pc") + 1;
             while i < code.len() {
                 let ins = code[i];
@@ -2069,6 +2115,14 @@ impl<'c, 'm> Dec<'c, 'm> {
                     || (ins.op == op::NAMECALL && qa == r && ins.b() == r);
                 if rd.has(r) && !temporary && self.later_statement(pc, q) {
                     break; // the source had a variable here
+                }
+                if rd.has(r) && made_by_call && state_read && self.state_printed_first(pc + self.insn(pc).n, r) {
+                    // the call came first: a separate statement in the source,
+                    // or an argument of copied-in code that read state first
+                    break;
+                }
+                if matches!(ins.op, op::GETGLOBAL | op::GETUPVAL | op::GETTABLE | op::GETTABLEKS | op::GETTABLEN | op::LENGTH) {
+                    state_read = true;
                 }
                 if rd.has(r) {
                     if matches!(ins.op, op::JUMPIF | op::JUMPIFNOT) && qa == r {
@@ -4099,6 +4153,49 @@ impl<'c, 'm> Dec<'c, 'm> {
         closure.borrow_mut().names_read = captured;
         self.put(out, ind, a, closure, true);
         q
+    }
+}
+
+/// At ins a value and a later read of state first meet: is the read written
+/// out first? Operands go left to right, lists in register order, and a store
+/// says where before what. A fast call's function is loaded last, after its
+/// arguments, however it is written.
+fn state_operand_first(ins: &Insn, val: &RegSet, st: &RegSet, prev: Option<Insn>) -> bool {
+    let (a, b, c) = (ins.a(), ins.b(), ins.c());
+    let first_of = |regs: &mut dyn Iterator<Item = usize>| {
+        for x in regs {
+            if st.has(x) {
+                return true;
+            }
+            if val.has(x) {
+                return false;
+            }
+        }
+        true
+    };
+    match ins.op {
+        op::ADD | op::SUB | op::MUL | op::DIV | op::MOD | op::POW | op::IDIV | op::AND | op::OR | op::GETTABLE => {
+            first_of(&mut [b, c].into_iter())
+        }
+        op::CONCAT => first_of(&mut (b..=c)),
+        op::CALL | op::CALLFB => {
+            let fast = prev.is_some_and(|p| {
+                p.a() == a && matches!(p.op, op::GETUPVAL | op::GETGLOBAL | op::GETIMPORT | op::GETTABLEKS)
+            });
+            let from = if fast { a + 1 } else { a };
+            let end = if b == 0 { a + 256 } else { a + b };
+            first_of(&mut (from..end))
+        }
+        op::RETURN => first_of(&mut (a..a + 256)),
+        op::SETLIST => first_of(&mut std::iter::once(a).chain(b..b + 256)),
+        op::SETTABLE => first_of(&mut [b, c, a].into_iter()),
+        op::SETTABLEKS | op::SETTABLEN => first_of(&mut [b, a].into_iter()),
+        op::JUMPIFEQ | op::JUMPIFLE | op::JUMPIFLT | op::JUMPIFNOTEQ | op::JUMPIFNOTLE | op::JUMPIFNOTLT => {
+            // `x > y` is `y < x`: written with the one made first first
+            let other = (ins.aux & 0xFF) as usize;
+            first_of(&mut [a.min(other), a.max(other)].into_iter())
+        }
+        _ => true,
     }
 }
 

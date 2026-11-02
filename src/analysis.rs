@@ -23,6 +23,20 @@ impl RegSet {
         }
     }
     #[inline]
+    pub fn remove(&mut self, r: usize) {
+        if r < WORDS * 64 {
+            self.0[r / 64] &= !(1u64 << (r % 64));
+        }
+    }
+
+    pub fn intersects(&self, other: &RegSet) -> bool {
+        self.0.iter().zip(other.0.iter()).any(|(a, b)| a & b != 0)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.iter().all(|w| *w == 0)
+    }
+
     pub fn has(&self, r: usize) -> bool {
         r < WORDS * 64 && self.0[r / 64] >> (r % 64) & 1 != 0
     }
