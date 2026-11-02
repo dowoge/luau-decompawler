@@ -1949,12 +1949,18 @@ impl<'c, 'm> Dec<'c, 'm> {
         if self.pending.is_empty() {
             return;
         }
+        let goes = |q: usize, x: &X| q != r && !x.pure_ && x.fields.is_none() && !x.method && x.text != "<self>" && !x.multret;
         let keys: Vec<usize> = self.pending.keys().copied().collect();
         for q in keys {
             let Some(v) = self.pending.get(&q) else { continue }; // written out on the way
             let go = {
                 let x = v.borrow();
-                q != r && !x.pure_ && x.fields.is_none() && !x.method && x.text != "<self>" && !x.multret
+                goes(q, &x)
+                    // a constructor that made calls already: before the values
+                    // with effects made after it
+                    || q != r
+                        && x.fields.as_ref().is_some_and(|f| f.iter().any(|t| t.contains('(')))
+                        && self.pending.range(q + 1..).any(|(p, w)| goes(*p, &w.borrow()))
             };
             if go {
                 let e = self.get(q);
