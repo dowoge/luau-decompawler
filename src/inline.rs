@@ -1025,6 +1025,10 @@ fn match_once(m: &Module, caller: &Proto, id: usize, start: usize, assumed: &[Op
                 match plain(e.op) {
                     op::JUMP => to_end.push(e.jump_target()?),
                     op::RETURN => copied_return = Some((e.a(), e.b())),
+                    // the constants given folded every test on the way: this
+                    // return is certain, and the compiler copies nothing of
+                    // the helper after it, so the caller's own code follows
+                    _ if walk.jumps.is_empty() && outside(helper, caller, e.pc) => break,
                     _ => return refuse("no way out after a return"),
                 }
                 exits.insert(e.pc);
@@ -1160,6 +1164,18 @@ fn feeds_return(want: &[&Insn], k: usize) -> bool {
         }
     }
     false
+}
+
+/// Is the caller's instruction at pc on a line outside the helper's? (False
+/// when there are no lines to tell by.)
+fn outside(helper: &Proto, caller: &Proto, pc: i32) -> bool {
+    let Some(&line) = caller.lines.get(pc as usize) else { return false };
+    let (lo, hi) = helper
+        .code
+        .iter()
+        .filter_map(|c| helper.lines.get(c.pc as usize).copied())
+        .fold((u32::MAX, 0), |(lo, hi), l| (lo.min(l), hi.max(l)));
+    lo <= hi && !(lo..=hi).contains(&line)
 }
 
 /// Where the code after a helper jumps straight on to, if it does.
