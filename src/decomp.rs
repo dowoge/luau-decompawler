@@ -4696,7 +4696,12 @@ impl<'c, 'm> Dec<'c, 'm> {
             let was_declared = self.declared[key as usize];
             self.declare(key);
             let (s, l, st) = (self.reg_text(a + 2), self.reg_text(a), self.reg_text(a + 1));
-            out.push(format!("{pad}for {var} = {s}, {l}, {st} do"));
+            // a step left out is a 1 loaded all the same
+            if st == "1" {
+                out.push(format!("{pad}for {var} = {s}, {l} do"));
+            } else {
+                out.push(format!("{pad}for {var} = {s}, {l}, {st} do"));
+            }
             self.loops.push((edge, target));
             self.emit_range(out, ind + 4, nxt, edge, None, None);
             self.flush(out, ind + 4, &[]);
