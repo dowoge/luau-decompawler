@@ -1,0 +1,8 @@
+/target/
+/build/
+/run/
+/out/
+/failed/
+__pycache__/
+*.pyc
+*.bc
