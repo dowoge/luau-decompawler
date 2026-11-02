@@ -618,6 +618,8 @@ impl Walk<'_> {
                 }
                 self.jump(p, c)
             }
+            // the helper's locals a closure captured end with it
+            op::CLOSEUPVALS => (self.map.get(pa).copied().flatten() == Some(ca)).then_some(()),
             _ => None, // closures, varargs and the like: leave it
         }
     }
@@ -706,6 +708,8 @@ fn match_once(m: &Module, caller: &Proto, id: usize, start: usize, assumed: &[Op
     };
     // helper code a folded test left out of the copy: up to this pc
     let mut dead_until: Option<i32> = None;
+    // the caller register a CLOSEUPVALS put after the result's moves closes
+    let mut late_close: Option<usize> = None;
     // the jump over an else a folded test left out, and where it goes
     let mut dead_jump: Option<(i32, i32)> = None;
     let mut landing: HashMap<i32, i32> = HashMap::default();
@@ -771,6 +775,12 @@ fn match_once(m: &Module, caller: &Proto, id: usize, start: usize, assumed: &[Op
         let mut c = code.get(i)?;
         REACHED.with(|r| r.set((k, want.len(), p.op, c.op)));
         landing.insert(p.pc, c.pc);
+        // `return a, b` of locals a closure captured: the copy moves the
+        // results out first and closes the locals after
+        if p.op == op::CLOSEUPVALS && c.op != op::CLOSEUPVALS && want.get(k + 1).is_some_and(|w| w.op == op::RETURN) {
+            late_close = Some(walk.map.get(p.a()).copied().flatten()?);
+            continue;
+        }
         if p.op == op::LOADK {
             if let Some(n) = walk.folded_concat(&want, k, c) {
                 folded = n - 1;
@@ -949,6 +959,14 @@ fn match_once(m: &Module, caller: &Proto, id: usize, start: usize, assumed: &[Op
                 }
             }
         }
+    }
+    if let Some(r) = late_close {
+        let close = code.get(i)?;
+        if close.op != op::CLOSEUPVALS || close.a() != r {
+            return refuse("captured locals not closed after the results");
+        }
+        last = close.pc;
+        i = skip(code, i + 1);
     }
     let after = code.get(i)?;
     let end = after.pc;
