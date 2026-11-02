@@ -811,7 +811,10 @@ pub fn wrap_mid_block_exits(lines: Vec<String>) -> Vec<String> {
             // opener before it needs nothing (and `;` there is not allowed)
             let prev = rstrip(out.last().unwrap());
             let opener = ends_block_word(prev) || ends_function_header_loose(prev);
-            if !opener && !prev.ends_with(';') {
+            // nor after `end`: a block is no expression, and a function
+            // literal is not one that can be called without brackets
+            let after_end = prev.strip_suffix("end").is_some_and(|h| h.is_empty() || !is_word(*h.as_bytes().last().unwrap()));
+            if !opener && !after_end && !prev.ends_with(';') {
                 let new = format!("{prev};");
                 *out.last_mut().unwrap() = new;
             }
