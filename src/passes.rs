@@ -1342,10 +1342,198 @@ fn copy_unless_guards(lines: &mut Vec<String>) {
             .filter(|f| f.strip_prefix("jump_").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())))
             .map(str::to_string);
         match flag {
-            Some(f) if copy_unless(lines, k, &f) || copy_unless_repeat(lines, k, &f) => {}
+            Some(f) if copy_unless(lines, k, &f) || copy_unless_repeat(lines, k, &f) || value_for_flag(lines, k, &f) => {}
             _ => k += 1,
         }
     }
+}
+
+/// `v = c and x or y` written out: `if c then v = x  if v then F = true end
+/// end  if not F then ... v = y end`. F is set exactly when v holds, so v
+/// can be tested in its place: each set goes, every other way out of the
+/// `if` gives v a false value, and the check tests v. Exact when what the
+/// check guards ends by setting v, reads v nowhere else and always gets to
+/// its end, and no function shares v (so the value put in is never seen).
+fn value_for_flag(lines: &mut Vec<String>, decl: usize, flag: &str) -> bool {
+    let check = format!("if not {flag} then");
+    let Some(c) = (decl + 1..lines.len()).find(|&i| strip(&lines[i]) == check) else { return false };
+    // the flag: declared, set in tail position, read once
+    let set = format!("{flag} = true");
+    if (0..lines.len()).any(|i| i != decl && i != c && has_word(&lines[i], flag) && strip(&lines[i]) != set) {
+        return false;
+    }
+    let d = indent_of(&lines[c]);
+    let Some(chain_end) = (decl + 1..c).rev().find(|&i| !is_blank(&lines[i])) else { return false };
+    if indent_of(&lines[chain_end]) != d || strip(&lines[chain_end]) != "end" {
+        return false;
+    }
+    let Some(first) = (decl + 1..chain_end).rev().find(|&i| indent_of(&lines[i]) == d && !is_blank(&lines[i]) && !is_arm(strip(&lines[i]))) else {
+        return false;
+    };
+    if !strip(&lines[first]).starts_with("if ") || !strip(&lines[first]).ends_with(" then") || if_end(lines, first) != Some(chain_end) {
+        return false;
+    }
+    if lines[decl + 1..first].iter().any(|l| loop_open(l) || strip(l).contains("function") || has_word(l, flag)) {
+        return false;
+    }
+    // every set is `if V then F = true end`, one V, one sense
+    let mut tested: Option<(bool, String)> = None;
+    for i in first..chain_end {
+        if strip(&lines[i]) != set {
+            continue;
+        }
+        let head = strip(&lines[i - 1]);
+        let Some(t) = head.strip_prefix("if ").and_then(|r| r.strip_suffix(" then")) else { return false };
+        if strip(&lines[i + 1]) != "end" || indent_of(&lines[i + 1]) != indent_of(&lines[i - 1]) {
+            return false;
+        }
+        let (truthy, v) = match t.strip_prefix("not ") {
+            Some(v) => (false, v),
+            None => (true, t),
+        };
+        if !is_token(v) || tested.as_ref().is_some_and(|x| *x != (truthy, v.to_string())) {
+            return false;
+        }
+        tested = Some((truthy, v.to_string()));
+    }
+    let Some((truthy, v)) = tested else { return false };
+    // what the check guards: ends by setting v, reads it nowhere else
+    let mut e = c + 1;
+    while e < lines.len() && (is_blank(&lines[e]) || indent_of(&lines[e]) > d) {
+        e += 1;
+    }
+    if e >= lines.len() || indent_of(&lines[e]) != d || strip(&lines[e]) != "end" {
+        return false;
+    }
+    let body: Vec<usize> = (c + 1..e).filter(|&i| !is_blank(&lines[i])).collect();
+    let Some(&last) = body.last() else { return false };
+    let assign = format!("{v} = ");
+    if indent_of(&lines[last]) != d + 4 || !strip(&lines[last]).starts_with(&assign) || has_word(&strip(&lines[last])[assign.len()..], &v) {
+        return false;
+    }
+    // a `break` or `continue` out of it would leave the placeholder to be
+    // seen (one of a loop inside it, or a `return`, would not)
+    let inside_loop = |i: usize| {
+        let mut min = indent_of(&lines[i]);
+        (c + 1..i).rev().any(|k| {
+            if is_blank(&lines[k]) || indent_of(&lines[k]) >= min {
+                return false;
+            }
+            min = indent_of(&lines[k]);
+            loop_open(&lines[k])
+        })
+    };
+    let leaves = |i: usize| {
+        let l = &lines[i];
+        has_any_goto(l) || ((has_word(l, "break") || has_word(l, "continue")) && !inside_loop(i))
+    };
+    if body[..body.len() - 1].iter().any(|&i| has_word(&lines[i], &v) || leaves(i)) {
+        return false;
+    }
+    // no function shares v: every line naming it is in the same function
+    let home = enclosing_function(lines, first);
+    let shared = |i: usize| strip(&lines[i]).contains("function") || enclosing_function(lines, i) != home;
+    if (0..lines.len()).any(|i| has_word(&lines[i], &v) && shared(i)) {
+        return false;
+    }
+    let chain: Vec<String> = lines[first..=chain_end].iter().filter(|l| !is_blank(l)).cloned().collect();
+    let mut puts = 0;
+    let placeholder = format!("{v} = {}", if truthy { "false" } else { "true" });
+    let Some(new) = value_chain(&chain, d, flag, &v, truthy, &placeholder, &mut puts) else { return false };
+    if new.iter().any(|l| has_word(l, flag)) {
+        return false;
+    }
+    let test = if truthy { format!("if not {v} then") } else { format!("if {v} then") };
+    lines[c] = format!("{}{test}", spaces(d));
+    lines.splice(first..=chain_end, new);
+    if !(0..lines.len()).any(|i| i != decl && has_word(&lines[i], flag)) {
+        lines.remove(decl);
+    }
+    true
+}
+
+/// The function line k is in: the nearest less indented line above it that
+/// opens one, or None at the top of the chunk.
+fn enclosing_function(lines: &[String], k: usize) -> Option<usize> {
+    let mut min = indent_of(&lines[k]);
+    for j in (0..k).rev() {
+        if is_blank(&lines[j]) || indent_of(&lines[j]) >= min {
+            continue;
+        }
+        min = indent_of(&lines[j]);
+        let s = strip(&lines[j]);
+        if s.contains("function(") || s.starts_with("function ") || s.starts_with("local function ") {
+            return Some(j);
+        }
+        if min == 0 {
+            break;
+        }
+    }
+    None
+}
+
+/// value_for_flag's rewrite of an `if` chain at indent j: a set of the flag,
+/// `if v then F = true end` at an arm's end, goes (v already says it); every
+/// other end of an arm gets the placeholder, and a missing else gets one.
+fn value_chain(chain: &[String], j: usize, flag: &str, v: &str, truthy: bool, placeholder: &str, puts: &mut usize) -> Option<Vec<String>> {
+    let pad = spaces(j);
+    if strip(chain.last()?) != "end" || indent_of(chain.last()?) != j {
+        return None;
+    }
+    let mut arms: Vec<(String, Vec<String>)> = Vec::new();
+    for l in &chain[..chain.len() - 1] {
+        let t = strip(l);
+        if indent_of(l) == j && (t.starts_with("if ") || t.starts_with("elseif ") || t == "else") {
+            arms.push((l.clone(), Vec::new()));
+        } else {
+            arms.last_mut()?.1.push(l.clone());
+        }
+    }
+    let has_else = arms.iter().any(|a| strip(&a.0) == "else");
+    let mut out = Vec::new();
+    for (head, body) in &arms {
+        out.push(head.clone());
+        out.extend(value_body(body, j + 4, flag, v, truthy, placeholder, puts)?);
+    }
+    if !has_else {
+        *puts += 1;
+        out.push(format!("{pad}else"));
+        out.push(format!("{}{placeholder}", spaces(j + 4)));
+    }
+    out.push(format!("{pad}end"));
+    Some(out)
+}
+
+fn value_body(body: &[String], j: usize, flag: &str, v: &str, truthy: bool, placeholder: &str, puts: &mut usize) -> Option<Vec<String>> {
+    let stmts = statements(body, j)?;
+    let put = |puts: &mut usize| -> String {
+        *puts += 1;
+        format!("{}{placeholder}", spaces(j))
+    };
+    let Some((last, before)) = stmts.split_last() else { return Some(vec![put(puts)]) };
+    if before.iter().flatten().any(|l| has_word(l, flag)) {
+        return None; // a set more code follows
+    }
+    let mut out: Vec<String> = before.iter().flatten().cloned().collect();
+    let head = strip(&last[0]);
+    let test = if truthy { format!("if {v} then") } else { format!("if not {v} then") };
+    if last.len() == 3 && head == test && strip(&last[1]) == format!("{flag} = true") {
+        return Some(out); // the set: v holds the answer already
+    }
+    if !last.iter().any(|l| has_word(l, flag)) {
+        out.extend(last.iter().cloned());
+        let t = head;
+        let leaves = last.len() == 1 && (t == "break" || t == "continue" || t == "return" || t.starts_with("return "));
+        if !leaves {
+            out.push(put(puts));
+        }
+        return Some(out);
+    }
+    if head.starts_with("if ") && head.ends_with(" then") {
+        out.extend(value_chain(last, j, flag, v, truthy, placeholder, puts)?);
+        return Some(out);
+    }
+    None
 }
 
 /// `local F = false  repeat ... F = true break until true  if not F then S
