@@ -1695,6 +1695,48 @@ fn arm_condition(s: &str) -> Option<(&'static str, &str)> {
     Some((word, c.strip_suffix(" then")?))
 }
 
+/// A test of names alone, joined by `not`, `and` and `or`: nothing it does
+/// can show, so an `if` with nothing in it can go.
+fn plain_test(c: &str) -> bool {
+    c.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == ' ')
+}
+
+/// Remove a flag nothing reads, and the `if`s left empty by that: one whose
+/// test could do something keeps it as `if c then end`; `if c then else B
+/// end` is `if not c then B end`.
+fn drop_unread_flag(lines: &mut Vec<String>, flag: &str) {
+    lines.retain(|l| !has_word(l, flag));
+    let mut k = 0;
+    while k + 1 < lines.len() {
+        let (ind, next_ind) = (indent_of(&lines[k]), indent_of(&lines[k + 1]));
+        let s = strip(&lines[k]).to_string();
+        let next = strip(&lines[k + 1]).to_string();
+        let Some(c) = s.strip_prefix("if ").and_then(|c| c.strip_suffix(" then")) else {
+            k += 1;
+            continue;
+        };
+        if next_ind != ind {
+            k += 1;
+            continue;
+        }
+        let pad = spaces(ind);
+        if next == "end" {
+            if plain_test(c) {
+                lines.drain(k..k + 2);
+            } else {
+                lines.splice(k..k + 2, [format!("{pad}if {c} then end")]);
+                k += 1;
+            }
+            continue;
+        }
+        if next == "else" {
+            lines[k] = format!("{pad}if {} then", negated(c));
+            lines.remove(k + 1);
+        }
+        k += 1;
+    }
+}
+
 fn eliminate_label(mut lines: Vec<String>, n: &str) -> Option<Vec<String>> {
     let flag = format!("jump_{n}");
     let mut declared = false;
@@ -1702,9 +1744,11 @@ fn eliminate_label(mut lines: Vec<String>, n: &str) -> Option<Vec<String>> {
         let li = lines.iter().position(|l| parse_label(l).is_some_and(|p| p.1 == n))?;
         let Some(g) = lines.iter().position(|l| has_goto(l, n)) else {
             lines.remove(li);
-            // the jumps may have gone without needing it
-            if lines.iter().filter(|l| has_word(l, &flag)).count() == 1 {
-                lines.retain(|l| !has_word(l, &flag));
+            // the jumps may have gone without needing it: what the flag
+            // guarded was nothing, so it is set and never read
+            let (declare, set) = (format!("local {flag} = false"), format!("{flag} = true"));
+            if lines.iter().filter(|l| has_word(l, &flag)).all(|l| strip(l) == declare || strip(l) == set) {
+                drop_unread_flag(&mut lines, &flag);
             }
             return Some(lines);
         };
