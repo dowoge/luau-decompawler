@@ -1342,10 +1342,167 @@ fn copy_unless_guards(lines: &mut Vec<String>) {
             .filter(|f| f.strip_prefix("jump_").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())))
             .map(str::to_string);
         match flag {
-            Some(f) if copy_unless(lines, k, &f) || copy_unless_repeat(lines, k, &f) || value_for_flag(lines, k, &f) => {}
+            Some(f)
+                if copy_unless(lines, k, &f)
+                    || copy_unless_repeat(lines, k, &f)
+                    || value_for_flag(lines, k, &f)
+                    || condition_for_flag(lines, k, &f) => {}
             _ => k += 1,
         }
     }
+}
+
+/// `if a then if b then F = true end end  if F or c then`: an `if` of tests
+/// and sets alone makes F a condition, read right after it as the first
+/// thing a condition tests. That condition, written out, stands in its
+/// place: `if a and b or c then`. Its tests run once each and in the same
+/// order, and only whether F holds is ever asked.
+fn condition_for_flag(lines: &mut Vec<String>, decl: usize, flag: &str) -> bool {
+    let set = format!("{flag} = true");
+    let reads: Vec<usize> = (decl + 1..lines.len()).filter(|&i| has_word(&lines[i], flag) && strip(&lines[i]) != set).collect();
+    let [r] = reads[..] else { return false };
+    if (0..decl).any(|i| has_word(&lines[i], flag)) {
+        return false;
+    }
+    let d = indent_of(&lines[r]);
+    let Some(chain_end) = (decl + 1..r).rev().find(|&i| !is_blank(&lines[i])) else { return false };
+    if indent_of(&lines[chain_end]) != d || strip(&lines[chain_end]) != "end" {
+        return false;
+    }
+    let Some(first) = (decl + 1..chain_end).rev().find(|&i| indent_of(&lines[i]) == d && !is_blank(&lines[i]) && !is_arm(strip(&lines[i]))) else {
+        return false;
+    };
+    if !strip(&lines[first]).starts_with("if ") || !strip(&lines[first]).ends_with(" then") || if_end(lines, first) != Some(chain_end) {
+        return false;
+    }
+    if lines[decl + 1..first].iter().any(|l| loop_open(l) || strip(l).contains("function") || has_word(l, flag)) {
+        return false;
+    }
+    // tests and sets, nothing else
+    let pure = lines[first..=chain_end].iter().filter(|l| !is_blank(l)).all(|l| {
+        let t = strip(l);
+        t == set || t == "end" || t == "else" || ((t.starts_with("if ") || t.starts_with("elseif ")) && t.ends_with(" then"))
+    });
+    if !pure || (first..chain_end).filter(|&i| strip(&lines[i]) == set).count() == 0 {
+        return false;
+    }
+    let chain: Vec<String> = lines[first..=chain_end].iter().filter(|l| !is_blank(l)).cloned().collect();
+    let Some(cond) = flag_condition(&chain, d, &set) else { return false };
+    // where it is read: the first thing tested by an `if`, or by an if
+    // expression that is all a value is set to
+    let text = strip(&lines[r]).to_string();
+    let (before, test, after) = if let Some(c) = text.strip_prefix("if ").and_then(|t| t.strip_suffix(" then")) {
+        ("if ".to_string(), c.to_string(), " then".to_string())
+    } else if let Some(at) = text.find(" = if ") {
+        let rest = &text[at + 6..];
+        let Some(th) = top_level_then(rest) else { return false };
+        (text[..at + 6].to_string(), rest[..th].to_string(), rest[th..].to_string())
+    } else {
+        return false;
+    };
+    if test.matches(flag).count() != 1 {
+        return false;
+    }
+    let lead = test.trim_start_matches("not ").trim_start_matches('(').trim_start_matches("not ");
+    let ok_after = |s: &str| s.is_empty() || s.starts_with(" or ") || s.starts_with(" and ") || s.starts_with(')');
+    if !lead.starts_with(flag) || !ok_after(&lead[flag.len()..]) || !has_word(lead, flag) {
+        return false;
+    }
+    let new_test = test.replacen(flag, &format!("({cond})"), 1);
+    lines[r] = format!("{}{before}{new_test}{after}", spaces(d));
+    lines.drain(first..=chain_end);
+    lines.remove(decl);
+    true
+}
+
+/// The ` then` that ends an if expression's condition: the first one outside
+/// brackets and strings.
+fn top_level_then(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let (mut depth, mut quote) = (0i32, None::<u8>);
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        match quote {
+            Some(q) => {
+                if c == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                b'"' | b'\'' | b'`' => quote = Some(c),
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => depth -= 1,
+                _ if depth == 0 && s[i..].starts_with(" then ") => return Some(i),
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The condition under which an `if` chain of tests and sets (at indent j)
+/// sets the flag, each test kept once and in its place: `if c then x else
+/// false` is `c and x`, `if c then true else x` is `c or x`.
+fn flag_condition(chain: &[String], j: usize, set: &str) -> Option<String> {
+    let mut arms: Vec<(Option<String>, Vec<String>)> = Vec::new();
+    for l in &chain[..chain.len() - 1] {
+        let t = strip(l);
+        if indent_of(l) == j && (t.starts_with("if ") || t.starts_with("elseif ") || t == "else") {
+            let cond = t.strip_prefix("if ").or_else(|| t.strip_prefix("elseif ")).and_then(|r| r.strip_suffix(" then")).map(str::to_string);
+            arms.push((cond, Vec::new()));
+        } else {
+            arms.last_mut()?.1.push(l.clone());
+        }
+    }
+    // the value of each arm's body: true, false, or a nested chain's
+    let value = |body: &[String]| -> Option<String> {
+        let b: Vec<&String> = body.iter().filter(|l| !is_blank(l)).collect();
+        match b.as_slice() {
+            [] => Some("false".to_string()),
+            [s] if strip(s) == set => Some("true".to_string()),
+            _ => {
+                let owned: Vec<String> = b.iter().map(|l| (*l).clone()).collect();
+                if strip(owned.first()?).starts_with("if ") && if_end(&owned, 0) == Some(owned.len() - 1) {
+                    flag_condition(&owned, j + 4, set)
+                } else {
+                    None
+                }
+            }
+        }
+    };
+    // from the last arm back: `if c then x else (rest)`
+    let mut rest = match arms.last()? {
+        (None, body) => value(body)?,
+        _ => "false".to_string(),
+    };
+    // parenthesize an operand only where precedence needs it
+    let ifx = |s: &str| s.starts_with("if ");
+    let has_or = |s: &str| top_level_ops(s).iter().any(|o| *o == " or ");
+    let and_op = |s: &str| if has_or(s) || ifx(s) { format!("({s})") } else { s.to_string() };
+    let or_op = |s: &str| if ifx(s) { format!("({s})") } else { s.to_string() };
+    let not_op = |s: &str| if one_operand(s) { s.to_string() } else { format!("({s})") };
+    for (cond, body) in arms.iter().rev() {
+        let Some(c) = cond else { continue };
+        let x = value(body)?;
+        rest = match (x.as_str(), rest.as_str()) {
+            ("true", "false") => c.clone(),
+            ("false", "true") => format!("not {}", not_op(c)),
+            ("true", "true") => return None, // the test would be lost
+            ("false", "false") => return None,
+            (_, "false") => format!("{} and {}", and_op(c), and_op(&x)),
+            ("true", _) => format!("{} or {}", or_op(c), or_op(&rest)),
+            ("false", _) => format!("not {} and {}", not_op(c), and_op(&rest)),
+            (_, "true") => format!("not {} or {}", not_op(c), or_op(&x)),
+            _ => format!("if {c} then {x} else {rest}"),
+        };
+    }
+    Some(rest)
 }
 
 /// `v = c and x or y` written out: `if c then v = x  if v then F = true end
