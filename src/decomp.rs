@@ -2969,6 +2969,22 @@ impl<'c, 'm> Dec<'c, 'm> {
         (self.stmt(out, ind, pc, end), false)
     }
 
+    /// Is the call at pc one of Luau's builtins that return one value? A
+    /// FASTCALL that names it says so, and at -O2 the compiler never lets
+    /// such a call return more: no parentheses are needed to keep it to one.
+    fn builtin_one(&self, pc: i32) -> bool {
+        let Some(at) = self.flow.idx(pc) else { return false };
+        self.p.code[..at]
+            .iter()
+            .rev()
+            .take(48)
+            .find(|i| {
+                matches!(i.op, op::FASTCALL | op::FASTCALL1 | op::FASTCALL2 | op::FASTCALL2K | op::FASTCALL3)
+                    && i.pc + 1 + i.c() as i32 == pc
+            })
+            .is_some_and(|i| builtin_returns_one(i.a()))
+    }
+
     fn read_once_from(&mut self, j: i32, r: usize) -> bool {
         let ins = self.insn(j);
         let (rd, wr, barrier) = effects(&ins, self.p.maxstack);
@@ -4228,7 +4244,7 @@ impl<'c, 'm> Dec<'c, 'm> {
                 let args: Vec<E> = (first..first + nargs.max(0) as usize).map(|r| self.get(r)).collect();
                 let texts = list_texts(&args, b != 0);
                 let call = ex(format!("{}({})", wrap(&f, 100), texts.join(", ")), 100);
-                call.borrow_mut().one = c == 2;
+                call.borrow_mut().one = c == 2 && !self.builtin_one(pc);
                 // above the arguments: the call overwrites it, so nothing reads
                 // it, but it may have effects, and those come first
                 let above: Vec<usize> = self.pending.range(a..).map(|(r, _)| *r).collect();
@@ -4887,4 +4903,11 @@ pub fn disassemble(m: &Module) -> String {
         all.push(lines.join("\n"));
     }
     all.join("\n\n")
+}
+
+/// The builtins whose result count Luau's compiler knows to be one: all up to
+/// the vector library but assert, math.frexp and math.modf, string.byte,
+/// table.insert and table.unpack, select(_, ...) and the buffer writes.
+fn builtin_returns_one(id: usize) -> bool {
+    (2..=88).contains(&id) && ![14, 20, 41, 52, 53, 57, 67, 70, 73, 75, 77].contains(&id)
 }

@@ -2551,8 +2551,19 @@ fn interpolation(lines: Vec<String>) -> Vec<String> {
                 }
             }
             text.push('`');
-            let new = format!("{}{}{}", &line[..m0], text, &line[close + 1..]);
-            pos = m0 + text.len();
+            // grouped to keep one value (`return (s:format(x))`): a string is one
+            let (mut from, mut to) = (m0, close + 1);
+            let call_paren = |c: Option<char>| c.is_some_and(|c| is_word(c as u8) || c == ')' || c == ']' || c == '"' || c == '\'');
+            if line[..m0].ends_with('(')
+                && line[close + 1..].starts_with(')')
+                && !call_paren(line[..m0 - 1].chars().next_back())
+                && !line[close + 2..].starts_with([':', '.', '[', '(', '"', '\'', '{', '`'])
+            {
+                from = m0 - 1;
+                to = close + 2;
+            }
+            let new = format!("{}{}{}", &line[..from], text, &line[to..]);
+            pos = from + text.len();
             *line = new;
         }
     }
