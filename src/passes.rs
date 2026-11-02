@@ -1405,30 +1405,16 @@ fn value_for_flag(lines: &mut Vec<String>, decl: usize, flag: &str) -> bool {
     if e >= lines.len() || indent_of(&lines[e]) != d || strip(&lines[e]) != "end" {
         return false;
     }
-    let body: Vec<usize> = (c + 1..e).filter(|&i| !is_blank(&lines[i])).collect();
-    let Some(&last) = body.last() else { return false };
-    let assign = format!("{v} = ");
-    if indent_of(&lines[last]) != d + 4 || !strip(&lines[last]).starts_with(&assign) || has_word(&strip(&lines[last])[assign.len()..], &v) {
+    // every way through what the check guards sets v before anything reads
+    // it, and so does every way that gets to its end: the placeholder is
+    // never read
+    let body: Vec<String> = lines[c + 1..e].iter().filter(|l| !is_blank(l)).cloned().collect();
+    if body.is_empty() || body.iter().any(|l| has_any_goto(l) || parse_label(l).is_some()) {
         return false;
     }
-    // a `break` or `continue` out of it would leave the placeholder to be
-    // seen (one of a loop inside it, or a `return`, would not)
-    let inside_loop = |i: usize| {
-        let mut min = indent_of(&lines[i]);
-        (c + 1..i).rev().any(|k| {
-            if is_blank(&lines[k]) || indent_of(&lines[k]) >= min {
-                return false;
-            }
-            min = indent_of(&lines[k]);
-            loop_open(&lines[k])
-        })
-    };
-    let leaves = |i: usize| {
-        let l = &lines[i];
-        has_any_goto(l) || ((has_word(l, "break") || has_word(l, "continue")) && !inside_loop(i))
-    };
-    if body[..body.len() - 1].iter().any(|&i| has_word(&lines[i], &v) || leaves(i)) {
-        return false;
+    match set_before_read(&body, d + 4, &v, false, false) {
+        Some((true, _)) | Some((_, false)) => {}
+        _ => return false,
     }
     // no function shares v: every line naming it is in the same function
     let home = enclosing_function(lines, first);
@@ -1450,6 +1436,119 @@ fn value_for_flag(lines: &mut Vec<String>, decl: usize, flag: &str) -> bool {
         lines.remove(decl);
     }
     true
+}
+
+/// Walks a block (its lines, at indent j) for variable v, set already or not
+/// where it starts: None when some way through reads v before setting it,
+/// declares another v, or leaves by `break`/`continue` (other than a loop's
+/// inside it); else (whether every way reaching the end has set v, whether
+/// any way reaches it at all: `return` does not).
+fn set_before_read(body: &[String], j: usize, v: &str, mut set: bool, in_loop: bool) -> Option<(bool, bool)> {
+    let assign = format!("{v} = ");
+    for stmt in statements(body, j)? {
+        let head = strip(&stmt[0]);
+        let mentions = stmt.iter().any(|l| has_word(l, v));
+        if stmt.len() == 1 {
+            if head == "break" || head == "continue" {
+                if !in_loop {
+                    return None;
+                }
+                return Some((set, false));
+            }
+            if head == "return" || head.starts_with("return ") {
+                if mentions && !set {
+                    return None;
+                }
+                return Some((true, false));
+            }
+            if let Some(rhs) = head.strip_prefix(&assign) {
+                if has_word(rhs, v) && !set {
+                    return None;
+                }
+                set = true;
+                continue;
+            }
+            if parse_local_list(head).is_some_and(|(names, _)| names.split(", ").any(|n| n == v)) {
+                return None; // another v
+            }
+            if mentions && !set {
+                return None;
+            }
+            // one-line blocks (`if c then break end`): a way out of a loop
+            if !in_loop && (has_word(head, "break") || has_word(head, "continue")) {
+                return None;
+            }
+            continue;
+        }
+        if head.starts_with("if ") && head.ends_with(" then") && strip(stmt.last()?) == "end" {
+            // the arms: their tests run before any of their bodies
+            let mut arms: Vec<(String, Vec<String>)> = Vec::new();
+            for l in &stmt[..stmt.len() - 1] {
+                let t = strip(l);
+                if indent_of(l) == j && (t.starts_with("if ") || t.starts_with("elseif ") || t == "else") {
+                    arms.push((t.to_string(), Vec::new()));
+                } else {
+                    arms.last_mut()?.1.push(l.clone());
+                }
+            }
+            if !set && arms.iter().any(|a| has_word(&a.0, v)) {
+                return None;
+            }
+            let (mut all_set, mut reach) = (true, false);
+            for (_, arm) in &arms {
+                let (s, r) = set_before_read(arm, j + 4, v, set, in_loop)?;
+                if r {
+                    reach = true;
+                    all_set &= s;
+                }
+            }
+            if !arms.iter().any(|a| a.0 == "else") {
+                reach = true;
+                all_set &= set;
+            }
+            if !reach {
+                return Some((true, false));
+            }
+            set = all_set;
+            continue;
+        }
+        if loop_open(&stmt[0]) || head == "do" {
+            // a loop's body may not run: what it sets counts for none after it
+            let looped = head != "do";
+            if !set && has_word(head, v) {
+                return None;
+            }
+            if let Some(r) = head.strip_prefix("for ") {
+                let vars = r.split(" in ").next().unwrap_or(r).split(" = ").next().unwrap_or(r);
+                if vars.split(", ").any(|x| x.trim() == v) {
+                    return None;
+                }
+            }
+            let close = strip(stmt.last()?);
+            if close != "end" && !close.starts_with("until ") {
+                return None;
+            }
+            if !set && has_word(close, v) {
+                return None;
+            }
+            let (s, r) = set_before_read(&stmt[1..stmt.len() - 1], j + 4, v, set, in_loop || looped)?;
+            if !looped {
+                if !r {
+                    return Some((true, false));
+                }
+                set = s;
+            }
+            continue;
+        }
+        // anything else spread over lines (a call given a table, ...)
+        if mentions && !set {
+            return None;
+        }
+        if !in_loop && stmt.iter().any(|l| has_word(l, "break") || has_word(l, "continue")) {
+            return None;
+        }
+    }
+    Some((set, true))
 }
 
 /// The function line k is in: the nearest less indented line above it that
@@ -1541,13 +1640,20 @@ fn value_body(body: &[String], j: usize, flag: &str, v: &str, truthy: bool, plac
 /// `continue`s) skips the set, so S goes before each of those, and the set,
 /// the last break and the flag go.
 fn copy_unless_repeat(lines: &mut Vec<String>, decl: usize, flag: &str) -> bool {
-    let d = indent_of(&lines[decl]);
-    let Some(open) = (decl + 1..lines.len()).find(|&i| !is_blank(&lines[i])) else { return false };
+    // the check, the `until true` right before it, and its `repeat`
+    let check = format!("if not {flag} then");
+    let Some(c0) = (decl + 1..lines.len()).find(|&i| strip(&lines[i]) == check) else { return false };
+    let d = indent_of(&lines[c0]);
+    let Some(until) = (decl + 1..c0).rev().find(|&i| !is_blank(&lines[i])) else { return false };
+    if indent_of(&lines[until]) != d || strip(&lines[until]) != "until true" {
+        return false;
+    }
+    let Some(open) = (decl + 1..until).rev().find(|&i| !is_blank(&lines[i]) && indent_of(&lines[i]) <= d) else { return false };
     if indent_of(&lines[open]) != d || strip(&lines[open]) != "repeat" {
         return false;
     }
-    let Some(until) = (open + 1..lines.len()).find(|&i| !is_blank(&lines[i]) && indent_of(&lines[i]) <= d) else { return false };
-    if indent_of(&lines[until]) != d || strip(&lines[until]) != "until true" {
+    // declared further out: still false where the `repeat` starts
+    if lines[decl + 1..open].iter().any(|l| loop_open(l) || strip(l).contains("function") || has_word(l, flag)) {
         return false;
     }
     let body_lines: Vec<usize> = (open + 1..until).filter(|&i| !is_blank(&lines[i])).collect();
