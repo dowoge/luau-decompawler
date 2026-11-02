@@ -2055,7 +2055,8 @@ impl<'c, 'm> Dec<'c, 'm> {
     fn decompile_body(&mut self) -> (Vec<String>, Vec<String>) {
         let (params, body) = self.decompile_fitted();
         let given = self.p.numparams as usize;
-        if self.tight || given + locals_in_scope(&body) <= LOCAL_LIMIT {
+        let over = |b: &[String]| given + locals_in_scope(b) > LOCAL_LIMIT || register_pressure(b, given) > REG_LIMIT;
+        if self.tight || !over(&body) {
             return (params, body);
         }
         // Still past the limit: a value computed before a test waits for its
@@ -2066,8 +2067,13 @@ impl<'c, 'm> Dec<'c, 'm> {
         let mut again = Dec::with_flow(self.ctx, self.idx, self.upvals.clone(), self.depth, Some(flow));
         again.tight = true;
         let (tparams, tbody) = again.decompile_fitted();
-        let (params, body) = if locals_in_scope(&tbody) < locals_in_scope(&body) { (tparams, tbody) } else { (params, body) };
-        if given + locals_in_scope(&body) <= LOCAL_LIMIT {
+        let fewer = |a: &[String], b: &[String]| {
+            let (la, lb) = (locals_in_scope(a), locals_in_scope(b));
+            let (ra, rb) = (register_pressure(a, given), register_pressure(b, given));
+            (la < lb && ra <= rb) || (ra < rb && la <= lb)
+        };
+        let (params, body) = if fewer(&tbody, &body) { (tparams, tbody) } else { (params, body) };
+        if !over(&body) {
             return (params, body);
         }
         // still past it: the stretches inside the blocks scope_nested made
@@ -2075,7 +2081,7 @@ impl<'c, 'm> Dec<'c, 'm> {
         let lines: Vec<String> = body.iter().flat_map(|c| c.split('\n').map(String::from)).collect();
         let base = lines.iter().find(|l| !l.trim().is_empty()).map_or(0, |l| passes::indent_of(l));
         let deep = scope_nested_deep(&lines, base);
-        if locals_in_scope(&deep) < locals_in_scope(&lines) {
+        if fewer(&deep, &lines) {
             (params, deep)
         } else {
             (params, body)
@@ -5141,12 +5147,70 @@ fn declared_names(chunk: &str, base: &str) -> Vec<String> {
 /// Luau's limit on locals in scope in one function, its parameters included.
 const LOCAL_LIMIT: usize = 200;
 
+/// Luau's limit on registers in one function.
+const REG_LIMIT: usize = 255;
+
+/// The most registers a line of the body needs, as near as its text tells:
+/// the parameters and the locals in scope there, and the widest call on it
+/// (one register for the function, one per argument).
+fn register_pressure(body: &[String], given: usize) -> usize {
+    let mut most = 0;
+    scope_walk(body, |line, alive, held| most = most.max(given + alive + held + widest_call(line)));
+    most
+}
+
+/// The most registers one call on the line takes: the function and each
+/// argument at the call's own depth.
+fn widest_call(line: &str) -> usize {
+    let b = line.as_bytes();
+    let mut best = 0;
+    let mut opens: Vec<(usize, bool)> = Vec::new(); // (arguments so far, a call)
+    let mut quote = 0u8;
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if quote != 0 {
+            if c == b'\\' {
+                i += 1;
+            } else if c == quote {
+                quote = 0;
+            }
+        } else if matches!(c, b'"' | b'\'' | b'`') {
+            quote = c;
+        } else if matches!(c, b'(' | b'{' | b'[') {
+            let call = c == b'(' && i > 0 && (b[i - 1].is_ascii_alphanumeric() || matches!(b[i - 1], b'_' | b')' | b']' | b'"'));
+            let empty = b.get(i + 1) == Some(&b')');
+            opens.push((usize::from(!empty), call));
+        } else if c == b',' {
+            if let Some(top) = opens.last_mut() {
+                top.0 += 1;
+            }
+        } else if matches!(c, b')' | b'}' | b']') {
+            if let Some((args, call)) = opens.pop() {
+                if call {
+                    best = best.max(args + 1);
+                }
+            }
+        }
+        i += 1;
+    }
+    best
+}
+
 /// The most locals in scope at once in a body, loop variables included, as
 /// they count against LOCAL_LIMIT. A nested function's are its own: under its
 /// own limit, they count for none of this one's.
 fn locals_in_scope(body: &[String]) -> usize {
-    let (mut alive, mut peak) = (0usize, 0usize);
-    let mut scopes: Vec<(usize, usize)> = Vec::new(); // (indent, locals there)
+    let mut peak = 0;
+    scope_walk(body, |_, alive, _| peak = peak.max(alive));
+    peak
+}
+
+/// Each line of the function's own (not a nested function's), with the locals
+/// in scope once it has run.
+fn scope_walk(body: &[String], mut each: impl FnMut(&str, usize, usize)) {
+    let (mut alive, mut held) = (0usize, 0usize);
+    let mut scopes: Vec<(usize, usize, usize)> = Vec::new(); // (indent, locals there, loop registers)
     let mut inside: Option<usize> = None; // the indent of a nested function's header
     for line in body.iter().flat_map(|c| c.split('\n')).filter(|l| !l.trim().is_empty()) {
         let ind = passes::indent_of(line);
@@ -5156,7 +5220,9 @@ fn locals_in_scope(body: &[String]) -> usize {
             None => {}
         }
         while scopes.last().is_some_and(|s| s.0 > ind) {
-            alive -= scopes.pop().unwrap().1;
+            let s = scopes.pop().unwrap();
+            alive -= s.1;
+            held -= s.2;
         }
         // a function opens here whose body is the deeper lines that follow
         // (`local function f()` is itself one of this function's locals)
@@ -5169,19 +5235,32 @@ fn locals_in_scope(body: &[String]) -> usize {
             let head = rest.split(" = ").next().unwrap_or(rest).split(" in ").next().unwrap_or(rest);
             head.split(',').count()
         });
-        for (at, new) in [(ind, base_locals(line, &line[..ind])), (ind + 1, looped)] {
+        // and its own state besides: generator, state and control (and at
+        // least two variables' registers), or limit and step; registers,
+        // not locals
+        let state = if looped == 0 {
+            0
+        } else if line[ind..].contains(" in ") {
+            3 + 2usize.saturating_sub(looped)
+        } else {
+            2
+        };
+        for (at, new, regs) in [(ind, base_locals(line, &line[..ind]), 0), (ind + 1, looped, state)] {
             if new == 0 {
                 continue;
             }
             match scopes.last_mut() {
-                Some(s) if s.0 == at => s.1 += new,
-                _ => scopes.push((at, new)),
+                Some(s) if s.0 == at => {
+                    s.1 += new;
+                    s.2 += regs;
+                }
+                _ => scopes.push((at, new, regs)),
             }
             alive += new;
+            held += regs;
         }
-        peak = peak.max(alive);
+        each(line, alive, held);
     }
-    peak
 }
 
 /// The most locals in scope at once anywhere in these lines, nested blocks
