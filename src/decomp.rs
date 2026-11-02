@@ -5149,9 +5149,23 @@ impl<'c, 'm> Dec<'c, 'm> {
             return end;
         }
         self.flush(out, ind, &[]);
+        if self.to_loop_end(target) {
+            out.push(format!("{pad}if {} then continue end", cond.borrow().text));
+            return nxt;
+        }
         self.add_goto(target);
         out.push(format!("{pad}if {} then goto L{target} end", cond.borrow().text));
         nxt
+    }
+
+    /// Is target the jump back that closes the loop being printed? `continue`
+    /// in a `while` loop goes there, and round from it.
+    fn to_loop_end(&self, target: i32) -> bool {
+        let Some(&(cont, _)) = self.loops.last() else { return false };
+        self.valid(target) && {
+            let i = self.insn(target);
+            matches!(i.op, op::JUMPBACK | op::JUMP | op::JUMPX) && i.jump_target() == Some(cont)
+        }
     }
 
     fn stmt(&mut self, out: &mut Vec<String>, ind: usize, pc: i32, end: i32) -> i32 {
@@ -5203,6 +5217,8 @@ impl<'c, 'm> Dec<'c, 'm> {
             }
             if let Some(word) = self.jump_word(target) {
                 out.push(format!("{pad}{word}"));
+            } else if target != nxt && self.to_loop_end(target) {
+                out.push(format!("{pad}continue"));
             } else if target != nxt {
                 self.add_goto(target);
                 out.push(format!("{pad}goto L{target}"));
