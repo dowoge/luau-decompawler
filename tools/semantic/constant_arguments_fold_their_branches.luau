@@ -4,19 +4,19 @@ local log = {}
 local function note(...)
 	log[#log + 1] = table.concat({ ... }, " ")
 end
-local function helper(flag)
-	note("start", tostring(flag))
-	if flag then
-		note("enabled")
+local function announce(loud)
+	note("begin", tostring(loud))
+	if loud then
+		note("shout")
 	end
-	note("end")
+	note("done")
 end
-local function leading(flag)
-	if flag then
-		note("first")
+local function greet(polite)
+	if polite then
+		note("bow")
 	end
-	note("then", tostring(flag))
-	note("last")
+	note("hello", tostring(polite))
+	note("wave")
 end
 local function quiet(flag)
 	if flag then
@@ -41,13 +41,13 @@ local function guard(on, n)
 	return n + 1
 end
 local function run(x)
-	helper(false)
-	helper(true)
-	helper(x)
-	leading(false)
-	leading(true)
-	leading(nil)
-	leading(1)
+	announce(false)
+	announce(true)
+	announce(x)
+	greet(false)
+	greet(true)
+	greet(nil)
+	greet(1)
 	quiet(true)
 	quiet(false)
 	quiet(x)
