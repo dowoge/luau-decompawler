@@ -3944,8 +3944,8 @@ impl<'c, 'm> Dec<'c, 'm> {
                 if o == op::NEWTABLE && fills.0 && !fills.1 {
                     // `local t = {}` then `t.k = v`: a constructor with keys
                     // would have compiled to DUPTABLE, so these are statements
-                    self.flush_impure(out, ind, a);
-                    self.assign(out, ind, a, &ex("{}", 100));
+                    // (put: what waited in the register, never read, goes first)
+                    self.put(out, ind, a, ex("{}", 100), false);
                 } else if self.read_once(pc, a) || self.table_filled_then_read(pc, a) {
                     self.ppop(a);
                     self.pset(a, table);
@@ -3958,9 +3958,8 @@ impl<'c, 'm> Dec<'c, 'm> {
                 } else {
                     // a table used more than once: its template's constant
                     // fields still belong in the constructor
-                    self.flush_impure(out, ind, a);
                     let t = table.borrow().render();
-                    self.assign(out, ind, a, &ex(t, 100));
+                    self.put(out, ind, a, ex(t, 100), false);
                 }
             }
             op::SETLIST => {
