@@ -2,11 +2,14 @@
 //! the hand-written cases behave, random programs behave. With $LUAU_RUN
 //! pointing at a folder of script dumps (<place>/<id>.wire) it also decompiles
 //! those into out/ and reports jump flags, dispatchers, undeclared names and how
-//! many functions recompile to the original.
+//! many functions recompile to the original. tools/semantic and the folders in
+//! $LUAU_SUITES must behave too, but for what their known.txt lists.
 //!
 //! Failing random programs are kept in failed/.
 
-use crate::cases;
+use std::path::Path;
+
+use crate::cases::{self, Print, Suite};
 use crate::difftest::{self, Options};
 use crate::edits::{compare_place, dump_places};
 use crate::luau::{command, percent, repo, text_of, Args, Tools};
@@ -96,11 +99,64 @@ fn real_scripts(tools: &Tools, dumps: &str) -> bool {
     good && found.names == 0
 }
 
+/// A folder of programs that print what they do, each about one way a
+/// decompiler can change behaviour: tools/semantic, and any in $LUAU_SUITES
+/// (separated by `;`). Those known not to behave yet are listed in the folder's
+/// known.txt, with why; any other failing, or a listed one now behaving, fails
+/// the check, so the list stays true.
+fn suite(tools: &Tools, dir: &Path) -> bool {
+    let has_programs = std::fs::read_dir(dir)
+        .map(|d| d.flatten().any(|e| e.path().extension().is_some_and(|x| x == "luau")))
+        .unwrap_or(false);
+    if !has_programs {
+        return true;
+    }
+    let suite = Suite {
+        dir: dir.to_string_lossy().into_owned(),
+        binary: tools.decompiler.clone(),
+        show: None,
+        print: Print::Nothing,
+        errors_are_output: true,
+    };
+    let found = cases::run_suite(&suite);
+    let listed = std::fs::read_to_string(dir.join("known.txt")).unwrap_or_default();
+    let known: Vec<&str> = listed
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| l.split_whitespace().next())
+        .collect();
+    let bad: Vec<&(String, &str)> = found.misbehaving.iter().filter(|m| !known.contains(&m.0.as_str())).collect();
+    let fixed: Vec<&&str> = known.iter().filter(|k| !found.misbehaving.iter().any(|m| m.0 == **k)).collect();
+    let behave = found.total - found.misbehaving.len();
+    println!("{}: {behave} of {} behave, {} known not to yet", dir.display(), found.total, known.len());
+    for (name, why) in &bad {
+        println!("  {name}: {why}");
+    }
+    for name in &fixed {
+        println!("  {name} behaves now: take it off its known.txt");
+    }
+    bad.is_empty() && fixed.is_empty()
+}
+
+fn suites(tools: &Tools) -> bool {
+    let mut dirs = vec![repo().join("tools").join("semantic")];
+    if let Ok(more) = std::env::var("LUAU_SUITES") {
+        dirs.extend(more.split(';').filter(|d| !d.is_empty()).map(std::path::PathBuf::from));
+    }
+    let mut ok = true;
+    for dir in &dirs {
+        ok = suite(tools, dir) && ok;
+    }
+    ok
+}
+
 pub fn main(args: &Args) -> u8 {
     let tools = Tools::find();
     let mut ok = build();
     if ok {
         ok = cases::run(&Args(Vec::new()), false) == 0;
+        ok = suites(&tools) && ok;
     }
     let seeds: &[(u64, usize, u64)] = if args.flag("--full") { &FULL } else { &QUICK };
     ok = random_sets(&tools, seeds) && ok;

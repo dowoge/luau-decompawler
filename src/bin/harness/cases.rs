@@ -4,6 +4,10 @@
 //!   shape   each function recompiles to the same opcode sequence
 //!   exact   also the same target registers: the variables came back as written
 //! Behaving differently is a bug and fails; differing in form does not.
+//!
+//! The same goes for any folder of programs: `check` runs tools/semantic too,
+//! where a program may end in an error, as long as its decompiled form ends in
+//! the same one.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -22,8 +26,31 @@ pub fn main(args: &Args) -> u8 {
     u8::from(run(args, true) > 0)
 }
 
-fn print_row(loud: bool, always: bool, line: String) {
-    if loud || always {
+#[derive(Clone, Copy, PartialEq)]
+pub enum Print {
+    All,
+    Bad,
+    Nothing,
+}
+
+/// A folder of programs to put through the decompiler.
+pub struct Suite<'a> {
+    pub dir: String,
+    pub binary: String,
+    pub show: Option<&'a str>,
+    pub print: Print,
+    /// A program may end in an error, which its decompiled form must repeat.
+    pub errors_are_output: bool,
+}
+
+/// What a suite found: the programs that do not behave the same, and why.
+pub struct Found {
+    pub misbehaving: Vec<(String, &'static str)>,
+    pub total: usize,
+}
+
+fn print_row(print: Print, bad: bool, line: String) {
+    if print == Print::All || (bad && print == Print::Bad) {
         println!("{line}");
     }
 }
@@ -34,12 +61,21 @@ fn base(path: &str) -> String {
 
 /// How many cases misbehave. With `loud` off, only the rows that matter come out.
 pub fn run(args: &Args, loud: bool) -> usize {
-    let tools = Tools::find();
     let default = repo().join("tools").join("luau_cases").to_string_lossy().into_owned();
-    let cases = args.opt("--dir").map_or(default, String::from);
-    let show = args.opt("--show");
-    let binary = args.opt("--bin").map_or(tools.decompiler.clone(), String::from);
-    let mut srcs: Vec<String> = std::fs::read_dir(&cases)
+    let suite = Suite {
+        dir: args.opt("--dir").map_or(default, String::from),
+        binary: args.opt("--bin").map_or_else(|| Tools::find().decompiler, String::from),
+        show: args.opt("--show"),
+        print: if loud { Print::All } else { Print::Bad },
+        errors_are_output: args.flag("--errors"),
+    };
+    run_suite(&suite).misbehaving.len()
+}
+
+pub fn run_suite(suite: &Suite) -> Found {
+    let tools = Tools::find();
+    let (cases, show, binary, print) = (&suite.dir, suite.show, &suite.binary, suite.print);
+    let mut srcs: Vec<String> = std::fs::read_dir(cases)
         .expect("the cases folder")
         .flatten()
         .map(|e| e.path())
@@ -59,7 +95,7 @@ pub fn run(args: &Args, loud: bool) -> usize {
             crashed.insert(s.clone(), "the case itself does not compile".to_string());
         }
     }
-    for (i, text) in compiled.iter().zip(decompile_many(&binary, &bytecode, 300)) {
+    for (i, text) in compiled.iter().zip(decompile_many(binary, &bytecode, 300)) {
         let s = &srcs[*i];
         match text {
             Ok(text) => {
@@ -80,22 +116,25 @@ pub fn run(args: &Args, loud: bool) -> usize {
     let all: Vec<Item> = sources.iter().chain(&dec_items).cloned().collect();
     let out = tools.outputs(&all, 60, USUAL_BUDGET);
     let mut totals = [0usize; 3];
-    let mut bad_run = 0;
-    print_row(loud, false, format!("{:<24} {:<4} {:>5} {:>6} {:>6}", "case", "run", "funcs", "shape", "exact"));
+    let mut misbehaving: Vec<(String, &'static str)> = Vec::new();
+    print_row(print, false, format!("{:<24} {:<4} {:>5} {:>6} {:>6}", "case", "run", "funcs", "shape", "exact"));
     for s in &srcs {
         let name = base(s);
         let Some(d) = decs.get(s) else {
-            print_row(loud, true, format!("{name:<24} crash: {}", crashed[s]));
-            bad_run += 1;
+            print_row(print, true, format!("{name:<24} crash: {}", crashed[s]));
+            misbehaving.push((name, "decompiler error"));
             continue;
         };
         let Some(recompiled) = back.get(&d.name) else {
-            print_row(loud, true, format!("{name:<24} decompiled text does not compile"));
-            bad_run += 1;
+            print_row(print, true, format!("{name:<24} decompiled text does not compile"));
+            misbehaving.push((name, "decompiled text does not compile"));
             continue;
         };
-        let same = out.get(s) == out.get(&d.name) && out.get(s).is_some_and(|x| x.ends_with("=== ok"));
-        bad_run += usize::from(!same);
+        let ran = out.get(s).is_some_and(|x| suite.errors_are_output || x.ends_with("=== ok"));
+        let same = ran && out.get(s) == out.get(&d.name);
+        if !same {
+            misbehaving.push((name.clone(), if ran { "output differs" } else { "the case itself fails" }));
+        }
         let (a, b) = (module(bc[s]), module(recompiled));
         let paired = pair(&a, &b);
         let (mut n, mut shp, mut ex) = (0, 0, 0);
@@ -124,7 +163,7 @@ pub fn run(args: &Args, loud: bool) -> usize {
         totals[1] += shp;
         totals[2] += ex;
         let verdict = if same { "ok" } else { "BAD" };
-        print_row(loud, !same, format!("{name:<24} {verdict:<4} {n:>5} {shp:>6} {ex:>6}"));
+        print_row(print, !same, format!("{name:<24} {verdict:<4} {n:>5} {shp:>6} {ex:>6}"));
         if show.is_some_and(|w| name.contains(w)) {
             if !same {
                 let shown = |p: &String| out.get(p).map_or("None", String::as_str).to_string();
@@ -135,14 +174,15 @@ pub fn run(args: &Args, loud: bool) -> usize {
     }
     let [n, shp, ex] = totals;
     let line = format!(
-        "{:<24} {:<4} {n:>5} {shp:>6} {ex:>6}   shape {}, exact {}, {bad_run} misbehave",
+        "{:<24} {:<4} {n:>5} {shp:>6} {ex:>6}   shape {}, exact {}, {} misbehave",
         "total",
         "",
         percent(shp, n),
-        percent(ex, n)
+        percent(ex, n),
+        misbehaving.len()
     );
-    print_row(loud, true, line);
-    bad_run
+    print_row(print, true, line);
+    Found { misbehaving, total: srcs.len() }
 }
 
 fn print_rows(rows: &[Row], text: &str) {

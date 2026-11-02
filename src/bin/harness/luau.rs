@@ -272,8 +272,27 @@ impl Tools {
     }
 }
 
+/// Where a value lives differs between any two runs: `table: 0x...` and its
+/// kind all read `table: 0x?`.
+fn mask_addresses(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(": 0x") {
+        let kind = ["table", "function", "userdata", "thread", "buffer"].iter().any(|k| rest[..at].ends_with(k));
+        out.push_str(&rest[..at + 4]);
+        rest = &rest[at + 4..];
+        if kind {
+            out.push('?');
+            rest = &rest[rest.bytes().take_while(u8::is_ascii_hexdigit).count()..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// `=== NAME`, what it printed, then `=== ok` or `=== error: MESSAGE`.
 pub fn parse_outputs(text: &str) -> HashMap<String, String> {
+    let text = mask_addresses(text);
     let mut res = HashMap::new();
     let mut cur: Option<String> = None;
     let mut buf: Vec<&str> = Vec::new();

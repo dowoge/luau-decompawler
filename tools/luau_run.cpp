@@ -96,6 +96,15 @@ static std::string run_file(Record& file, bool named, long budget, lua_CompileOp
     luaL_openlibs(L);
     lua_pushcfunction(L, lprint, "print");
     lua_setglobal(L, "print");
+    // Roblox's Vector3.new, which decompiled code spells vector constants
+    // with: here a plain vector.create
+    lua_getglobal(L, "vector");
+    lua_getfield(L, -1, "create");
+    lua_createtable(L, 0, 1);
+    lua_insert(L, -2);
+    lua_setfield(L, -2, "new");
+    lua_setglobal(L, "Vector3");
+    lua_pop(L, 1);
     luaL_sandbox(L);
     luaL_sandboxthread(L);
     lua_callbacks(L)->interrupt = interrupt;
