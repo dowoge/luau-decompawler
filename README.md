@@ -10,6 +10,7 @@ cargo build --release
 
 target/release/luau_decompile script.wire
 target/release/luau_decompile --upstream script.luauc
+target/release/luau_decompile --key 203 saved.lua
 target/release/luau_decompile --dir dumps --out decompiled
 cargo harness check --full
 ```
@@ -178,7 +179,7 @@ local Class = {}
 Class.__index = Class
 
 function Class.new()
-    return setmetatable({items = {}, size = 0}, Class)
+    return setmetatable({ items = {}, size = 0 }, Class)
 end
 
 function Class:push(item)
