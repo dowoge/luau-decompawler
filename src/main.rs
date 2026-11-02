@@ -30,6 +30,7 @@ mod decomp;
 mod expr;
 mod hash;
 mod inline;
+mod pack;
 mod passes;
 
 use std::fs;
@@ -41,6 +42,7 @@ use std::sync::Mutex;
 
 use bytecode::{parse, Module};
 use hash::{HashMap, HashSet};
+use pack::Packed;
 use passes::{CallMap, Extra, Tally};
 
 #[global_allocator]
@@ -67,14 +69,6 @@ fn decompile_core(m: &Module, path: Option<&str>, noflat: bool) -> Vec<String> {
     let lines = passes::uninline(lines);
     let lines = passes::module_table(lines, path);
     passes::tidy_before_names(lines)
-}
-
-/// A job's text (or error), copied out of the job's memory.
-fn keep_text(r: Result<String, String>) -> Result<String, String> {
-    match r {
-        Ok(s) => Ok(s.as_str().to_owned()),
-        Err(e) => Err(e.as_str().to_owned()),
-    }
 }
 
 /// The naming rounds that can use other scripts' call sites.
@@ -257,13 +251,18 @@ fn run_dir(src: &Path, dst: &Path, upstream: bool, noflat: bool) -> i32 {
     // a script's bytecode in memory costs some forty times as much while it is
     // decompiled: a few megabytes of it at once keep all cores busy
     let budget = std::env::var("LUAU_BUDGET").ok().and_then(|v| v.parse().ok()).unwrap_or(2 << 20);
-    let core: Vec<Result<String, String>> = par_map_sized(&sizes, budget, |i| {
+    // each kept packed till the last stage: the place's text is tens of
+    // megabytes, a fraction of that packed
+    let core: Vec<Result<Packed, String>> = par_map_sized(&sizes, budget, |i| {
         let run = || -> Result<String, String> {
             let data = fs::read(src.join(&files[i])).map_err(|e| e.to_string())?;
             let m = parse(&data, !upstream)?;
             Ok(decompile_core(&m, names.get(sids[i]).map(String::as_str), noflat).join("\n"))
         };
-        alloc::job(|| panic::catch_unwind(AssertUnwindSafe(run)).unwrap_or_else(|e| Err(panic_text(e))), keep_text)
+        alloc::job(
+            || panic::catch_unwind(AssertUnwindSafe(run)).unwrap_or_else(|e| Err(panic_text(e))).map(|t| Packed::new(&t)),
+            |r| r.map(|p| p.copy()).map_err(|e| e.as_str().to_owned()),
+        )
     });
     let lines_of = |text: &str| -> Vec<String> { text.split('\n').map(String::from).collect() };
 
@@ -277,7 +276,7 @@ fn run_dir(src: &Path, dst: &Path, upstream: bool, noflat: bool) -> i32 {
     let defined: Vec<Vec<String>> = par_map(core.len(), |i| {
         alloc::job(
             || match &core[i] {
-                Ok(text) => passes::defined_keys(&lines_of(text)),
+                Ok(p) => passes::defined_keys(&lines_of(&p.text())),
                 Err(_) => Vec::new(),
             },
             |keys| keys.iter().map(|k| k.as_str().to_owned()).collect(),
@@ -295,8 +294,11 @@ fn run_dir(src: &Path, dst: &Path, upstream: bool, noflat: bool) -> i32 {
         passes::tally(&calls)
     };
     let draft: Vec<Option<Tally>> = par_map(core.len(), |i| {
-        let text = core[i].as_ref().ok()?;
-        alloc::job(|| panic::catch_unwind(AssertUnwindSafe(|| tally_of(text, &alone))).ok(), |d| d.map(|calls| calls.clone()))
+        let packed = core[i].as_ref().ok()?;
+        alloc::job(
+            || panic::catch_unwind(AssertUnwindSafe(|| tally_of(&packed.text(), &alone))).ok(),
+            |d| d.map(|calls| calls.clone()),
+        )
     });
     if timing {
         eprintln!("draft {:?}", t0.elapsed());
@@ -342,8 +344,8 @@ fn run_dir(src: &Path, dst: &Path, upstream: bool, noflat: bool) -> i32 {
                     seen.add(key, &sites[*j][key]);
                 }
             }
-            let Ok(text) = &core[i] else { return Tally::default() };
-            panic::catch_unwind(AssertUnwindSafe(|| tally_of(text, &seen))).unwrap_or_default()
+            let Ok(packed) = &core[i] else { return Tally::default() };
+            panic::catch_unwind(AssertUnwindSafe(|| tally_of(&packed.text(), &seen))).unwrap_or_default()
         }, |calls| calls.clone()));
         changed.clear();
         for (i, new) in todo.iter().zip(fresh) {
@@ -366,8 +368,11 @@ fn run_dir(src: &Path, dst: &Path, upstream: bool, noflat: bool) -> i32 {
 
     // a script none of whose functions is called elsewhere is named as it was
     // alone: what the place knows is about functions it does not define
+    // each text is read once more, here, and goes as soon as it is written
+    let core: Vec<Mutex<Option<Result<Packed, String>>>> = core.into_iter().map(|c| Mutex::new(Some(c))).collect();
     let finish = |i: usize| -> Result<String, String> {
-        let text = core[i].as_ref().map_err(Clone::clone)?;
+        let taken = core[i].lock().unwrap().take().ok_or_else(|| "named twice".to_string())?;
+        let text = &taken.as_ref().map_err(Clone::clone)?.text();
         let seen = if defined[i].iter().any(|k| extra.knows(k)) { &extra } else { &alone };
         panic::catch_unwind(AssertUnwindSafe(|| to_text(&name_round(lines_of(text), seen)))).map_err(panic_text)
     };
