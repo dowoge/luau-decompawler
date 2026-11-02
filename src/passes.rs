@@ -4328,6 +4328,9 @@ fn call_kind(header: &str) -> &'static str {
 /// What a call-site argument suggests calling the parameter.
 fn vote_name(arg: &str) -> Option<String> {
     let a = strip(arg);
+    if pass_keyword(a) || matches!(a, "true" | "false" | "nil") {
+        return None; // a literal says nothing of the parameter's name
+    }
     if is_token(a) && !is_generated(a) {
         Some(a.to_string())
     } else {
