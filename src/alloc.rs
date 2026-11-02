@@ -22,7 +22,9 @@ const STEP: usize = 16;
 /// Larger limits cost memory quickly and gain little.
 const LARGEST: usize = 1024;
 const CLASSES: usize = LARGEST / STEP;
-const CHUNK: usize = 1 << 20;
+/// Every worker keeps one between jobs, which is all most jobs need; a big
+/// one takes more.
+const CHUNK: usize = 256 << 10;
 
 struct Lists {
     free: [Cell<*mut u8>; CLASSES],
@@ -45,7 +47,7 @@ struct Arena {
     high: Cell<usize>,
 }
 
-const ARENA_CHUNKS: usize = 64;
+const ARENA_CHUNKS: usize = 256;
 
 // `const` and nothing to drop: native thread-local storage, with no allocation
 // or registration behind it, which an allocator could not use.
