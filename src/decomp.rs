@@ -360,6 +360,137 @@ fn tail_string_arg<'t>(text: &'t str, close: &str) -> Option<(&'t str, &'t str)>
     Some((before, name))
 }
 
+/// Names a value suggests for itself, best first: its function's name, the
+/// field it was read from, the service, module or child it is, what it is
+/// an element of, what a well-known call returns.
+fn name_bases(text: &str, hint: Option<&str>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    out.extend(hint.map(String::from));
+    if let Some(t) = field_tail(text) {
+        out.push(t.to_string());
+    }
+    let lower = |s: &str| -> String {
+        let mut c = s.chars();
+        match c.next() {
+            Some(_) if s.chars().all(|x| x.is_ascii_uppercase() || x == '_' || x.is_ascii_digit()) => s.to_ascii_lowercase(),
+            Some(f) => f.to_ascii_lowercase().to_string() + c.as_str(),
+            None => String::new(),
+        }
+    };
+    if let Some((before, g)) = tail_string_arg(text, "\")") {
+        if before.ends_with(":GetService") {
+            out.push(g.to_string());
+        }
+        for f in [".WaitForChild", ":WaitForChild", ".FindFirstChild", ":FindFirstChild"] {
+            if before.ends_with(f) {
+                out.push(g.to_string());
+            }
+        }
+        for f in [
+            ":FindFirstChildOfClass", ":FindFirstChildWhichIsA", ":FindFirstAncestorOfClass",
+            ":FindFirstAncestorWhichIsA", ":FindFirstAncestor",
+        ] {
+            if before.ends_with(f) {
+                out.push(lower(g));
+            }
+        }
+        if before == "Instance.new" || before.ends_with(":GetAttribute") {
+            out.push(lower(g));
+        }
+    }
+    if text.starts_with("require(") && !text.contains('\n') {
+        if let Some((before, g)) = tail_string_arg(text, "\"))") {
+            for f in [".WaitForChild", ":WaitForChild", ".FindFirstChild", ":FindFirstChild"] {
+                if before.len() >= 8 + f.len() && before.ends_with(f) {
+                    out.push(g.to_string());
+                }
+            }
+        }
+        if let Some(s) = text.strip_suffix(')') {
+            if let Some(dot) = s.rfind('.') {
+                if dot >= 8 {
+                    out.push(s[dot + 1..].to_string());
+                }
+            }
+        }
+    }
+    // `x and x.Value`: the field
+    if let Some((a, b)) = text.split_once(" and ") {
+        if let Some(f) = b.strip_prefix(a).and_then(|r| r.strip_prefix('.')).filter(|f| is_ident(f)) {
+            out.push(lower(f));
+        }
+    }
+    // an element of something plural: `holders[k]`, `self.items[i]`
+    if text.ends_with(']') && !text.contains('\n') {
+        if let Some(open) = text.find('[') {
+            if let Some(n) = passes::element_noun(&text[..open]) {
+                out.push(n);
+            }
+        }
+    }
+    // what well-known calls give
+    for (tail, name) in [
+        (":GetChildren()", "children"),
+        (":GetDescendants()", "descendants"),
+        (":GetPlayers()", "players"),
+        (":GetTouchingParts()", "parts"),
+        (":GetAttributes()", "attributes"),
+        (":GetMouse()", "mouse"),
+        (":GetPivot()", "pivot"),
+        (":GetFullName()", "fullName"),
+        (":Clone()", "clone"),
+        (":GetTags()", "tags"),
+    ] {
+        if text.ends_with(tail) && !text.contains('\n') {
+            out.push(name.to_string());
+        }
+    }
+    for (head, name) in [
+        (":GetPlayerFromCharacter(", "player"),
+        (":LoadAnimation(", "track"),
+        (":Raycast(", "result"),
+        (":FindFirstChild(", "child"),
+        (":WaitForChild(", "child"),
+        (":GetPropertyChangedSignal(", "signal"),
+        (":GetAttributeChangedSignal(", "signal"),
+    ] {
+        if let Some(at) = text.find(head) {
+            if text.ends_with(')') && !text[..at].contains('(') {
+                out.push(name.to_string());
+            }
+        }
+    }
+    for (head, name) in [
+        ("table.create(", "list"),
+        ("table.clone(", "copy"),
+        ("table.concat(", "text"),
+        ("string.format(", "text"),
+        ("string.split(", "parts"),
+        ("buffer.create(", "buf"),
+        ("os.clock(", "now"),
+        ("tick(", "now"),
+        ("tostring(", "text"),
+        ("setmetatable(", "object"),
+        ("TweenInfo.new(", "tweenInfo"),
+        ("Color3.fromRGB(", "color"),
+        ("Color3.new(", "color"),
+        ("UDim2.new(", "size"),
+        ("UDim2.fromOffset(", "size"),
+        ("UDim2.fromScale(", "size"),
+        ("CFrame.new(", "cframe"),
+        ("Vector3.new(", "position"),
+        ("Vector2.new(", "point"),
+        ("NumberSequence.new(", "sequence"),
+        ("RaycastParams.new(", "params"),
+        ("OverlapParams.new(", "params"),
+    ] {
+        if text.starts_with(head) && text.ends_with(')') && !text.contains('\n') {
+            out.push(name.to_string());
+        }
+    }
+    out
+}
+
 fn field_tail(text: &str) -> Option<&str> {
     let b = text.as_bytes();
     if b.is_empty() || !(b[0].is_ascii_alphabetic() || b[0] == b'_') {
@@ -911,50 +1042,27 @@ impl<'c, 'm> Dec<'c, 'm> {
     }
 
     fn nice_name(&self, text: &str, hint: Option<&str>) -> Option<String> {
-        if let Some(h) = hint {
-            if is_ident(h) && !is_keyword(h) && !self.is_used(h) {
-                return Some(h.to_string());
-            }
-        }
-        if let Some(t) = field_tail(text) {
-            if !is_keyword(t) && !self.is_used(t) && !t.as_bytes()[0].is_ascii_lowercase() {
-                return Some(t.to_string());
-            }
-        }
-        let ok = |g: &str| is_ident(g) && !is_keyword(g) && !self.is_used(g);
-        // :GetService("X")$
-        if let Some((before, g)) = tail_string_arg(text, "\")") {
-            if before.ends_with(":GetService") && ok(g) {
-                return Some(g.to_string());
-            }
-        }
-        if text.starts_with("require(") && !text.contains('\n') {
-            // ^require\(.*[.:](?:WaitForChild|FindFirstChild)\("x"\)\)$
-            if let Some((before, g)) = tail_string_arg(text, "\"))") {
-                for f in [".WaitForChild", ":WaitForChild", ".FindFirstChild", ":FindFirstChild"] {
-                    if before.len() >= 8 + f.len() && before.ends_with(f) && ok(g) {
-                        return Some(g.to_string());
-                    }
-                }
-            }
-            // ^require\(.*\.x\)$
-            if let Some(s) = text.strip_suffix(')') {
-                if let Some(dot) = s.rfind('.') {
-                    if dot >= 8 && ok(&s[dot + 1..]) {
-                        return Some(s[dot + 1..].to_string());
-                    }
-                }
-            }
-        }
-        // [.:](?:WaitForChild|FindFirstChild)\("x"\)$
-        if let Some((before, g)) = tail_string_arg(text, "\")") {
-            for f in [".WaitForChild", ":WaitForChild", ".FindFirstChild", ":FindFirstChild"] {
-                if before.ends_with(f) && ok(g) {
-                    return Some(g.to_string());
-                }
+        // what the value says it is, best first; a name taken gets a number
+        for base in name_bases(text, hint) {
+            if let Some(n) = self.free_name(&base) {
+                return Some(n);
             }
         }
         None
+    }
+
+    /// `base`, or `base2` ... `base9` when that is taken.
+    fn free_name(&self, base: &str) -> Option<String> {
+        if !is_ident(base) || is_keyword(base) || is_generated_v(base, true) {
+            return None;
+        }
+        if !self.is_used(base) {
+            return Some(base.to_string());
+        }
+        if base.ends_with(|c: char| c.is_ascii_digit()) {
+            return None;
+        }
+        (2..=9).map(|n| format!("{base}{n}")).find(|c| !self.is_used(c))
     }
 
     fn assign(&mut self, out: &mut Vec<String>, ind: usize, r: usize, e: &E) {
@@ -4428,13 +4536,9 @@ impl<'c, 'm> Dec<'c, 'm> {
                             None => true,
                             Some(n) => is_generated_v(n, false),
                         };
-                        if is_ident(hint)
-                            && !is_keyword(hint)
-                            && !self.is_used(hint)
-                            && !self.declared[key as usize]
-                            && cur_ok
-                        {
-                            let h: Rc<str> = Rc::from(hint);
+                        // the name the definition will get, a number added if taken
+                        if let Some(n) = self.free_name(hint).filter(|_| !self.declared[key as usize] && cur_ok) {
+                            let h: Rc<str> = Rc::from(n.as_str());
                             self.set_name(key, h.clone());
                             self.add_used(&h);
                         }

@@ -4070,6 +4070,199 @@ pub fn defined_keys(lines: &[String]) -> Vec<String> {
 ///   * returned at the end of `GetFoo` -> foo
 ///   * used like a known Roblox type (`x.Character`, `x.UserId`) -> player
 /// Parameters take part too, and are named from their call sites first.
+/// What an event hands the function connected to it, by the event's name.
+const EVENT_PARAMS: &[(&str, &[&str])] = &[
+    ("PlayerAdded", &["player"]),
+    ("PlayerRemoving", &["player"]),
+    ("CharacterAdded", &["character"]),
+    ("CharacterRemoving", &["character"]),
+    ("CharacterAppearanceLoaded", &["character"]),
+    ("Touched", &["hit"]),
+    ("TouchEnded", &["hit"]),
+    ("ChildAdded", &["child"]),
+    ("ChildRemoved", &["child"]),
+    ("DescendantAdded", &["descendant"]),
+    ("DescendantRemoving", &["descendant"]),
+    ("InputBegan", &["input", "gameProcessedEvent"]),
+    ("InputEnded", &["input", "gameProcessedEvent"]),
+    ("InputChanged", &["input", "gameProcessedEvent"]),
+    ("Heartbeat", &["deltaTime"]),
+    ("RenderStepped", &["deltaTime"]),
+    ("PreRender", &["deltaTime"]),
+    ("PreSimulation", &["deltaTime"]),
+    ("PostSimulation", &["deltaTime"]),
+    ("Stepped", &["time", "deltaTime"]),
+    ("OnServerEvent", &["player"]),
+    ("HealthChanged", &["health"]),
+    ("FocusLost", &["enterPressed", "inputThatCausedFocusLoss"]),
+    ("Triggered", &["player"]),
+    ("TriggerEnded", &["player"]),
+    ("PromptTriggered", &["prompt", "player"]),
+    ("PromptShown", &["prompt"]),
+    ("PromptHidden", &["prompt"]),
+    ("Chatted", &["message"]),
+    ("AncestryChanged", &["child", "parent"]),
+    ("StateChanged", &["oldState", "newState"]),
+    ("Equipped", &["mouse"]),
+    ("KeyframeReached", &["keyframeName"]),
+    ("MarkerReached", &["parameter"]),
+    ("AttributeChanged", &["attribute"]),
+    ("MouseEnter", &["x", "y"]),
+    ("MouseLeave", &["x", "y"]),
+    ("MouseMoved", &["x", "y"]),
+];
+
+/// Names by convention and by role where the decompiler had none: what an
+/// event hands its handler, loop variables (`i`, `k`, `v`, or the singular of
+/// what is iterated), and `_` for a parameter nothing reads.
+pub fn role_names(lines: Vec<String>) -> Vec<String> {
+    let mut out = lines;
+    event_params(&mut out);
+    loop_names(&mut out);
+    unused_params(&mut out);
+    out
+}
+
+fn word_in(out: &[String], lo: usize, hi: usize, w: &str) -> bool {
+    (lo..=hi.min(out.len().saturating_sub(1))).any(|j| has_word(&out[j], w))
+}
+
+fn rename_in(out: &mut [String], lo: usize, hi: usize, old: &str, new: &str) {
+    for j in lo..=hi.min(out.len().saturating_sub(1)) {
+        replace_token(&mut out[j], old, new);
+    }
+}
+
+/// `x.Event:Connect(function(a, b)`: a and b named for what the event passes.
+fn event_params(out: &mut [String]) {
+    for i in 0..out.len() {
+        let Some(params) = func_open(&out[i]).map(split_params) else { continue };
+        let line = out[i].clone();
+        let Some(at) = line.rfind("function(") else { continue };
+        let head = &line[..at];
+        let event = [":Connect(", ":Once(", ":ConnectParallel("]
+            .iter()
+            .find_map(|c| head.strip_suffix(c))
+            .or_else(|| head.strip_suffix(" = ").filter(|h| h.ends_with("OnServerInvoke")))
+            .map(|h| h.rsplit(['.', ':', ' ', '(']).next().unwrap_or(""));
+        let Some(names) = event.and_then(|e| EVENT_PARAMS.iter().find(|(n, _)| *n == e).map(|(_, p)| *p)).or_else(|| {
+            head.strip_suffix(" = ").filter(|h| h.ends_with("OnServerInvoke")).map(|_| &["player"][..])
+        }) else {
+            continue;
+        };
+        let end = block_end(out, i);
+        for (k, p) in params.iter().enumerate() {
+            let Some(new) = names.get(k) else { break };
+            if is_generated(p) && !word_in(out, i, end, new) {
+                rename_in(out, i, end, p, new);
+            }
+        }
+    }
+}
+
+/// The singular of what a loop goes over, if that says: `players` (or
+/// `self.players`, `ipairs(players)`) to `player`, `x:GetChildren()` to `child`.
+pub(crate) fn element_noun(expr: &str) -> Option<String> {
+    let e = expr.trim();
+    let inner = e
+        .strip_prefix("ipairs(")
+        .or_else(|| e.strip_prefix("pairs("))
+        .and_then(|x| x.strip_suffix(')'))
+        .unwrap_or(e);
+    for (call, noun) in [
+        (":GetChildren()", "child"),
+        (":GetDescendants()", "descendant"),
+        (":GetPlayers()", "player"),
+        (":GetTouchingParts()", "part"),
+        (":GetTags()", "tag"),
+        (":GetPlayingAnimationTracks()", "track"),
+        (":GetAccessories()", "accessory"),
+    ] {
+        if inner.ends_with(call) {
+            return Some(noun.to_string());
+        }
+    }
+    let b = inner.as_bytes();
+    let mut k = b.len();
+    while k > 0 && is_word(b[k - 1]) {
+        k -= 1;
+    }
+    if k == b.len() || (k > 0 && b[k - 1] != b'.') {
+        return None;
+    }
+    let word = &inner[k..];
+    if is_generated(word) || word.len() < 4 {
+        return None;
+    }
+    let lower = if str_isupper(word) { word.to_ascii_lowercase() } else { lower_first(word) };
+    let one = if let Some(s) = lower.strip_suffix("children") {
+        format!("{s}child")
+    } else if let Some(s) = lower.strip_suffix("ies") {
+        format!("{s}y")
+    } else if let Some(s) = ["ches", "shes", "sses", "xes"].iter().find_map(|suf| lower.strip_suffix(suf).map(|s| (s, suf))) {
+        format!("{}{}", s.0, &s.1[..s.1.len() - 2])
+    } else if lower.ends_with("ss") || lower.ends_with("us") || lower.ends_with("is") {
+        return None;
+    } else {
+        lower.strip_suffix('s')?.to_string()
+    };
+    (one.len() >= 2 && is_token(&one) && !pass_keyword(&one)).then_some(one)
+}
+
+/// `for v4_1 = 1, n do` to `for i = 1, n do`; `for k, v in pairs(t) do`; the
+/// value of a loop over `players` is `player`. A name the loop already
+/// mentions is passed over.
+fn loop_names(out: &mut [String]) {
+    for i in 0..out.len() {
+        let s = strip(&out[i]).to_string();
+        let Some(head) = s.strip_prefix("for ").and_then(|r| r.strip_suffix(" do")) else { continue };
+        let (vars, expr) = match head.split_once(" in ") {
+            Some((v, e)) => (v.to_string(), Some(e.to_string())),
+            None => match head.split_once(" = ") {
+                Some((v, _)) => (v.to_string(), None),
+                None => continue,
+            },
+        };
+        let end = block_end(out, i);
+        let vars: Vec<String> = vars.split(',').map(|x| x.trim().to_string()).collect();
+        for (k, var) in vars.iter().enumerate() {
+            if !is_generated(var) {
+                continue;
+            }
+            let mut cands: Vec<String> = Vec::new();
+            match (&expr, k) {
+                (None, _) => cands.extend(["i", "j", "k", "n"].map(String::from)),
+                (Some(e), 0) if e.starts_with("ipairs(") => cands.extend(["i", "j", "index"].map(String::from)),
+                (Some(_), 0) => cands.extend(["k", "key"].map(String::from)),
+                (Some(e), 1) => {
+                    cands.extend(element_noun(e));
+                    cands.extend(["v", "value"].map(String::from));
+                }
+                _ => continue,
+            }
+            if let Some(new) = cands.into_iter().find(|c| !word_in(out, i, end, c)) {
+                rename_in(out, i, end, var, &new);
+            }
+        }
+    }
+}
+
+/// A parameter nothing in its function reads is `_`.
+fn unused_params(out: &mut [String]) {
+    for i in 0..out.len() {
+        let Some(params) = func_open(&out[i]).map(split_params) else { continue };
+        if !params.iter().any(|p| is_generated(p)) {
+            continue;
+        }
+        let end = block_end(out, i);
+        for p in &params {
+            if is_generated(p) && !word_in(out, i + 1, end, p) {
+                replace_token(&mut out[i], p, "_");
+            }
+        }
+    }
+}
+
 pub fn more_names(lines: Vec<String>, extra: &Extra) -> Vec<String> {
     let mut out = lines;
     let mut index = WordIndex::new(&out);
@@ -4112,14 +4305,12 @@ fn name_pass(out: &mut Vec<String>, index: &mut WordIndex, extra: &Extra) -> boo
     collect_calls(out, &mut calls, &asked);
     let no_sites: Vec<Vec<String>> = Vec::new();
     for (fi, fend, params) in &funcs {
-        let fi = *fi;
-        if fi < 0 {
-            continue;
-        }
-        let fi = fi as usize;
-        let (lo, hi) = (fi + 1, (*fend).min(out.len()));
-        let depth = indent_of(&out[fi]) / 4 + 1;
-        let header = out[fi].clone();
+        // the main chunk (-1): its own locals carry no depth
+        let top = *fi < 0;
+        let fi = (*fi).max(0) as usize;
+        let (lo, hi) = if top { (0, out.len()) } else { (fi + 1, (*fend).min(out.len())) };
+        let depth = if top { 0 } else { indent_of(&out[fi]) / 4 + 1 };
+        let header = if top { String::new() } else { out[fi].clone() };
         let fname = function_name_of(&header).map(str::to_string);
         let scope_end = (hi + 1).min(out.len());
         let in_scope = |out: &[String], index: &WordIndex, word: &str| {
@@ -4209,7 +4400,10 @@ fn name_pass(out: &mut Vec<String>, index: &mut WordIndex, extra: &Extra) -> boo
                 }
             }
         }
-        let mut own: Vec<String> = own.into_iter().filter(|n| is_depth_name(n, depth)).collect();
+        let mut own: Vec<String> = own
+            .into_iter()
+            .filter(|n| if top { is_generated(n) && !n.contains('_') } else { is_depth_name(n, depth) })
+            .collect();
         own.sort();
         for name in &own {
             if cands.iter().any(|c| c.0 == *name) {

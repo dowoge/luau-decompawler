@@ -71,7 +71,7 @@ fn decompile_core(m: &Module, path: Option<&str>, noflat: bool) -> Vec<String> {
 
 /// The naming rounds that can use other scripts' call sites.
 fn name_round(lines: Vec<String>, extra: &Extra) -> Vec<String> {
-    passes::blank_lines(passes::more_names(lines, extra))
+    passes::blank_lines(passes::more_names(passes::role_names(lines), extra))
 }
 
 fn to_text(lines: &[String]) -> String {
