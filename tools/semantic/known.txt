@@ -19,5 +19,4 @@ table_shape_after_folded_stores.luau           a copied-in helper with constant 
 template_field_after_nil_with_collection.luau  a store folded into a template after a field with no value: a call-valued field moves behind the constant ones
 template_grown_by_later_method.luau            a later store folded into a template: the table is sized for more keys
 template_runtime_nil_then_new_fields.luau      stores folded into a template with a runtime nil: the table is sized for more keys
-unrolled_loop_literal_stays_one_closure.luau   an unrolled loop's function literal is printed per pass: closures equal in Luau no longer are
 zero_key_nil_slot_taken_over.luau              [0] = nil and a later [-0] store printed as one constructor: the slot is laid out otherwise

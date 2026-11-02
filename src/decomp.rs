@@ -219,6 +219,9 @@ struct Dec<'c, 'm> {
     once_cache: HashMap<(i32, u32, i32), bool>,
     hoisted: Vec<Rc<str>>,
     hoisted_set: HashSet<Rc<str>>,
+    /// Closure constants with no upvalues loaded at several places: one
+    /// closure in Luau, declared once at the top under this name.
+    shared_closures: HashMap<usize, Rc<str>>,
     exits: Vec<i32>,
     /// The [start, end) of the blocks being printed, innermost last.
     ranges: Vec<(i32, i32)>,
@@ -433,6 +436,7 @@ impl<'c, 'm> Dec<'c, 'm> {
             once_cache: HashMap::default(),
             hoisted: Vec::new(),
             hoisted_set: HashSet::default(),
+            shared_closures: HashMap::default(),
             exits: Vec::new(),
             ranges: Vec::new(),
             loops: Vec::new(),
@@ -1512,6 +1516,52 @@ impl<'c, 'm> Dec<'c, 'm> {
         names
     }
 
+    /// A function literal with no upvalues is one closure wherever it is
+    /// loaded (DUPCLOSURE reuses it): loaded at several places (a loop the
+    /// compiler unrolled, a helper copied in twice), printed at each it would
+    /// be several. Declared once at the top instead, under a name; the lines.
+    /// Not one calling a helper by name, which may be declared later.
+    fn share_closures(&mut self, base: usize) -> Vec<(Rc<str>, String)> {
+        let p = self.p;
+        let mut sites: HashMap<usize, (usize, usize)> = HashMap::default(); // constant -> (count, child)
+        for ins in &p.code {
+            if ins.op != op::DUPCLOSURE {
+                continue;
+            }
+            let k = kindex(p, ins.d() as i64);
+            if let K::Closure(c) = &p.k[k] {
+                if self.m.protos[*c].nups == 0 {
+                    sites.entry(k).or_insert((0, *c)).0 += 1;
+                }
+            }
+        }
+        let mut keys: Vec<usize> = sites.iter().filter(|(_, v)| v.0 > 1).map(|(k, _)| *k).collect();
+        keys.sort_unstable();
+        let mut lines = Vec::new();
+        for k in keys {
+            let child = sites[&k].1;
+            let text = self.closure_text(child, Vec::new(), base);
+            let helpers = self.ctx.helpers.borrow().iter().map(|h| h.1.clone()).collect::<Vec<_>>();
+            if helpers.iter().any(|h| !h.is_empty() && contains_ident(&text, h)) {
+                continue;
+            }
+            let hint = self.m.protos[child].name.clone().filter(|n| is_ident(n) && !is_keyword(n));
+            let stem = hint.unwrap_or_else(|| "shared".to_string());
+            let mut name = stem.clone();
+            let mut n = 1;
+            while self.is_used(&name) {
+                n += 1;
+                name = format!("{stem}{n}");
+            }
+            let name: Rc<str> = Rc::from(name.as_str());
+            self.add_used(&name);
+            let body = text.strip_prefix("function").unwrap_or(&text);
+            lines.push((name.clone(), format!("{}local function {name}{body}", sp(base))));
+            self.shared_closures.insert(k, name);
+        }
+        lines
+    }
+
     fn decompile_body(&mut self) -> (Vec<String>, Vec<String>) {
         let (params, body) = self.decompile_once();
         if !self.flat_regs {
@@ -1532,10 +1582,11 @@ impl<'c, 'm> Dec<'c, 'm> {
         if p.vararg != 0 {
             params.push("...".to_string());
         }
+        let base = (self.depth + 1) as usize * 4;
+        let shared = self.share_closures(base);
         // The first pass learns which jumps stay gotos. Few functions have any:
         // then what it printed is final, since labels are all a second pass adds.
         let start = self.mark();
-        let base = (self.depth + 1) as usize * 4;
         self.base_indent = base as i32;
         let mut out = Vec::new();
         self.reset_defs();
@@ -1561,6 +1612,12 @@ impl<'c, 'm> Dec<'c, 'm> {
             self.emit_range(&mut out, base, 0, p.sizecode, None, None);
         }
         self.fill_defs(&mut out);
+        // its loads may all have been inside copies put back as calls
+        for (name, line) in shared.into_iter().rev() {
+            if out.iter().any(|l| contains_ident(l, &name)) {
+                out.insert(0, line);
+            }
+        }
         // a parameter is declared already: `local x` would replace it with nil
         let mut seen: HashSet<Rc<str>> = self.param_names.iter().cloned().collect();
         let names: Vec<&str> =
@@ -4080,6 +4137,12 @@ impl<'c, 'm> Dec<'c, 'm> {
         let ins = self.insn(pc);
         let (a, d) = (ins.a(), ins.d());
         let (m, p) = (self.m, self.p);
+        if ins.op == op::DUPCLOSURE {
+            if let Some(name) = self.shared_closures.get(&kindex(p, d as i64)).cloned() {
+                self.put(out, ind, a, ex_pure(name.to_string()), true);
+                return pc + ins.n;
+            }
+        }
         let child = if ins.op == op::NEWCLOSURE {
             p.children[if d < 0 { (p.children.len() as i32 + d) as usize } else { d as usize }]
         } else {
