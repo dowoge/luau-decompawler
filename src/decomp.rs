@@ -5084,10 +5084,13 @@ impl<'c, 'm> Dec<'c, 'm> {
                 // made before, stored into it, was a local (Luau reads a
                 // local key or value where it is stored, after any call)
                 let read_by_stores = self.store_operands(pc, a);
+                // and Luau computes a constructor's items above it: one waiting
+                // below it that a store reads was a local
+                let tight = self.tight;
                 let early: Vec<usize> = self
                     .pending
                     .iter()
-                    .filter(|(q, e)| **q != a && e.borrow().snapshot && read_by_stores.has(**q))
+                    .filter(|(q, e)| **q != a && read_by_stores.has(**q) && (e.borrow().snapshot || (**q < a && !tight)))
                     .map(|(q, _)| *q)
                     .collect();
                 for q in early {
