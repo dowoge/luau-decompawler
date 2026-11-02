@@ -32,6 +32,7 @@
 mod alloc;
 mod analysis;
 mod bytecode;
+mod cache;
 mod decomp;
 mod expr;
 mod hash;
@@ -321,7 +322,7 @@ fn load(data: &[u8], opcodes: Opcodes) -> Result<Module, String> {
     bytecode::parse_as(text.as_deref().unwrap_or(data), opcodes)
 }
 
-fn run_dir(src: &Path, dst: &Path, opcodes: Opcodes, noflat: bool) -> i32 {
+fn run_dir(src: &Path, dst: &Path, opcodes: Opcodes, noflat: bool, cache_dir: Option<&Path>) -> i32 {
     let names = read_index(src);
     // dumps of a game's wire bytecode, or with a key other saved scripts
     let keyed = matches!(opcodes, Opcodes::Key(_));
@@ -413,9 +414,32 @@ fn run_dir(src: &Path, dst: &Path, opcodes: Opcodes, noflat: bool) -> i32 {
     // decompiled, and the biggest come first: a megabyte and a quarter of it
     // at once keeps all cores busy, and more only costs memory
     let budget = std::env::var("LUAU_BUDGET").ok().and_then(|v| v.parse().ok()).unwrap_or(5 << 18);
+    // `--cache`: an entry per script, named by its place and its bytes
+    let options = format!("{opcodes:?} noflat={noflat} info={}", decomp::INFO.load(std::sync::atomic::Ordering::Relaxed));
+    let cache = cache_dir.and_then(|d| cache::Cache::open(d, &options));
     let core: Vec<Core> = par_map_sized(&sizes, budget, |i| {
+        let data = match fs::read(src.join(&files[i])) {
+            Ok(d) => d,
+            Err(e) => return Core::done(write_out(i, &Err(e.to_string()))),
+        };
+        let place = format!("{}{}", targets[i].1, names.get(sids[i]).map_or("", String::as_str));
+        let key = cache.as_ref().map(|c| c.key(&place, &data));
+        if let Some(hit) = cache.as_ref().zip(key.as_ref()).and_then(|(c, k)| c.get(k)) {
+            return alloc::job(
+                || match hit.named {
+                    Some(named) => Core { calls: hit.calls, ..Core::done(write_out(i, &finished(i, lines_of(&named), hit.native))) },
+                    None => Core {
+                        defined: passes::defined_keys(&lines_of(&hit.core)),
+                        text: Some(Packed::new(&hit.core)),
+                        calls: hit.calls,
+                        done: None,
+                        native: hit.native,
+                    },
+                },
+                |c| c.copy(),
+            );
+        }
         let run = || -> Result<(String, bool), String> {
-            let data = fs::read(src.join(&files[i])).map_err(|e| e.to_string())?;
             let m = load(&data, opcodes)?;
             Ok((decompile_core(&m, names.get(sids[i]).map(String::as_str), noflat).join("\n"), is_native(&m)))
         };
@@ -428,7 +452,12 @@ fn run_dir(src: &Path, dst: &Path, opcodes: Opcodes, noflat: bool) -> i32 {
                 let lines = lines_of(&text);
                 let defined = passes::defined_keys(&lines);
                 let kept = (!defined.is_empty()).then(|| Packed::new(&text));
-                drop(text);
+                let store = |calls: &[u8], core: String, named: Option<String>| {
+                    if let (Some(c), Some(k)) = (&cache, &key) {
+                        c.put(k, &cache::Entry { native, core, calls: calls.to_vec(), named });
+                    }
+                };
+                let text = if cache.is_some() && kept.is_some() { text } else { String::new() };
                 // its call sites of every function: which the place defines is
                 // not known yet
                 let named = panic::catch_unwind(AssertUnwindSafe(|| {
@@ -438,11 +467,17 @@ fn run_dir(src: &Path, dst: &Path, opcodes: Opcodes, noflat: bool) -> i32 {
                     (named, passes::tally_bytes(&passes::tally(&calls)))
                 }));
                 match (named, kept) {
-                    (Ok((named, calls)), None) => Core { calls, ..Core::done(write_out(i, &finished(i, named, native))) },
-                    (Ok((_, calls)), Some(text)) => Core { text: Some(text), defined, calls, done: None, native },
+                    (Ok((named, calls)), None) => {
+                        store(&calls, String::new(), Some(named.join("\n")));
+                        Core { calls, ..Core::done(write_out(i, &finished(i, named, native))) }
+                    }
+                    (Ok((_, calls)), Some(packed)) => {
+                        store(&calls, text, None);
+                        Core { text: Some(packed), defined, calls, done: None, native }
+                    }
                     // named the same way again, it would fail the same way
                     (Err(e), None) => Core::done(write_out(i, &Err(panic_text(e)))),
-                    (Err(_), Some(text)) => Core { text: Some(text), defined, calls: Vec::new(), done: None, native },
+                    (Err(_), Some(packed)) => Core { text: Some(packed), defined, calls: Vec::new(), done: None, native },
                 }
             },
             |c| c.copy(),
@@ -632,6 +667,8 @@ fn usage() -> i32 {
          \x20              parameters, registers, instructions and flags\n\
          \x20 --strict     a script needing a flag for a jump, or blocks dispatched by\n\
          \x20              number, fails instead of being written\n\
+         \x20 --cache DIR  with --dir, keep each script's work in DIR: a run over\n\
+         \x20              scripts seen before decompiles only those that changed\n\
          Bytecode saved as text, a `--` line and then base64, is read as such."
     );
     2
@@ -660,13 +697,18 @@ fn run(args: Vec<String>) -> i32 {
     if let Some(i) = args.iter().position(|a| a == "--key") {
         args.drain(i..i + 2);
     }
+    let cache_dir = match args.iter().position(|a| a == "--cache") {
+        Some(i) if i + 1 < args.len() => Some(PathBuf::from(args.drain(i..i + 2).nth(1).unwrap())),
+        Some(_) => return usage(),
+        None => None,
+    };
     if args.len() >= 2 && args[0] == "--dir" {
         let src = PathBuf::from(&args[1]);
         let dst = match args.iter().position(|a| a == "--out") {
             Some(i) if i + 1 < args.len() => PathBuf::from(&args[i + 1]),
             _ => src.join("lua"),
         };
-        return run_dir(&src, &dst, opcodes, noflat);
+        return run_dir(&src, &dst, opcodes, noflat, cache_dir.as_deref());
     }
     if args.first().is_some_and(|a| a == "--stream") {
         return run_stream(opcodes, noflat);
