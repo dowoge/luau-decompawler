@@ -271,10 +271,30 @@ pub fn mk_logic(op: Logic, left: &E, right: &E) -> E {
 }
 
 /// A literal that is always true when tested: not nil, not false.
+/// A literal that is true however it is used: `true`, a number, a string. The
+/// whole text: `1 .. s == t` starts with a digit and may be false.
 pub fn truthy_constant(e: &E) -> bool {
     let x = e.borrow();
     let t = x.text.trim_start_matches('-');
-    x.text == "true" || t.starts_with('"') || t.starts_with(|c: char| c.is_ascii_digit())
+    let number = t.parse::<f64>().is_ok()
+        || t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).is_some_and(|h| !h.is_empty() && h.bytes().all(|c| c.is_ascii_hexdigit()));
+    let string = t.len() >= 2 && t.starts_with('"') && t.ends_with('"') && {
+        // one literal: no quote inside but escaped ones
+        let inner = &t.as_bytes()[1..t.len() - 1];
+        let mut i = 0;
+        let mut one = true;
+        while i < inner.len() {
+            if inner[i] == b'\\' {
+                i += 1;
+            } else if inner[i] == b'"' {
+                one = false;
+                break;
+            }
+            i += 1;
+        }
+        one && !(t.len() >= 3 && t.as_bytes()[t.len() - 2] == b'\\' && t.as_bytes()[t.len() - 3] != b'\\')
+    };
+    x.text == "true" || ((number || string) && !t.is_empty())
 }
 
 pub fn is_boolean(e: &E) -> bool {
@@ -682,6 +702,16 @@ mod tests {
         assert_eq!(negate(&ex("\"a == b\"", 100)).borrow().text, "not \"a == b\"");
         assert_eq!(negate(&ex("f(a) == b", 3)).borrow().text, "f(a) ~= b");
         assert_eq!(negate(&ex("(t.k ~= nil)", 0)).borrow().text, "(t.k == nil)");
+    }
+
+    #[test]
+    fn only_whole_literals_are_truthy_constants() {
+        for yes in ["true", "1", "-2.5", "0x1F", "\"a\"", "\"a \\\" b\"", "0"] {
+            assert!(truthy_constant(&ex(yes, 100)), "{yes}");
+        }
+        for no in ["1 .. s == t", "\"a\" == x", "\"a\" .. \"b\"", "1 + x", "false", "nil", "x"] {
+            assert!(!truthy_constant(&ex(no, 0)), "{no}");
+        }
     }
 
     #[test]
