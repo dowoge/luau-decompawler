@@ -86,6 +86,9 @@ fn name_round(lines: Vec<String>, extra: &Extra) -> Vec<String> {
 /// The finished lines: with `--info` the comments on each function (from m),
 /// and `--!native` first when the module was compiled so.
 fn finish_lines(mut lines: Vec<String>, m: Option<&Module>, native: bool) -> Vec<String> {
+    if RETURN_TYPES.load(std::sync::atomic::Ordering::Relaxed) {
+        lines = passes::return_types(lines);
+    }
     if let Some(m) = m.filter(|_| decomp::INFO.load(std::sync::atomic::Ordering::Relaxed)) {
         lines = decomp::info_comments(lines, m);
     }
@@ -102,6 +105,10 @@ fn is_native(m: &Module) -> bool {
 /// `--strict`: a script whose text needs a flag for a jump or the block
 /// dispatcher is reported as failed instead of written.
 static STRICT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `--return-types`: functions whose results are certainly of one kind are
+/// annotated with it. Off by default: sources seldom write them.
+static RETURN_TYPES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// A finished text as `--strict` takes it: the text, or why it is refused.
 fn strict_check(text: String) -> Result<String, String> {
@@ -667,6 +674,8 @@ fn usage() -> i32 {
          \x20              parameters, registers, instructions and flags\n\
          \x20 --strict     a script needing a flag for a jump, or blocks dispatched by\n\
          \x20              number, fails instead of being written\n\
+         \x20 --return-types  `: T` on functions whose results are certainly booleans,\n\
+         \x20              strings or numbers (`T?` with nil)\n\
          \x20 --cache DIR  with --dir, keep each script's work in DIR: a run over\n\
          \x20              scripts seen before decompiles only those that changed\n\
          Bytecode saved as text, a `--` line and then base64, is read as such."
@@ -680,6 +689,7 @@ fn run(args: Vec<String>) -> i32 {
     TABS.store(args.iter().any(|a| a == "--tabs"), std::sync::atomic::Ordering::Relaxed);
     decomp::INFO.store(args.iter().any(|a| a == "--info"), std::sync::atomic::Ordering::Relaxed);
     STRICT.store(args.iter().any(|a| a == "--strict"), std::sync::atomic::Ordering::Relaxed);
+    RETURN_TYPES.store(args.iter().any(|a| a == "--return-types"), std::sync::atomic::Ordering::Relaxed);
     let key = match args.iter().position(|a| a == "--key") {
         Some(i) => match args.get(i + 1).and_then(|v| v.parse::<u8>().ok()) {
             Some(k) => Some(k),
@@ -692,7 +702,7 @@ fn run(args: Vec<String>) -> i32 {
         None if upstream => Opcodes::Stock,
         None => Opcodes::Wire,
     };
-    let flags = ["--upstream", "--tabs", "--info", "--strict"];
+    let flags = ["--upstream", "--tabs", "--info", "--strict", "--return-types"];
     let mut args: Vec<String> = args.into_iter().filter(|a| !flags.contains(&a.as_str())).collect();
     if let Some(i) = args.iter().position(|a| a == "--key") {
         args.drain(i..i + 2);

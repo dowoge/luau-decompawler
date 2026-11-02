@@ -4738,6 +4738,173 @@ fn passed_name(name: &str, out: &[String], at: &[u32], signatures: &HashMap<Stri
     None
 }
 
+/// `--return-types`: `: T` after a named function's parameters when every
+/// value it returns is certainly a T (comparisons, `not` and `and`/`or` of
+/// them are booleans; literals are their own kind), `T?` when some return
+/// nil, and its body ends in a return. Annotations compile to nothing: the
+/// bytecode stays the same.
+pub fn return_types(mut lines: Vec<String>) -> Vec<String> {
+    for i in 0..lines.len() {
+        let t = strip(&lines[i]);
+        if !((t.starts_with("function ") || t.starts_with("local function ")) && t.ends_with(')')) {
+            continue;
+        }
+        let ind = indent_of(&lines[i]);
+        let Some(end) = (i + 1..lines.len()).find(|&k| !is_blank(&lines[k]) && indent_of(&lines[k]) <= ind) else { continue };
+        if indent_of(&lines[end]) != ind || strip(&lines[end]) != "end" {
+            continue;
+        }
+        // no way to fall off its end
+        let Some(last) = (i + 1..end).rev().find(|&k| !is_blank(&lines[k])) else { continue };
+        if indent_of(&lines[last]) <= ind || !strip(&lines[last]).starts_with("return ") || own_function(&lines, last, i) != Some(i) {
+            continue;
+        }
+        let mut kind: Option<&str> = None;
+        let mut nil = false;
+        let mut known = true;
+        for k in i + 1..end {
+            let s = strip(&lines[k]);
+            let value = if let Some(v) = s.strip_prefix("return ") {
+                v
+            } else if s == "return" || s.contains(" then return end") {
+                if own_function(&lines, k, i) == Some(i) {
+                    known = false; // no value at all
+                }
+                continue;
+            } else if let Some(p) = s.find(" then return ") {
+                match s[p + 13..].strip_suffix(" end") {
+                    Some(v) => v,
+                    None => continue,
+                }
+            } else {
+                continue;
+            };
+            if own_function(&lines, k, i) != Some(i) {
+                continue;
+            }
+            match value_kind(value) {
+                Some("nil") => nil = true,
+                Some(kd) if kind.is_none_or(|x| x == kd) => kind = Some(kd),
+                _ => known = false,
+            }
+        }
+        if let Some(kd) = kind.filter(|_| known) {
+            lines[i].push_str(&format!(": {kd}{}", if nil { "?" } else { "" }));
+        }
+    }
+    lines
+}
+
+/// The function whose own body line k is in: the nearest line above it, less
+/// indented, that opens a function (header at `outer` or one inside it).
+fn own_function(lines: &[String], k: usize, outer: usize) -> Option<usize> {
+    let mut min = indent_of(&lines[k]);
+    for j in (outer..k).rev() {
+        if is_blank(&lines[j]) || indent_of(&lines[j]) >= min {
+            continue;
+        }
+        min = indent_of(&lines[j]);
+        let s = strip(&lines[j]);
+        if j == outer || s.contains("function(") || s.starts_with("function ") || s.starts_with("local function ") {
+            return Some(j);
+        }
+    }
+    None
+}
+
+/// What a returned value certainly is: "boolean", "string", "number" or
+/// "nil"; None when it could be more than one thing.
+fn value_kind(v: &str) -> Option<&'static str> {
+    let v = v.trim();
+    if v.contains(", ") && !balanced_outside(v) {
+        return None; // more than one value
+    }
+    match v {
+        "nil" => return Some("nil"),
+        "true" | "false" => return Some("boolean"),
+        _ => {}
+    }
+    if v.starts_with("not ") {
+        return Some("boolean");
+    }
+    let quoted = |q: char| v.len() >= 2 && v.starts_with(q) && v.ends_with(q) && !v[1..v.len() - 1].contains(q);
+    if quoted('"') || quoted('\'') || quoted('`') {
+        return Some("string");
+    }
+    if v.trim_start_matches('-').parse::<f64>().is_ok() {
+        return Some("number");
+    }
+    // comparisons, at the top level, and `and`s / `or`s of them
+    let tops = top_level_ops(v);
+    if tops.iter().any(|o| *o == " and " || *o == " or ") {
+        return boolean_parts(v).then_some("boolean");
+    }
+    // arithmetic and `..` bind tighter: a comparison at the top is outermost
+    if tops.iter().any(|o| matches!(*o, " == " | " ~= " | " < " | " > " | " <= " | " >= ")) {
+        return Some("boolean");
+    }
+    None
+}
+
+/// Is every `, ` in v inside brackets or a string (one value, not a list)?
+fn balanced_outside(v: &str) -> bool {
+    let (mut depth, mut quote) = (0i32, None::<u8>);
+    let b = v.as_bytes();
+    for (i, &c) in b.iter().enumerate() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None => match c {
+                b'"' | b'\'' | b'`' => quote = Some(c),
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => depth -= 1,
+                b',' if depth == 0 && b.get(i + 1) == Some(&b' ') => return false,
+                _ => {}
+            },
+        }
+    }
+    true
+}
+
+/// The binary operators of v outside brackets and strings, among those a
+/// value's kind depends on.
+fn top_level_ops(v: &str) -> Vec<&'static str> {
+    let b = v.as_bytes();
+    let (mut depth, mut quote) = (0i32, None::<u8>);
+    let mut found = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        match quote {
+            Some(q) => {
+                if c == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                b'"' | b'\'' | b'`' => quote = Some(c),
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => depth -= 1,
+                _ if depth == 0 => {
+                    for op in [" and ", " or ", " == ", " ~= ", " <= ", " >= ", " < ", " > ", " .. ", " + ", " - ", " * ", " / ", " % ", " ^ ", " // "] {
+                        if v[i..].starts_with(op) {
+                            found.push(op);
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    found
+}
+
 /// `a ~= nil and f() == true`: `and`s and `or`s of comparisons, `not`s and
 /// booleans, so a boolean itself.
 fn boolean_parts(r: &str) -> bool {
