@@ -351,6 +351,29 @@ fn contains_ident(text: &str, name: &str) -> bool {
     false
 }
 
+/// The names contains_ident finds in a text: runs of letters, digits and `_`
+/// not right after `.` or `:`.
+fn ident_words(text: &str) -> impl Iterator<Item = &str> {
+    let t = text.as_bytes();
+    let mut i = 0;
+    std::iter::from_fn(move || {
+        while i < t.len() {
+            if t[i].is_ascii_alphanumeric() || t[i] == b'_' {
+                let s = i;
+                while i < t.len() && (t[i].is_ascii_alphanumeric() || t[i] == b'_') {
+                    i += 1;
+                }
+                if s == 0 || !matches!(t[s - 1], b'.' | b':') {
+                    return Some(&text[s..i]);
+                }
+            } else {
+                i += 1;
+            }
+        }
+        None
+    })
+}
+
 /// The quoted identifier ending `text` as `<prefix>("name")`.
 fn tail_string_arg<'t>(text: &'t str, close: &str) -> Option<(&'t str, &'t str)> {
     let s = text.strip_suffix(close)?;
@@ -4736,27 +4759,65 @@ fn peak_lines(lines: &[String]) -> usize {
 }
 
 /// Lines at indentation `ind` and the blocks under them, as statements: one
-/// starts at each line at `ind` but the ends and middles of blocks.
-fn statements_at(lines: &[String], ind: usize) -> Vec<Vec<String>> {
-    let mut out: Vec<Vec<String>> = Vec::new();
-    for line in lines {
+/// starts at each line at `ind` but the ends and middles of blocks. As
+/// ranges of the lines.
+fn statements_at(lines: &[String], ind: usize) -> Vec<(usize, usize)> {
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    for (j, line) in lines.iter().enumerate() {
         let starts = !line.trim().is_empty() && passes::indent_of(line) == ind && {
             let s = line.trim_start();
             !(s.starts_with("end") || s.starts_with("else") || s.starts_with("until ") || s.starts_with('}') || s.starts_with(')'))
         };
         match out.last_mut() {
-            Some(last) if !starts => last.push(line.clone()),
-            _ => out.push(vec![line.clone()]),
+            Some(last) if !starts => last.1 = j + 1,
+            _ => out.push((j, j + 1)),
         }
     }
     out
 }
 
+/// Which lines mention each name, as contains_ident finds them: read once for
+/// a whole function, as `do` blocks put back inside change no mention.
+struct Mentions<'a> {
+    at: HashMap<&'a str, Vec<u32>>,
+}
+
+impl<'a> Mentions<'a> {
+    fn new(lines: &'a [String]) -> Self {
+        let mut at: HashMap<&'a str, Vec<u32>> = HashMap::default();
+        for (j, l) in lines.iter().enumerate() {
+            for w in ident_words(l) {
+                let list = at.entry(w).or_default();
+                if list.last() != Some(&(j as u32)) {
+                    list.push(j as u32);
+                }
+            }
+        }
+        Mentions { at }
+    }
+
+    /// The last line in lo..hi that mentions name.
+    fn last_in(&self, name: &str, lo: usize, hi: usize) -> Option<usize> {
+        let list = self.at.get(name)?;
+        let k = list.partition_point(|j| (*j as usize) < hi);
+        let last = *list.get(k.checked_sub(1)?)? as usize;
+        (last >= lo).then_some(last)
+    }
+}
+
 /// scope_blocks at every depth: each block's body first, then the
 /// statements at this indentation.
 fn scope_nested(lines: &[String], ind: usize) -> Vec<String> {
-    let mut stmts = statements_at(lines, ind);
-    for stmt in &mut stmts {
+    let mentions = Mentions::new(lines);
+    scope_level(lines, 0, ind, &mentions)
+}
+
+/// One depth of scope_nested: these lines start at line `off` of the function.
+fn scope_level(lines: &[String], off: usize, ind: usize, mentions: &Mentions) -> Vec<String> {
+    let ranges = statements_at(lines, ind);
+    let mut chunks: Vec<String> = Vec::with_capacity(ranges.len());
+    for &(a, b) in &ranges {
+        let stmt = &lines[a..b];
         // each run of deeper lines is a block's body (or a function's)
         let mut done: Vec<String> = Vec::with_capacity(stmt.len());
         let mut i = 0;
@@ -4769,38 +4830,52 @@ fn scope_nested(lines: &[String], ind: usize) -> Vec<String> {
                 }
                 let inner = &stmt[start..i];
                 let inner_ind = inner.iter().find(|l| !l.trim().is_empty()).map_or(ind + 4, |l| passes::indent_of(l));
-                done.extend(scope_nested(inner, inner_ind));
+                done.extend(scope_level(inner, off + a + start, inner_ind, mentions));
             } else {
                 done.push(stmt[i].clone());
                 i += 1;
             }
         }
-        *stmt = done;
+        chunks.push(done.join("\n"));
     }
-    let chunks: Vec<String> = stmts.iter().map(|s| s.join("\n")).collect();
-    scope_blocks(&chunks).into_iter().flat_map(|c| c.split('\n').map(String::from).collect::<Vec<_>>()).collect()
+    let spans: Vec<(usize, usize)> = ranges.iter().map(|&(a, b)| (off + a, off + b)).collect();
+    scope_blocks(&chunks, &spans, mentions)
+        .into_iter()
+        .flat_map(|c| c.split('\n').map(String::from).collect::<Vec<_>>())
+        .collect()
 }
 
 /// A body's top-level statements, a stretch of them whose locals nothing after
 /// it mentions wrapped in `do ... end`, so they end there as in the source.
-/// A local that lives to the end stays where it is.
-fn scope_blocks(body: &[String]) -> Vec<String> {
+/// A local that lives to the end stays where it is. `spans` are the lines of
+/// the function each statement came from, for `mentions`.
+fn scope_blocks(body: &[String], spans: &[(usize, usize)], mentions: &Mentions) -> Vec<String> {
     let n = body.len();
     let Some(first) = body.iter().find(|c| !c.trim().is_empty()) else { return body.to_vec() };
     let base = " ".repeat(passes::indent_of(first.split('\n').next().unwrap_or("")));
     let declared: Vec<Vec<String>> = body.iter().map(|c| declared_names(c, &base)).collect();
-    // the last statement mentioning a name, up to one declaring it again
-    let last_use = |name: &str, from: usize| -> usize {
-        let mut last = from;
-        for j in from + 1..n {
-            if contains_ident(&body[j], name) {
-                last = j;
-            }
-            if declared[j].iter().any(|d| d == name) {
-                break;
-            }
+    if declared.iter().all(Vec::is_empty) {
+        return body.to_vec();
+    }
+    // where each name is declared again
+    let mut declares: HashMap<&str, Vec<usize>> = HashMap::default();
+    for (j, names) in declared.iter().enumerate() {
+        for name in names {
+            declares.entry(name.as_str()).or_default().push(j);
         }
-        last
+    }
+    // the last statement mentioning a name, up to one declaring it again
+    // (that one included: `local x = x + 1` reads it)
+    let last_use = |name: &str, from: usize| -> usize {
+        let again = declares.get(name).and_then(|d| d.iter().find(|j| **j > from).copied());
+        let stop = again.map_or(n, |j| j + 1);
+        if stop <= from + 1 {
+            return from;
+        }
+        match mentions.last_in(name, spans[from + 1].0, spans[stop - 1].1) {
+            Some(line) => spans.partition_point(|s| s.1 <= line),
+            None => from,
+        }
     };
     let mut out = Vec::with_capacity(n + 8);
     let mut i = 0;

@@ -214,6 +214,9 @@ fn for_each_word<'a>(s: &'a str, mut f: impl FnMut(&'a str) -> bool) {
 /// "..." and '...', and inside `...` but for its {} interpolations, which
 /// are code again, strings and all.
 fn code_mask(s: &str) -> Vec<bool> {
+    if !s.bytes().any(|c| matches!(c, b'"' | b'\'' | b'`')) {
+        return vec![true; s.len()];
+    }
     #[derive(Clone, Copy)]
     enum M {
         Code(u32), // brace depth since this code began
@@ -4023,38 +4026,44 @@ fn slot_name(name: &str, out: &[String], at: &[u32]) -> Option<String> {
     let mut class: Option<String> = None;
     let mut called = false;
     let mut found: Option<(usize, &str)> = None;
+    const ISA: &str = ":IsA(\"";
     for j in at {
         let l = &out[*j as usize];
-        // NAME:IsA("Class")
-        let isa = format!("{name}:IsA(\"");
-        if let Some(p) = l.find(&isa) {
-            let ok = p == 0 || !is_word(l.as_bytes()[p - 1]);
-            let rest = &l[p + isa.len()..];
-            if let Some(c) = rest.split('"').next().filter(|c| ok && is_token(c)) {
-                class = Some(lower_first(c));
+        let b = l.as_bytes();
+        let mut isa_at: Option<usize> = None;
+        let mut from = 0;
+        // each place the name stands, and what is right before and after it
+        while let Some(p) = l[from..].find(name).map(|x| x + from) {
+            from = p + 1;
+            let rest = &l[p + name.len()..];
+            if isa_at.is_none() && rest.starts_with(ISA) {
+                isa_at = Some(p);
             }
-        }
-        for (k, (before, after, n)) in SLOTS.iter().enumerate() {
-            let mut from = 0;
-            while let Some(p) = l[from..].find(before).map(|x| x + from) {
-                from = p + before.len();
-                let rest = &l[from..];
-                if rest.starts_with(name) && (after.is_empty() || rest[name.len()..].starts_with(after)) {
-                    let next = rest.as_bytes().get(name.len()).copied().unwrap_or(b' ');
-                    if !is_word(next) && found.is_none_or(|f| k < f.0) {
+            let next = rest.as_bytes().first().copied().unwrap_or(b' ');
+            if !is_word(next) {
+                let head = &l[..p];
+                for (k, (before, after, n)) in SLOTS.iter().enumerate() {
+                    if found.is_some_and(|f| f.0 <= k) {
+                        break;
+                    }
+                    if head.ends_with(before) && (after.is_empty() || rest.starts_with(after)) {
                         found = Some((k, n));
+                        break;
                     }
                 }
             }
-        }
-        // NAME( called, not NAME.f( or a.NAME(
-        let b = l.as_bytes();
-        let mut from = 0;
-        while let Some(p) = l[from..].find(name).map(|x| x + from) {
-            from = p + name.len();
+            // NAME( called, not NAME.f( or a.NAME(
             let before_ok = p == 0 || !(is_word(b[p - 1]) || b[p - 1] == b'.' || b[p - 1] == b':');
-            if before_ok && b.get(from) == Some(&b'(') {
+            if before_ok && next == b'(' {
                 called = true;
+            }
+        }
+        // NAME:IsA("Class"), the first in the line
+        if let Some(p) = isa_at {
+            let ok = p == 0 || !is_word(b[p - 1]);
+            let rest = &l[p + name.len() + ISA.len()..];
+            if let Some(c) = rest.split('"').next().filter(|c| ok && is_token(c)) {
+                class = Some(lower_first(c));
             }
         }
     }
@@ -4868,11 +4877,10 @@ fn name_pass(out: &mut Vec<String>, index: &mut WordIndex, extra: &Extra) -> boo
             // up to the line that ends the function: what follows its `end`
             // there is the enclosing code's (`end}, function(a)` opens the next)
             let stop = hi;
+            // every line with the word, strings included: the index keeps them all
             let hits: Vec<u32> = index.within(old, fi, stop).to_vec();
             let lines: Vec<usize> = hits.iter().map(|j| *j as usize).collect();
-            // a use the index does not list (inside an interpolation) stops it
-            let unlisted = (fi..stop.min(out.len())).any(|j| raw_word(&out[j], old) && !lines.contains(&j));
-            if unlisted || !rename_lines(out, &lines, old, new) {
+            if !rename_lines(out, &lines, old, new) {
                 continue; // a use it could not reach: inside a string's interpolation
             }
             renamed |= !hits.is_empty();
