@@ -4373,6 +4373,36 @@ impl<'c, 'm> Dec<'c, 'm> {
             .map(|i| i.pc)
     }
 
+    /// Whether the rest of a loop's body after the test at pc reads as that
+    /// test's own block (`if c then <rest> end`) rather than as what follows a
+    /// `continue`: the two compile alike, lines included, except that a block
+    /// starting on the test's own line was written there. Otherwise a short
+    /// rest is a block and a long one follows a guard.
+    fn short_tail(&self, pc: i32, nxt: i32, end: i32) -> bool {
+        let line = |q: i32| self.p.lines.get(q as usize).copied();
+        let (Some(at), Some(first)) = (line(pc), line(nxt)) else { return false };
+        if first == at {
+            return true;
+        }
+        let limit = 6;
+        let mut seen: Vec<u32> = Vec::new();
+        let mut q = nxt;
+        while q < end {
+            if self.valid(q) {
+                if let Some(l) = line(q) {
+                    if !seen.contains(&l) {
+                        seen.push(l);
+                        if seen.len() > limit {
+                            return false;
+                        }
+                    }
+                }
+            }
+            q += 1;
+        }
+        true
+    }
+
     fn jump_word(&self, target: i32) -> Option<&'static str> {
         let (cont, brk) = *self.loops.last()?;
         if target == brk || target == self.jump_end(brk) || self.same_return(target, brk) {
@@ -4462,6 +4492,16 @@ impl<'c, 'm> Dec<'c, 'm> {
             }
         }
         if let Some(word) = self.jump_word(target) {
+            if word == "continue" && nxt < end && (end == target || self.range_exit() == Some(target)) && self.short_tail(pc, nxt, end) {
+                // `if c then <rest> end` closing the loop's body: the same
+                // code as `if not c then continue end <rest>`
+                self.flush(out, ind, &[]);
+                out.push(format!("{pad}if {} then", negate(&cond).borrow().text));
+                self.emit_range(out, ind + 4, nxt, end, None, Some(target));
+                self.flush(out, ind + 4, &[]);
+                out.push(format!("{pad}end"));
+                return end;
+            }
             self.flush(out, ind, &[]);
             out.push(format!("{pad}if {} then {word} end", cond.borrow().text));
             return nxt;
