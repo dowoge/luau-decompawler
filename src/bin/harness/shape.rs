@@ -78,6 +78,30 @@ pub fn exact(p: &Proto) -> Vec<String> {
         .collect()
 }
 
+/// Every instruction word the same (registers, operands, jump offsets and aux
+/// too) and the constants equal by value in order, a closure constant meaning
+/// its paired function: the function came back as it was compiled.
+pub fn strict(am: &Module, a: &Proto, bm: &Module, b: &Proto, paired: &[Option<usize>]) -> bool {
+    let words = |p: &Proto| p.code.iter().map(|i| (i.w, i.aux)).collect::<Vec<_>>();
+    if a.code.len() != b.code.len() || words(a) != words(b) || a.k.len() != b.k.len() {
+        return false;
+    }
+    let text = |m: &Module, s: &Option<usize>| s.map(|s| m.strings[s].clone());
+    a.k.iter().zip(&b.k).all(|(x, y)| match (x, y) {
+        (K::Nil, K::Nil) | (K::Class, K::Class) => true,
+        (K::Bool(x), K::Bool(y)) => x == y,
+        (K::Number(x), K::Number(y)) => x.to_bits() == y.to_bits(),
+        (K::Integer(x), K::Integer(y)) => x == y,
+        (K::Vector(x), K::Vector(y)) => x.iter().zip(y).all(|(p, q)| p.to_bits() == q.to_bits()),
+        (K::Str(x), K::Str(y)) => text(am, x) == text(bm, y),
+        // constant indices, the same constants: the same names
+        (K::Import(x), K::Import(y)) => x == y,
+        (K::TableK(x), K::TableK(y)) => x == y,
+        (K::Closure(x), K::Closure(y)) => paired.get(*x).copied().flatten() == Some(*y),
+        _ => false,
+    })
+}
+
 /// For each function of a, its counterpart in b. They are numbered in compile
 /// order, so one gone missing would misalign all that follow: pair the same
 /// function by name and arity, then what is left by identical code, then by

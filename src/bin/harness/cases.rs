@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::luau::{clip, decompile_many, module, percent, repo, text_of, Args, Item, Tools, USUAL_BUDGET};
-use crate::shape::{exact, pair, shape};
+use crate::shape::{exact, pair, shape, strict};
 
 struct Row {
     name: Option<String>,
@@ -115,9 +115,9 @@ pub fn run_suite(suite: &Suite) -> Found {
     let bc: HashMap<&String, &Vec<u8>> = srcs.iter().zip(&code).filter_map(|(s, c)| Some((s, c.as_ref().ok()?))).collect();
     let all: Vec<Item> = sources.iter().chain(&dec_items).cloned().collect();
     let out = tools.outputs(&all, 60, USUAL_BUDGET);
-    let mut totals = [0usize; 3];
+    let mut totals = [0usize; 4];
     let mut misbehaving: Vec<(String, &'static str)> = Vec::new();
-    print_row(print, false, format!("{:<24} {:<4} {:>5} {:>6} {:>6}", "case", "run", "funcs", "shape", "exact"));
+    print_row(print, false, format!("{:<24} {:<4} {:>5} {:>6} {:>6} {:>6}", "case", "run", "funcs", "shape", "exact", "strict"));
     for s in &srcs {
         let name = base(s);
         let Some(d) = decs.get(s) else {
@@ -137,7 +137,7 @@ pub fn run_suite(suite: &Suite) -> Found {
         }
         let (a, b) = (module(bc[s]), module(recompiled));
         let paired = pair(&a, &b);
-        let (mut n, mut shp, mut ex) = (0, 0, 0);
+        let (mut n, mut shp, mut ex, mut st) = (0, 0, 0, 0);
         let mut rows = Vec::new();
         for (i, pa) in a.protos.iter().enumerate() {
             n += 1;
@@ -151,6 +151,7 @@ pub fn run_suite(suite: &Suite) -> Found {
                 let (ea, eb) = (exact(pa), exact(&b.protos[j]));
                 if ea == eb {
                     ex += 1;
+                    st += usize::from(strict(&a, pa, &b, &b.protos[j], &paired));
                 } else {
                     rows.push(Row { name: pa.name.clone(), why: "registers", a: ea, b: eb });
                 }
@@ -162,8 +163,9 @@ pub fn run_suite(suite: &Suite) -> Found {
         totals[0] += n;
         totals[1] += shp;
         totals[2] += ex;
+        totals[3] += st;
         let verdict = if same { "ok" } else { "BAD" };
-        print_row(print, !same, format!("{name:<24} {verdict:<4} {n:>5} {shp:>6} {ex:>6}"));
+        print_row(print, !same, format!("{name:<24} {verdict:<4} {n:>5} {shp:>6} {ex:>6} {st:>6}"));
         if show.is_some_and(|w| name.contains(w)) {
             if !same {
                 let shown = |p: &String| out.get(p).map_or("None", String::as_str).to_string();
@@ -172,13 +174,14 @@ pub fn run_suite(suite: &Suite) -> Found {
             print_rows(&rows, &text_of(&d.data));
         }
     }
-    let [n, shp, ex] = totals;
+    let [n, shp, ex, st] = totals;
     let line = format!(
-        "{:<24} {:<4} {n:>5} {shp:>6} {ex:>6}   shape {}, exact {}, {} misbehave",
+        "{:<24} {:<4} {n:>5} {shp:>6} {ex:>6} {st:>6}   shape {}, exact {}, strict {}, {} misbehave",
         "total",
         "",
         percent(shp, n),
         percent(ex, n),
+        percent(st, n),
         misbehaving.len()
     );
     print_row(print, true, line);
