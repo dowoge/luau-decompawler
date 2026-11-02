@@ -1448,11 +1448,28 @@ fn copy_unless_repeat(lines: &mut Vec<String>, decl: usize, flag: &str) -> bool 
     true
 }
 
+/// One flag may be checked several times, each check inside what the one
+/// before guards (gotos to one label from several places): the last check
+/// first, whose S mentions the flag no more.
 fn copy_unless(lines: &mut Vec<String>, decl: usize, flag: &str) -> bool {
-    let set = format!("{flag} = true");
-    // the check, and the `if` right before it
     let check = format!("if not {flag} then");
-    let Some(c) = (decl + 1..lines.len()).find(|&i| strip(&lines[i]) == check) else { return false };
+    let checks: Vec<usize> = (decl + 1..lines.len()).filter(|&i| strip(&lines[i]) == check).collect();
+    for &c in checks.iter().rev() {
+        if copy_unless_at(lines, decl, flag, c) {
+            // the declaration goes with the flag's last use
+            if !(0..lines.len()).any(|i| i != decl && has_word(&lines[i], flag)) {
+                lines.remove(decl);
+            }
+            return true;
+        }
+    }
+    false
+}
+
+fn copy_unless_at(lines: &mut Vec<String>, decl: usize, flag: &str, c: usize) -> bool {
+    let set = format!("{flag} = true");
+    let check = format!("if not {flag} then");
+    // the `if` right before the check
     let d = indent_of(&lines[c]);
     let Some(chain_end) = (decl + 1..c).rev().find(|&i| !is_blank(&lines[i])) else { return false };
     if indent_of(&lines[chain_end]) != d || strip(&lines[chain_end]) != "end" {
@@ -1466,10 +1483,13 @@ fn copy_unless(lines: &mut Vec<String>, decl: usize, flag: &str) -> bool {
     if !strip(&lines[first]).starts_with("if ") || !strip(&lines[first]).ends_with(" then") || if_end(lines, first) != Some(chain_end) {
         return false;
     }
-    // declared further out: still false where the `if` starts, with no loop
-    // or function begun in between
-    let between = &lines[decl + 1..first];
-    if between.iter().any(|l| loop_open(l) || strip(l).contains("function")) {
+    // the flag is false where that `if` starts: just inside another check of
+    // it, or just declared, with nothing touching it, and no loop or function
+    // begun, in between
+    let enclosing = (decl + 1..first).rev().find(|&p| strip(&lines[p]) == check && indent_of(&lines[p]) < d && arm_end(lines, p) > c);
+    let from = enclosing.unwrap_or(decl);
+    let between = &lines[from + 1..first];
+    if between.iter().any(|l| loop_open(l) || strip(l).contains("function") || has_word(l, flag)) {
         return false;
     }
     let mut e = c + 1;
@@ -1479,16 +1499,25 @@ fn copy_unless(lines: &mut Vec<String>, decl: usize, flag: &str) -> bool {
     if e >= lines.len() || indent_of(&lines[e]) != d || strip(&lines[e]) != "end" {
         return false;
     }
-    // every other mention of the flag is a set inside the `if`
-    let others = (0..lines.len()).filter(|&i| has_word(&lines[i], flag) && i != decl && i != c);
+    // inside the `if`, the flag is only set
     let mut sets = 0;
-    for i in others {
-        if !(first < i && i < chain_end && strip(&lines[i]) == set) {
-            return false;
+    for i in first..chain_end {
+        if has_word(&lines[i], flag) {
+            if strip(&lines[i]) != set {
+                return false;
+            }
+            sets += 1;
         }
-        sets += 1;
     }
     let body: Vec<String> = lines[c + 1..e].iter().filter(|l| !is_blank(l)).map(|l| l[d + 4..].to_string()).collect();
+    if body.iter().any(|l| has_word(l, flag)) {
+        return false; // a later check comes first
+    }
+    // nothing after reads what the `if` set: a check further down would
+    // see its sets too (a goto to the same label from further in)
+    if (e + 1..lines.len()).any(|i| has_word(&lines[i], flag)) {
+        return false;
+    }
     if body.is_empty() || body.len() > 12 || body.iter().any(|l| has_any_goto(l) || parse_label(l).is_some()) {
         return false;
     }
@@ -1502,11 +1531,10 @@ fn copy_unless(lines: &mut Vec<String>, decl: usize, flag: &str) -> bool {
     let chain: Vec<String> = lines[first..=chain_end].iter().filter(|l| !is_blank(l)).cloned().collect();
     let mut copies = 0;
     let Some(new) = unless_chain(&chain, d, flag, &body, &mut copies) else { return false };
-    if sets == 0 || copies == 0 || copies * body.len() > 32 {
+    if sets == 0 || copies == 0 || copies * body.len() > 32 || new.iter().any(|l| has_word(l, flag)) {
         return false;
     }
     lines.splice(first..=e, new);
-    lines.remove(decl);
     true
 }
 
@@ -1583,7 +1611,7 @@ fn unless_chain(chain: &[String], j: usize, flag: &str, s: &[String], copies: &m
     // `if c then else B end` is `if not c then B end`
     if new_arms.len() == 2 && new_arms[0].1.is_empty() && strip(&new_arms[1].0) == "else" {
         let c = strip(&new_arms[0].0).strip_prefix("if ")?.strip_suffix(" then")?.to_string();
-        let mut out = vec![format!("{pad}if {} then", negated(&c))];
+        let mut out = vec![format!("{pad}if {} then", negated_test(&c))];
         out.extend(new_arms[1].1.iter().cloned());
         out.push(format!("{pad}end"));
         return Some(out);
@@ -2155,7 +2183,7 @@ fn drop_unread_flag(lines: &mut Vec<String>, flag: &str) {
             continue;
         }
         if next == "else" {
-            lines[k] = format!("{pad}if {} then", negated(c));
+            lines[k] = format!("{pad}if {} then", negated_test(c));
             lines.remove(k + 1);
         }
         k += 1;
