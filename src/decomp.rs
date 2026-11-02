@@ -613,6 +613,11 @@ pub fn decompile_lines(m: &Module, noflat: bool) -> Vec<String> {
 
 impl<'c, 'm> Dec<'c, 'm> {
     fn new(ctx: &'c Ctx<'m>, idx: usize, upvals: Vec<Rc<str>>, depth: i32) -> Self {
+        Self::with_flow(ctx, idx, upvals, depth, None)
+    }
+
+    /// new(), with the analysis of this function if it was made already.
+    fn with_flow(ctx: &'c Ctx<'m>, idx: usize, upvals: Vec<Rc<str>>, depth: i32, flow: Option<Flow>) -> Self {
         let m = ctx.m;
         let p = &m.protos[idx];
         let upvals: Vec<Rc<str>> = if upvals.is_empty() {
@@ -625,7 +630,7 @@ impl<'c, 'm> Dec<'c, 'm> {
             let inside = |s: &(u32, u32)| own.0 <= s.0 && s.1 <= own.1 && *s != own;
             line < own.0 || line > own.1 || ctx.spans.iter().any(|s| inside(s) && s.0 <= line && line <= s.1)
         };
-        let flow = Flow::new(p, &foreign);
+        let flow = flow.unwrap_or_else(|| Flow::new(p, &foreign));
         let suffix = if depth < 0 { String::new() } else { format!("_{}", depth + 1) };
         let size = p.sizecode.max(0) as usize + 2;
         let mut d = Dec {
@@ -840,12 +845,12 @@ impl<'c, 'm> Dec<'c, 'm> {
     }
 
     fn live_after(&self, pc: i32, r: usize) -> bool {
-        self.shared(pc, r) || self.flow.idx(pc).is_some_and(|i| self.flow.live_out[i].has(r))
+        self.shared(pc, r) || self.flow.idx(pc).is_some_and(|i| self.flow.live_out(i).has(r))
     }
 
     fn live_at(&self, pc: i32, r: usize) -> bool {
         self.flow.use_web(pc, r).is_some_and(|w| self.flow.byref_only[w as usize])
-            || self.flow.idx(pc).is_some_and(|i| self.flow.live_in[i].has(r))
+            || self.flow.idx(pc).is_some_and(|i| self.flow.live_in(i).has(r))
     }
 
     /// Is the variable written or read at pc in r shared with a closure
@@ -1452,7 +1457,7 @@ impl<'c, 'm> Dec<'c, 'm> {
             let ins = code[i];
             let q = ins.pc;
             tests.retain(|t| t.0 > q);
-            let (rd, wr, barrier) = self.flow.effects[i];
+            let (rd, wr, barrier) = self.flow.effects(i);
             let (with_val, with_st) = (rd.intersects(&val), rd.intersects(&st));
             if with_val && with_st {
                 return state_operand_first(&ins, &val, &st, i.checked_sub(1).map(|k| code[k]));
@@ -1819,7 +1824,10 @@ impl<'c, 'm> Dec<'c, 'm> {
             if peak > 180 {
                 // Luau allows 200 locals in scope: one variable per register
                 // (shared closure variables kept apart) stays under that
-                let mut again = Dec::new(self.ctx, self.idx, self.upvals.clone(), self.depth);
+                // the same function: its analysis carries over, and only one
+                // is held at a time
+                let flow = std::mem::take(&mut self.flow);
+                let mut again = Dec::with_flow(self.ctx, self.idx, self.upvals.clone(), self.depth, Some(flow));
                 again.flat_regs = true;
                 return again.decompile_once();
             }
@@ -2403,7 +2411,7 @@ impl<'c, 'm> Dec<'c, 'm> {
                 }
                 let (rd, wr, barrier) = match top {
                     Some(top) => effects(&ins, top),
-                    None => self.flow.effects[i],
+                    None => self.flow.effects(i),
                 };
                 if rd.has(r) && twice(&ins, r) {
                     break; // `x * x`: two reads in one instruction
@@ -2516,7 +2524,7 @@ impl<'c, 'm> Dec<'c, 'm> {
                     break; // all of a call or `...`: the last item, nothing joins behind it
                 }
             } else {
-                let (rd, wr, barrier) = self.flow.effects[i];
+                let (rd, wr, barrier) = self.flow.effects(i);
                 let joined = self.has_label(ins.pc) && self.first_jump[ins.pc as usize] <= pc;
                 if rd.has(r) || wr.has(r) || (left == 0 && (barrier || joined)) {
                     break;
@@ -2534,7 +2542,7 @@ impl<'c, 'm> Dec<'c, 'm> {
         let Some(mut i) = self.flow.idx(pc).map(|k| k + 1) else { return regs };
         while i < code.len() {
             let ins = code[i];
-            let (rd, wr, _) = self.flow.effects[i];
+            let (rd, wr, _) = self.flow.effects(i);
             let store = matches!(ins.op, op::SETTABLEKS | op::SETTABLE | op::SETTABLEN) && ins.b() == r
                 || ins.op == op::SETLIST && ins.a() == r;
             if store {
@@ -2571,7 +2579,7 @@ impl<'c, 'm> Dec<'c, 'm> {
             } else if ins.op == op::SETLIST && ins.a() == r {
                 return None; // a list: sized by its items, as it is printed
             } else {
-                let (rd, wr, barrier) = self.flow.effects[i];
+                let (rd, wr, barrier) = self.flow.effects(i);
                 let joined = self.has_label(ins.pc) && self.first_jump[ins.pc as usize] <= pc;
                 if rd.has(r) || wr.has(r) || (left == 0 && (barrier || joined)) {
                     break;
@@ -2679,7 +2687,7 @@ impl<'c, 'm> Dec<'c, 'm> {
             if is_forgprep(ins.op) && qa == r {
                 return true; // a loop's iterator: its header
             }
-            let (rd, wr, barrier) = self.flow.effects[i];
+            let (rd, wr, barrier) = self.flow.effects(i);
             if rd.has(r) {
                 return !twice(&ins, r) && (wr.has(r) || !self.live_after(q, r));
             }

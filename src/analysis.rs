@@ -189,6 +189,7 @@ pub fn twice(ins: &Insn, r: usize) -> bool {
 }
 
 /// Facts about one function that never change while it is printed.
+#[derive(Default)]
 pub struct Flow {
     /// pc -> index into `code`, -1 inside a two-word instruction or outside.
     pub pos: Vec<i32>,
@@ -213,11 +214,15 @@ pub struct Flow {
     pub used_web: Vec<bool>,
     /// Per web: first write, first read and last touch, as pcs.
     pub web_span: Vec<(i32, i32, i32)>,
-    pub live_in: Vec<RegSet>,
-    pub live_out: Vec<RegSet>,
-    /// effects() of every instruction, the end of a list being the stack's.
-    /// The printer's look-aheads ask again and again, for the same few.
-    pub effects: Vec<(RegSet, RegSet, bool)>,
+    /// live_in and live_out of every instruction, `words` words each: most
+    /// functions use one word of registers, and RegSet holds four.
+    live: Vec<u64>,
+    /// effects() of every instruction, the end of a list being the stack's
+    /// (reads and writes as `live`). The printer's look-aheads ask again and
+    /// again, for the same few.
+    eff: Vec<u64>,
+    barriers: Vec<bool>,
+    words: usize,
 }
 
 fn find(parent: &mut [u32], mut x: u32) -> u32 {
@@ -386,6 +391,30 @@ impl Flow {
                 live_in[i] = o;
             }
         }
+
+        let effs: Vec<(RegSet, RegSet, bool)> = code.iter().map(|ins| effects(ins, p.maxstack)).collect();
+        let used = |s: &RegSet| s.0.iter().rposition(|w| *w != 0).map_or(0, |k| k + 1);
+        let set_words = live_in
+            .iter()
+            .chain(&live_out)
+            .chain(effs.iter().flat_map(|e| [&e.0, &e.1]))
+            .map(used)
+            .max()
+            .unwrap_or(0)
+            .max(1);
+        let mut live = Vec::with_capacity(2 * n * set_words);
+        for (i, o) in live_in.iter().zip(&live_out) {
+            live.extend_from_slice(&i.0[..set_words]);
+            live.extend_from_slice(&o.0[..set_words]);
+        }
+        drop((live_in, live_out));
+        let mut eff = Vec::with_capacity(2 * effs.len() * set_words);
+        for e in &effs {
+            eff.extend_from_slice(&e.0 .0[..set_words]);
+            eff.extend_from_slice(&e.1 .0[..set_words]);
+        }
+        let barriers: Vec<bool> = effs.iter().map(|e| e.2).collect();
+        drop(effs);
 
         // definitions; those of one register get adjacent bits, in order
         let nregs = p.maxstack.max(1) + 1;
@@ -771,10 +800,36 @@ impl Flow {
             web_defs,
             used_web,
             web_span,
-            live_in,
-            live_out,
-            effects: code.iter().map(|ins| effects(ins, p.maxstack)).collect(),
+            live,
+            eff,
+            barriers,
+            words: set_words,
         }
+    }
+
+    #[inline]
+    fn set_at(&self, sets: &[u64], k: usize) -> RegSet {
+        let mut s = RegSet::EMPTY;
+        s.0[..self.words].copy_from_slice(&sets[k * self.words..(k + 1) * self.words]);
+        s
+    }
+
+    /// Registers live before instruction i (an index into the code).
+    #[inline]
+    pub fn live_in(&self, i: usize) -> RegSet {
+        self.set_at(&self.live, 2 * i)
+    }
+
+    /// Registers live after instruction i.
+    #[inline]
+    pub fn live_out(&self, i: usize) -> RegSet {
+        self.set_at(&self.live, 2 * i + 1)
+    }
+
+    /// effects() of instruction i.
+    #[inline]
+    pub fn effects(&self, i: usize) -> (RegSet, RegSet, bool) {
+        (self.set_at(&self.eff, 2 * i), self.set_at(&self.eff, 2 * i + 1), self.barriers[i])
     }
 
     /// Every (register, web root, write pc) in pc order; pc -1 is the entry.
