@@ -4285,6 +4285,21 @@ fn passed_name(name: &str, out: &[String], at: &[u32], signatures: &HashMap<Stri
     None
 }
 
+/// `a ~= nil and f() == true`: `and`s and `or`s of comparisons, `not`s and
+/// booleans, so a boolean itself.
+fn boolean_parts(r: &str) -> bool {
+    if !r.contains(" and ") && !r.contains(" or ") || r.starts_with("if ") || r.contains(" then ") {
+        return false;
+    }
+    r.split(" and ").flat_map(|p| p.split(" or ")).all(|p| {
+        let p = p.trim().trim_start_matches('(').trim_end_matches(')');
+        p == "true"
+            || p == "false"
+            || p.starts_with("not ")
+            || [" == ", " ~= ", " < ", " > ", " <= ", " >= "].iter().any(|o| p.contains(o))
+    })
+}
+
 /// The kind of value a variable holds, as a short name: by the value it is
 /// given, else by what is done with it.
 fn kind_name(name: &str, out: &[String], at: &[u32], defs: &[usize]) -> Option<String> {
@@ -4322,6 +4337,8 @@ fn kind_name(name: &str, out: &[String], at: &[u32], defs: &[usize]) -> Option<S
                 Some("fn")
             } else if r.starts_with("not ") || [" == ", " ~= ", " < ", " > ", " <= ", " >= "].iter().any(|o| r.contains(o)) && !r.contains(" and ") && !r.contains(" or ") {
                 Some("ok")
+            } else if boolean_parts(r) {
+                Some("flag")
             } else if r.ends_with(']') && !r.contains('(') {
                 Some("value")
             } else {
