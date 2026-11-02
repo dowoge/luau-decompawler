@@ -1433,7 +1433,10 @@ impl<'c, 'm> Dec<'c, 'm> {
                 let code = &self.m.protos[call.helper].code;
                 e.borrow_mut().one = !code.iter().filter(|i| i.op == op::RETURN).all(|i| i.b() == 2);
                 self.value_done(t, e, pc, call.end);
-                if self.state_printed_first(call.end, t) || !self.read_once_from(call.end, t) {
+                // an arm of `if c then f(1) else f(2)`: its jump to the join
+                // carries the value on, read there once
+                let joins = self.in_region && self.reaches_join_unread(call.last, t);
+                if !joins && (self.state_printed_first(call.end, t) || !self.read_once_from(call.end, t)) {
                     let e = self.get(t);
                     self.flush_impure(out, ind, t);
                     self.assign(out, ind, t, &e);
@@ -1621,9 +1624,17 @@ impl<'c, 'm> Dec<'c, 'm> {
 
     /// The same for a helper's result, from the pc after its code.
     fn flows_from(&self, end: i32, result: Option<usize>, q: usize) -> bool {
-        let (Some(r), Some(from)) = (result, self.flow.idx(end)) else { return false };
+        let (Some(r), Some(mut from)) = (result, self.flow.idx(end)) else { return false };
         let mut flow = RegSet::EMPTY;
         flow.add(r);
+        if self.in_region {
+            // in a branch of a value: who reads that value after the join
+            let Some(j) = self.region_join.and_then(|j| self.flow.idx(j)) else { return false };
+            for w in 0..flow.0.len() {
+                flow.0[w] |= self.region_written.0[w];
+            }
+            from = j;
+        }
         self.flows_on(from, flow, q)
     }
 

@@ -7,5 +7,4 @@ generic_loop_slots_near_register_limit.luau    loop slots near the register limi
 index_keys_then_named_fields.luau              {[1] = nil, [2] = ...} printed as {} and stores: later field stores count into its size
 open_list_positional_before_keyed.luau         an open list after a split constructor is a loop of stores: the array grows otherwise
 open_list_tail_after_branch_split.luau         an open list after a split constructor is a loop of stores: the array grows otherwise
-open_list_varargs_after_split_prefix.luau      an open list after a split constructor is a loop of stores: the array grows otherwise
 table_shape_after_folded_stores.luau           a copied-in helper with constant arguments loses folded stores: the plain stores left give a smaller array part
