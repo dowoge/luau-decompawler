@@ -1677,9 +1677,11 @@ impl<'c, 'm> Dec<'c, 'm> {
                 // the source freed its locals at the end of `do` blocks, which
                 // the bytecode does not show: a stretch whose locals nothing
                 // after it mentions is a block of its own again
-                let scoped = scope_blocks(&body);
-                let less = peak_locals(&scoped);
-                if less < peak && (less <= 180 || peak <= 180) {
+                let lines: Vec<String> = body.iter().flat_map(|c| c.split('\n').map(String::from)).collect();
+                let base = lines.iter().find(|l| !l.trim().is_empty()).map_or(0, |l| passes::indent_of(l));
+                let scoped = scope_nested(&lines, base);
+                let (before, after) = (peak_lines(&lines), peak_lines(&scoped));
+                if after < before && (peak_locals(&scoped) <= 180 || peak <= 180) {
                     return (params, scoped);
                 }
             }
@@ -4581,6 +4583,75 @@ fn declared_names(chunk: &str, base: &str) -> Vec<String> {
     }
     let head = rest.split(" = ").next().unwrap_or(rest);
     head.split(',').map(|s| s.trim().to_string()).filter(|s| is_ident(s)).collect()
+}
+
+/// The most locals in scope at once anywhere in these lines, nested blocks
+/// and functions included.
+fn peak_lines(lines: &[String]) -> usize {
+    let (mut alive, mut peak) = (0usize, 0usize);
+    let mut scopes: Vec<(usize, usize)> = Vec::new();
+    for line in lines.iter().filter(|l| !l.trim().is_empty()) {
+        let ind = passes::indent_of(line);
+        while scopes.last().is_some_and(|s| s.0 > ind) {
+            alive -= scopes.pop().unwrap().1;
+        }
+        let new = base_locals(line, &line[..ind]);
+        if new > 0 {
+            match scopes.last_mut() {
+                Some(s) if s.0 == ind => s.1 += new,
+                _ => scopes.push((ind, new)),
+            }
+            alive += new;
+            peak = peak.max(alive);
+        }
+    }
+    peak
+}
+
+/// Lines at indentation `ind` and the blocks under them, as statements: one
+/// starts at each line at `ind` but the ends and middles of blocks.
+fn statements_at(lines: &[String], ind: usize) -> Vec<Vec<String>> {
+    let mut out: Vec<Vec<String>> = Vec::new();
+    for line in lines {
+        let starts = !line.trim().is_empty() && passes::indent_of(line) == ind && {
+            let s = line.trim_start();
+            !(s.starts_with("end") || s.starts_with("else") || s.starts_with("until ") || s.starts_with('}') || s.starts_with(')'))
+        };
+        match out.last_mut() {
+            Some(last) if !starts => last.push(line.clone()),
+            _ => out.push(vec![line.clone()]),
+        }
+    }
+    out
+}
+
+/// scope_blocks at every depth: each block's body first, then the
+/// statements at this indentation.
+fn scope_nested(lines: &[String], ind: usize) -> Vec<String> {
+    let mut stmts = statements_at(lines, ind);
+    for stmt in &mut stmts {
+        // each run of deeper lines is a block's body (or a function's)
+        let mut done: Vec<String> = Vec::with_capacity(stmt.len());
+        let mut i = 0;
+        while i < stmt.len() {
+            let deeper = |l: &String| l.trim().is_empty() || passes::indent_of(l) > ind;
+            if i > 0 && deeper(&stmt[i]) {
+                let start = i;
+                while i < stmt.len() && deeper(&stmt[i]) {
+                    i += 1;
+                }
+                let inner = &stmt[start..i];
+                let inner_ind = inner.iter().find(|l| !l.trim().is_empty()).map_or(ind + 4, |l| passes::indent_of(l));
+                done.extend(scope_nested(inner, inner_ind));
+            } else {
+                done.push(stmt[i].clone());
+                i += 1;
+            }
+        }
+        *stmt = done;
+    }
+    let chunks: Vec<String> = stmts.iter().map(|s| s.join("\n")).collect();
+    scope_blocks(&chunks).into_iter().flat_map(|c| c.split('\n').map(String::from).collect::<Vec<_>>()).collect()
 }
 
 /// A body's top-level statements, a stretch of them whose locals nothing after
