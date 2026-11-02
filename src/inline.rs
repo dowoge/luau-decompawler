@@ -905,7 +905,9 @@ fn match_once(m: &Module, caller: &Proto, id: usize, start: usize, assumed: &[Op
                 }
             }
             walk.write(p.a(), c.a())?;
-        } else if plain(p.op) == plain(c.op) {
+        } else if plain(p.op) == plain(c.op) || (p.op == op::NEWCLOSURE && c.op == op::DUPCLOSURE) {
+            // a literal that captures a parameter is new on every call; in a
+            // copy given a function literal it is shared, and loaded as one
             walk.step(p, c)?;
         } else {
             walk.k_form(p, c)?;
