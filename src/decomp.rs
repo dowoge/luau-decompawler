@@ -1672,7 +1672,18 @@ impl<'c, 'm> Dec<'c, 'm> {
     fn decompile_body(&mut self) -> (Vec<String>, Vec<String>) {
         let (params, body) = self.decompile_once();
         if !self.flat_regs {
-            if peak_locals(&body) > 180 {
+            let peak = peak_locals(&body);
+            if peak + self.p.numparams as usize > 180 {
+                // the source freed its locals at the end of `do` blocks, which
+                // the bytecode does not show: a stretch whose locals nothing
+                // after it mentions is a block of its own again
+                let scoped = scope_blocks(&body);
+                let less = peak_locals(&scoped);
+                if less < peak && (less <= 180 || peak <= 180) {
+                    return (params, scoped);
+                }
+            }
+            if peak > 180 {
                 // Luau allows 200 locals in scope: one variable per register
                 // (shared closure variables kept apart) stays under that
                 let mut again = Dec::new(self.ctx, self.idx, self.upvals.clone(), self.depth);
@@ -4558,6 +4569,72 @@ fn peak_locals(body: &[String]) -> usize {
         }
     }
     peak
+}
+
+/// The names a statement declares at the start of the body (`base` indent).
+fn declared_names(chunk: &str, base: &str) -> Vec<String> {
+    let line = chunk.split('\n').next().unwrap_or("");
+    let Some(rest) = line.strip_prefix(base).and_then(|l| l.strip_prefix("local ")) else { return Vec::new() };
+    if let Some(r) = rest.strip_prefix("function ") {
+        let name: String = r.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+        return if is_ident(&name) { vec![name] } else { Vec::new() };
+    }
+    let head = rest.split(" = ").next().unwrap_or(rest);
+    head.split(',').map(|s| s.trim().to_string()).filter(|s| is_ident(s)).collect()
+}
+
+/// A body's top-level statements, a stretch of them whose locals nothing after
+/// it mentions wrapped in `do ... end`, so they end there as in the source.
+/// A local that lives to the end stays where it is.
+fn scope_blocks(body: &[String]) -> Vec<String> {
+    let n = body.len();
+    let Some(first) = body.iter().find(|c| !c.trim().is_empty()) else { return body.to_vec() };
+    let base = " ".repeat(passes::indent_of(first.split('\n').next().unwrap_or("")));
+    let declared: Vec<Vec<String>> = body.iter().map(|c| declared_names(c, &base)).collect();
+    // the last statement mentioning a name, up to one declaring it again
+    let last_use = |name: &str, from: usize| -> usize {
+        let mut last = from;
+        for j in from + 1..n {
+            if contains_ident(&body[j], name) {
+                last = j;
+            }
+            if declared[j].iter().any(|d| d == name) {
+                break;
+            }
+        }
+        last
+    };
+    let mut out = Vec::with_capacity(n + 8);
+    let mut i = 0;
+    while i < n {
+        if declared[i].is_empty() {
+            out.push(body[i].clone());
+            i += 1;
+            continue;
+        }
+        let mut end = i;
+        let mut k = i;
+        while k <= end {
+            for name in &declared[k] {
+                end = end.max(last_use(name, k));
+            }
+            k += 1;
+        }
+        if end + 1 >= n {
+            out.push(body[i].clone()); // lives to the end
+            i += 1;
+            continue;
+        }
+        out.push(format!("{base}do"));
+        for chunk in &body[i..=end] {
+            let lines: Vec<String> =
+                chunk.split('\n').map(|l| if l.is_empty() { String::new() } else { format!("    {l}") }).collect();
+            out.push(lines.join("\n"));
+        }
+        out.push(format!("{base}end"));
+        i = end + 1;
+    }
+    out
 }
 
 fn base_locals(line: &str, base: &str) -> usize {
