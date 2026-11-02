@@ -17,6 +17,7 @@ use crate::hash::{HashMap, HashSet};
 
 use crate::bytecode::{is_for, is_forgprep, op, op_name, Insn, Module, Proto, K};
 use crate::decomp::{import_expr, kexpr};
+use crate::analysis::full_effects;
 
 thread_local! {
     /// How far the last walk got: (instructions matched, of, helper's op, caller's op).
@@ -112,19 +113,56 @@ struct Walk<'a> {
     args: Vec<Option<Arg>>,
     written: Vec<usize>,
     jumps: Vec<(i32, i32)>,
-    /// Caller registers just loaded with a constant, as source text.
-    loaded: HashMap<usize, String>,
+    /// Caller registers just loaded with a constant, as source text, and the
+    /// pc of the load.
+    loaded: HashMap<usize, (String, i32)>,
+    /// Parameters the helper assigns: Luau loads a constant given for one
+    /// into its register before the copy, where it does not for the others.
+    assigned: Vec<bool>,
     upvals: Vec<Option<Up>>,
     /// Helper registers holding an upvalue the caller has not been seen to read.
     unread: HashMap<usize, usize>,
     /// Every (helper register, caller register) a write has paired.
     held: HashSet<(usize, usize)>,
+    /// Parameters taken to be a false or a true constant: tested before
+    /// the copy showed what they were.
+    assumed: Vec<Option<bool>>,
+    /// A parameter a test needed to know, unknown yet.
+    need: Option<usize>,
+}
+
+fn falsy(text: &str) -> bool {
+    text == "nil" || text == "false"
 }
 
 impl Walk<'_> {
+    /// The constant in caller register c, if it was loaded where a call
+    /// given it for parameter p would load it: before the read at pc with no
+    /// statement between, or anywhere for a parameter the helper assigns.
+    /// `a, b = x, k` loads k before the store of a, which a call cannot say.
+    fn given(&self, p: usize, c: usize, pc: i32) -> Option<String> {
+        let (text, at) = self.loaded.get(&c)?;
+        if self.assigned.get(p).copied().unwrap_or(false) {
+            return Some(text.clone());
+        }
+        let from = self.caller.code.partition_point(|i| i.pc <= *at);
+        let mut between = self.caller.code[from..].iter().take_while(|i| i.pc < pc);
+        let statement = |o: u8| {
+            matches!(plain(o), op::SETTABLE | op::SETTABLEKS | op::SETTABLEN | op::SETUPVAL | op::SETGLOBAL | op::CALL | op::RETURN)
+        };
+        (!between.any(|i| statement(i.op))).then(|| text.clone())
+    }
+
     fn read(&mut self, p: usize, c: usize, pc: i32) -> Option<()> {
         if let Some(Some(Arg::Const(text))) = self.args.get(p) {
-            return (self.loaded.get(&c) == Some(text)).then_some(());
+            return (self.loaded.get(&c).map(|l| &l.0) == Some(text)).then_some(());
+        }
+        if let Some(Some(truthy)) = self.assumed.get(p).copied() {
+            // what it was taken for: a constant of that truth
+            let text = self.given(p, c, pc)?;
+            (falsy(&text) != truthy).then_some(())?;
+            self.args[p] = Some(Arg::Const(text));
+            return Some(());
         }
         if let Some(u) = self.unread.remove(&p) {
             self.upvalue(u, Up::Reg(c))?;
@@ -134,13 +172,13 @@ impl Walk<'_> {
         match *self.map.get(p)? {
             Some(x) => (x == c).then_some(()),
             None if p < self.helper.numparams => {
-                self.args[p] = Some(match self.loaded.get(&c) {
-                    Some(text) => Arg::Const(text.clone()),
-                    None => {
-                        self.map[p] = Some(c);
-                        Arg::Reg(c, pc)
-                    }
-                });
+                if self.loaded.contains_key(&c) {
+                    let text = self.given(p, c, pc)?;
+                    self.args[p] = Some(Arg::Const(text));
+                    return Some(());
+                }
+                self.map[p] = Some(c);
+                self.args[p] = Some(Arg::Reg(c, pc));
                 Some(())
             }
             None => None,
@@ -150,6 +188,9 @@ impl Walk<'_> {
     /// Parameter p is this constant, wherever it is read.
     fn constant(&mut self, p: usize, text: String) -> Option<()> {
         if self.map.get(p)?.is_some() || p >= self.helper.numparams {
+            return None;
+        }
+        if self.assumed[p].is_some_and(|truthy| falsy(&text) == truthy) {
             return None;
         }
         match &self.args[p] {
@@ -178,6 +219,44 @@ impl Walk<'_> {
                 *slot = Some(up);
                 Some(())
             }
+        }
+    }
+
+    /// Does this test of the helper's go one way for the constants it was
+    /// given? Some(true) if it jumps. A parameter tested before anything
+    /// showed it is noted as needed, for a try with each truth.
+    fn folded_test(&mut self, p: &Insn) -> Option<bool> {
+        let r = p.a();
+        if r >= self.helper.numparams || self.map[r].is_some() || self.unread.contains_key(&r) {
+            return None;
+        }
+        let text = match &self.args[r] {
+            Some(Arg::Const(t)) => Some(t.clone()),
+            Some(Arg::Reg(..)) => return None,
+            None => None,
+        };
+        match plain(p.op) {
+            op::JUMPIF | op::JUMPIFNOT => {
+                let truthy = match (&text, self.assumed[r]) {
+                    (Some(t), _) => !falsy(t),
+                    (None, Some(b)) => b,
+                    (None, None) => {
+                        self.need = self.need.or(Some(r));
+                        return None;
+                    }
+                };
+                Some(truthy == (p.op == op::JUMPIF))
+            }
+            op::JUMPXEQKNIL | op::JUMPXEQKB | op::JUMPXEQKN | op::JUMPXEQKS => {
+                let text = text?;
+                let k = match p.op {
+                    op::JUMPXEQKNIL => "nil".to_string(),
+                    op::JUMPXEQKB => if p.aux & 1 != 0 { "true" } else { "false" }.to_string(),
+                    _ => kexpr(self.m, self.helper, (p.aux & 0xFFFFFF) as i64),
+                };
+                Some((text == k) != (p.aux >> 31 != 0))
+            }
+            _ => None,
         }
     }
 
@@ -267,7 +346,7 @@ impl Walk<'_> {
                 let text = self.load_text(c)?;
                 self.constant(pb, text.clone())?;
                 self.write(pa, ca)?;
-                self.loaded.insert(ca, text);
+                self.loaded.insert(ca, (text, c.pc));
                 Some(())
             }
             _ => None,
@@ -555,7 +634,44 @@ impl Inlined {
 }
 
 /// Is the code of `helper` inlined at index `start` of the caller's code?
+/// A copy given constants has the tests on them folded: a parameter tested
+/// before the copy shows what it is is tried as false, then as true.
 pub fn match_call(m: &Module, caller: &Proto, id: usize, start: usize) -> Option<Inlined> {
+    let mut assumed = vec![None; m.protos[id].numparams];
+    // the parameters assumed, in the order tests needed them
+    let mut taken: Vec<usize> = Vec::new();
+    for _ in 0..16 {
+        let (found, need) = match_assuming(m, caller, id, start, &assumed);
+        if found.is_some() {
+            return found;
+        }
+        if let Some(r) = need.filter(|r| assumed[*r].is_none() && taken.len() < 3) {
+            assumed[r] = Some(false);
+            taken.push(r);
+            continue;
+        }
+        // that assumption failed: the last one false becomes true, those
+        // true already are dropped
+        loop {
+            let r = *taken.last()?;
+            if assumed[r] == Some(false) {
+                assumed[r] = Some(true);
+                break;
+            }
+            assumed[r] = None;
+            taken.pop();
+        }
+    }
+    None
+}
+
+fn match_assuming(m: &Module, caller: &Proto, id: usize, start: usize, assumed: &[Option<bool>]) -> (Option<Inlined>, Option<usize>) {
+    let mut need = None;
+    let found = match_once(m, caller, id, start, assumed, &mut need);
+    (found, need)
+}
+
+fn match_once(m: &Module, caller: &Proto, id: usize, start: usize, assumed: &[Option<bool>], need: &mut Option<usize>) -> Option<Inlined> {
     let helper = &m.protos[id];
     CHECK.with(|c| c.set(""));
     let want: Vec<&Insn> = helper.code.iter().filter(|i| !ignored(i.op)).collect();
@@ -575,7 +691,16 @@ pub fn match_call(m: &Module, caller: &Proto, id: usize, start: usize) -> Option
         upvals: vec![None; helper.nups],
         unread: HashMap::default(),
         held: HashSet::default(),
+        assumed: assumed.to_vec(),
+        need: None,
+        assigned: (0..helper.numparams)
+            .map(|r| helper.code.iter().any(|i| !ignored(i.op) && full_effects(i, helper.maxstack).1.has(r)))
+            .collect(),
     };
+    // helper code a folded test left out of the copy: up to this pc
+    let mut dead_until: Option<i32> = None;
+    // the jump over an else a folded test left out, and where it goes
+    let mut dead_jump: Option<(i32, i32)> = None;
     let mut landing: HashMap<i32, i32> = HashMap::default();
     let mut to_end: Vec<i32> = Vec::new();
     let mut copied_return: Option<(usize, usize)> = None;
@@ -595,6 +720,47 @@ pub fn match_call(m: &Module, caller: &Proto, id: usize, start: usize) -> Option
             folded -= 1;
             continue;
         }
+        if let Some(t) = dead_until {
+            if p.pc < t {
+                continue;
+            }
+            dead_until = None;
+        }
+        if dead_jump.is_some_and(|(at, _)| at == p.pc) {
+            dead_until = dead_jump.take().map(|(_, to)| to);
+            continue;
+        }
+        // a test of a constant argument: no code in the copy, one way taken.
+        // A parameter not known yet is a constant only if the copy does not
+        // test something there itself.
+        let tests = matches!(plain(p.op), op::JUMPIF | op::JUMPIFNOT | op::JUMPXEQKNIL | op::JUMPXEQKB | op::JUMPXEQKN | op::JUMPXEQKS);
+        let constant = tests
+            && p.a() < helper.numparams
+            && (matches!(walk.args[p.a()], Some(Arg::Const(_))) || walk.assumed[p.a()].is_some());
+        let tested_here = code.get(i).is_some_and(|c| plain(c.op) == plain(p.op));
+        if tests && (constant || !tested_here) {
+            let jumps = walk.folded_test(p);
+            if walk.need.is_some() {
+                *need = walk.need;
+                return refuse("a test of a parameter not known yet");
+            }
+            if let Some(jumps) = jumps {
+                let target = p.jump_target()?;
+                if jumps {
+                    dead_until = Some(target);
+                } else {
+                    // `if c then A else B end`: A ends with a jump over B
+                    let before = want.iter().take_while(|w| w.pc < target).last();
+                    if let Some(j) = before.filter(|j| plain(j.op) == op::JUMP && j.pc > p.pc) {
+                        let to = j.jump_target()?;
+                        if to > target {
+                            dead_jump = Some((j.pc, to));
+                        }
+                    }
+                }
+                continue;
+            }
+        }
         let mut c = code.get(i)?;
         REACHED.with(|r| r.set((k, want.len(), p.op, c.op)));
         landing.insert(p.pc, c.pc);
@@ -613,10 +779,11 @@ pub fn match_call(m: &Module, caller: &Proto, id: usize, start: usize) -> Option
             walk.map[p.a()] = if p.op == op::MOVE { walk.map[p.b()] } else { None };
             continue;
         }
-        // constants the caller loads for the helper to read
-        while plain(p.op) != plain(c.op) && p.op != op::RETURN && p.op != op::MOVE {
+        // constants the caller loads for the helper to read (an upvalue read
+        // may have no instruction in the copy, and reads none of them)
+        while plain(p.op) != plain(c.op) && p.op != op::RETURN && p.op != op::MOVE && p.op != op::GETUPVAL {
             let Some(text) = walk.load_text(c) else { break };
-            walk.loaded.insert(c.a(), text);
+            walk.loaded.insert(c.a(), (text, c.pc));
             walk.written.push(c.a());
             last = c.pc;
             i = skip(code, i + 1);
@@ -640,7 +807,8 @@ pub fn match_call(m: &Module, caller: &Proto, id: usize, start: usize) -> Option
                     && result.is_none_or(|r| r == c.a())
                     && walk.load_text(c).is_some_and(|t| match walk.args.get(p.a()) {
                         Some(Some(Arg::Const(k))) => *k == t,
-                        Some(None) => true,
+                        // taken for a constant of one truth, by a test before
+                        Some(None) => walk.assumed[p.a()].is_none_or(|truthy| falsy(&t) != truthy),
                         _ => false,
                     }) =>
                 {
@@ -803,7 +971,16 @@ pub fn match_call(m: &Module, caller: &Proto, id: usize, start: usize) -> Option
         return None;
     }
     let results = if result.is_some() { results.max(1) } else { 0 };
-    Some(Inlined { helper: id, upvals: walk.upvals, args: walk.args, end, last, result, results, written: walk.written })
+    // what a parameter was taken for, when nothing of the copy read it
+    let mut args = walk.args;
+    for (r, a) in args.iter_mut().enumerate() {
+        if a.is_none() {
+            if let Some(truthy) = walk.assumed[r] {
+                *a = Some(Arg::Const(if truthy { "true" } else { "false" }.to_string()));
+            }
+        }
+    }
+    Some(Inlined { helper: id, upvals: walk.upvals, args, end, last, result, results, written: walk.written })
 }
 
 /// Does this load only set up a value of the `return` that follows it?
