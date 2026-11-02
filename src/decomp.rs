@@ -3132,6 +3132,52 @@ impl<'c, 'm> Dec<'c, 'm> {
         (keyed, listed, last)
     }
 
+    /// The table made at pc, given only string-keyed stores up to `last`, then
+    /// goes into a constructor still being built, from the register Luau made
+    /// it in: it was an item written `{ ["k"] = v }` there (a variable has a
+    /// register of its own, and `{ k = v }` is made from a template).
+    fn item_of_constructor(&self, pc: i32, r: usize, last: Option<i32>) -> bool {
+        let made = self.insn(pc);
+        let code = &self.p.code;
+        let (Some(last), Some(from)) = (last, self.flow.idx(pc)) else { return false };
+        let Some(to) = self.flow.idx(last) else { return false };
+        if made.op != op::NEWTABLE || made.aux != 0 {
+            return false;
+        }
+        let mut count = 0;
+        for ins in &code[from + 1..=to] {
+            if matches!(ins.op, op::SETTABLEKS | op::SETTABLE | op::SETTABLEN) && ins.b() == r && ins.a() != r {
+                if ins.op != op::SETTABLEKS {
+                    return false;
+                }
+                count += 1;
+            }
+        }
+        if hash_class(count) != made.b() as u8 {
+            return false;
+        }
+        let building = |t: usize| t != r && self.pending.get(&t).is_some_and(|e| e.borrow().fields.is_some());
+        for (i, ins) in code.iter().enumerate().skip(to + 1) {
+            if ins.jump_target().is_some() || self.has_label(ins.pc) {
+                return false;
+            }
+            let (rd, wr, _) = self.effects_at(i);
+            if rd.has(r) {
+                let (qa, qb, qc) = (ins.a(), ins.b(), ins.c());
+                return match ins.op {
+                    op::SETLIST => building(qa) && qb <= r && (qc == 0 || r < qb + qc - 1),
+                    op::SETTABLEKS | op::SETTABLEN => qa == r && building(qb),
+                    op::SETTABLE => qa == r && qc != r && building(qb),
+                    _ => false,
+                };
+            }
+            if wr.has(r) {
+                return false;
+            }
+        }
+        false
+    }
+
     /// The registers the stores into the table made at pc read (but the table).
     fn store_operands(&self, pc: i32, r: usize) -> RegSet {
         let code = &self.p.code;
@@ -5219,6 +5265,7 @@ impl<'c, 'm> Dec<'c, 'm> {
             op::NEWTABLE | op::DUPTABLE => {
                 let table = ex("{}", 100);
                 table.borrow_mut().constructor = true;
+                table.borrow_mut().newtable = o == op::NEWTABLE;
                 table.borrow_mut().fields = Some(if o == op::DUPTABLE {
                     template_slots(m, p, d as i64)
                 } else {
@@ -5266,7 +5313,7 @@ impl<'c, 'm> Dec<'c, 'm> {
                         let t = table.borrow().render();
                         self.put(out, ind, a, ex(t, 100), false);
                     }
-                } else if o == op::NEWTABLE && fills.0 && !fills.1 {
+                } else if o == op::NEWTABLE && fills.0 && !fills.1 && !self.item_of_constructor(pc, a, fills.2) {
                     // `local t = {}` then `t.k = v`: a constructor with keys
                     // would have compiled to DUPTABLE, so these are statements
                     // (put: what waited in the register, never read, goes first)

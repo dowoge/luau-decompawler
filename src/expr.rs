@@ -61,6 +61,8 @@ pub struct X {
     pub snapshot: bool,
     /// A table constructor.
     pub constructor: bool,
+    /// A constructor Luau made with NEWTABLE, not from a template.
+    pub newtable: bool,
     /// A snapshot of a local register (not of an upvalue): printed as the
     /// local, Luau would read it where it is used.
     pub local_copy: bool,
@@ -100,6 +102,7 @@ pub fn ex(text: impl Into<String>, prec: i32) -> E {
         closure: None,
         snapshot: false,
         constructor: false,
+        newtable: false,
         local_copy: false,
         names_read: HashSet::default(),
     }))
@@ -153,12 +156,19 @@ impl X {
             None => self.text.clone(),
             Some(f) if f.is_empty() => "{}".to_string(),
             Some(f) => {
+                // Luau makes `{ a = 1 }` from a template: a table it made with
+                // NEWTABLE and gave only `a = 1` items had them as `["a"] = 1`
+                let bracket = self.newtable && f.len() <= 32 && f.iter().all(|x| record_name(x).is_some());
                 // a slot never filled stays in the template, with nothing in it
                 let shown: Vec<String> = f
                     .iter()
                     .map(|x| match x.strip_prefix(SLOT) {
                         Some(k) => format!("{k} = nil"),
                         None if x == ITEM => "nil".to_string(),
+                        None if bracket => {
+                            let n = record_name(x).unwrap_or(0);
+                            format!("[\"{}\"]{}", &x[..n], &x[n..])
+                        }
                         None => x.clone(),
                     })
                     .collect();
@@ -166,6 +176,13 @@ impl X {
             }
         }
     }
+}
+
+/// `name = value`, a constructor's record item: the length of its name.
+fn record_name(x: &str) -> Option<usize> {
+    let n = x.bytes().take_while(|b| is_ident_byte(*b)).count();
+    let starts = x.as_bytes().first().is_some_and(|b| is_ident_start(*b));
+    (starts && x[n..].starts_with(" = ")).then_some(n)
 }
 
 pub fn wrap(e: &E, prec: i32) -> String {
