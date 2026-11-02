@@ -1538,7 +1538,7 @@ impl<'c, 'm> Dec<'c, 'm> {
                 let joins = self.in_region && self.reaches_join_unread(call.last, t);
                 if !joins && (self.state_printed_first(call.end, t) || !self.read_once_from(call.end, t)) {
                     let e = self.get(t);
-                    self.flush_impure(out, ind, t);
+                    self.flush_impure_for(out, ind, t, Some(&e));
                     self.assign(out, ind, t, &e);
                 }
             }
@@ -1957,7 +1957,7 @@ impl<'c, 'm> Dec<'c, 'm> {
             self.set_def_key(&e, r, k);
             self.pset(r, e);
         } else {
-            self.flush_impure(out, ind, r);
+            self.flush_impure_for(out, ind, r, Some(&e));
             self.assign(out, ind, r, &e);
         }
     }
@@ -1966,9 +1966,17 @@ impl<'c, 'm> Dec<'c, 'm> {
     /// could have side effects (calls, field reads) go out first, so the
     /// order things happen in is kept.
     fn flush_impure(&mut self, out: &mut Vec<String>, ind: usize, r: usize) {
+        self.flush_impure_for(out, ind, r, None);
+    }
+
+    /// flush_impure for the value about to be written to r, taken out of
+    /// pending already: when it has effects, a constructor below it that made
+    /// calls goes before it too.
+    fn flush_impure_for(&mut self, out: &mut Vec<String>, ind: usize, r: usize, value: Option<&E>) {
         if self.pending.is_empty() {
             return;
         }
+        let effects = value.is_some_and(|e| !e.borrow().pure_);
         let goes = |q: usize, x: &X| q != r && !x.pure_ && x.fields.is_none() && !x.method && x.text != "<self>" && !x.multret;
         let keys: Vec<usize> = self.pending.keys().copied().collect();
         for q in keys {
@@ -1977,10 +1985,10 @@ impl<'c, 'm> Dec<'c, 'm> {
                 let x = v.borrow();
                 goes(q, &x)
                     // a constructor that made calls already: before the values
-                    // with effects made after it
+                    // with effects made after it, this one included
                     || q != r
                         && x.fields.as_ref().is_some_and(|f| f.iter().any(|t| t.contains('(')))
-                        && self.pending.range(q + 1..).any(|(p, w)| goes(*p, &w.borrow()))
+                        && (effects && r > q || self.pending.range(q + 1..).any(|(p, w)| goes(*p, &w.borrow())))
             };
             if go {
                 let e = self.get(q);
@@ -4061,7 +4069,7 @@ impl<'c, 'm> Dec<'c, 'm> {
             if let Some(r) = self.joined_value.take() {
                 if self.pending.contains_key(&r) && !self.read_once_from(f, r) {
                     let e = self.get(r);
-                    self.flush_impure(scratch, 0, r);
+                    self.flush_impure_for(scratch, 0, r, Some(&e));
                     self.assign(scratch, 0, r, &e);
                 }
             }
@@ -4358,7 +4366,7 @@ impl<'c, 'm> Dec<'c, 'm> {
             if let Some(r) = self.joined_value.take() {
                 if self.pending.contains_key(&r) && !self.read_once_from(f, r) {
                     let e = self.get(r);
-                    self.flush_impure(out, ind, r);
+                    self.flush_impure_for(out, ind, r, Some(&e));
                     self.assign(out, ind, r, &e);
                 }
             }
@@ -4777,7 +4785,7 @@ impl<'c, 'm> Dec<'c, 'm> {
                 // value has to stay where it is, under its own name
                 if self.pending.contains_key(&b) && !self.shared(pc, b) && self.live_after(pc, b) && b != a {
                     let e = self.get(b);
-                    self.flush_impure(out, ind, b);
+                    self.flush_impure_for(out, ind, b, Some(&e));
                     self.assign(out, ind, b, &e);
                 }
                 let shared = !self.pending.contains_key(&b) && self.shared(pc, b);
