@@ -4615,7 +4615,22 @@ impl<'c, 'm> Dec<'c, 'm> {
             nodes.push(Node { start, c: cond, t: taken, f: self.past_dead(j + ji.n) });
         }
         let last = blocks[blocks.len() - 1].1;
-        let region_end = self.past_dead(last + self.insn(last).n);
+        let mut region_end = self.past_dead(last + self.insn(last).n);
+        // `x or (b and c)`: the last test jumps into the then-part when it
+        // holds, and falls into a jump past that part when it does not.
+        // (`if a or b then else X end` compiles alike, and is kept as
+        // written unless that needs a flag.)
+        if self.relaxed && self.valid(region_end) && !self.has_label(region_end) && self.insn(region_end).op == op::JUMP {
+            if let Some(to) = self.insn(region_end).jump_target().filter(|to| *to > region_end && *to <= end) {
+                let past = region_end + self.insn(region_end).n;
+                if nodes.last().is_some_and(|n| n.t == past) {
+                    if let Some(n) = nodes.last_mut() {
+                        n.f = to;
+                    }
+                    region_end = past;
+                }
+            }
+        }
         let mut preds: HashMap<i32, i32> = HashMap::default();
         for n in &nodes {
             *preds.entry(n.t).or_insert(0) += 1;
