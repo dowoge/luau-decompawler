@@ -338,12 +338,50 @@ pub fn negate(e: &E) -> E {
         }
         return ex(inner, 100);
     }
-    for (a, b) in [(" == ", " ~= "), (" ~= ", " == ")] {
-        if t.contains(a) && t.bytes().filter(|c| *c == b' ').count() == 2 {
-            return ex(t.replace(a, b), 3);
+    // `x == y` as a whole, maybe in parentheses: not one inside a call, an
+    // index or a string (`not f(x == nil)` is no `f(x ~= nil)`)
+    if t.bytes().filter(|c| *c == b' ').count() == 2 {
+        let whole = t.len() >= 2 && t.starts_with('(') && t.ends_with(')') && balanced_parens(&t[1..t.len() - 1]);
+        let core = if whole { &t[1..t.len() - 1] } else { &t[..] };
+        for (a, b) in [(" == ", " ~= "), (" ~= ", " == ")] {
+            if let Some(at) = outside_brackets(core, a) {
+                let flipped = format!("{}{b}{}", &core[..at], &core[at + a.len()..]);
+                return ex(if whole { format!("({flipped})") } else { flipped }, 3);
+            }
         }
     }
     ex(format!("not {}", wrap(e, 8)), 8)
+}
+
+/// Where `op` stands in t outside brackets and strings, if there it does
+/// exactly once.
+fn outside_brackets(t: &str, op: &str) -> Option<usize> {
+    let b = t.as_bytes();
+    let (mut depth, mut quote, mut found) = (0i32, 0u8, None);
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if quote != 0 {
+            if c == b'\\' {
+                i += 1;
+            } else if c == quote {
+                quote = 0;
+            }
+        } else if matches!(c, b'"' | b'\'' | b'`') {
+            quote = c;
+        } else if matches!(c, b'(' | b'[' | b'{') {
+            depth += 1;
+        } else if matches!(c, b')' | b']' | b'}') {
+            depth -= 1;
+        } else if depth == 0 && t[i..].starts_with(op) {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(i);
+        }
+        i += 1;
+    }
+    found
 }
 
 /// `if c then a else b` when a or b repeats the other's last part, which is
@@ -635,6 +673,15 @@ mod tests {
         let either = mk_logic(Logic::Or, &a, &b);
         let back = negate(&not_of(&either));
         assert_eq!(mk_logic(Logic::And, &back, &ex_pure("c")).borrow().text, "(a or b) and c");
+    }
+
+    #[test]
+    fn only_a_whole_equality_flips() {
+        assert_eq!(negate(&ex("f(x == nil)", 100)).borrow().text, "not f(x == nil)");
+        assert_eq!(negate(&ex("t[a == b]", 100)).borrow().text, "not t[a == b]");
+        assert_eq!(negate(&ex("\"a == b\"", 100)).borrow().text, "not \"a == b\"");
+        assert_eq!(negate(&ex("f(a) == b", 3)).borrow().text, "f(a) ~= b");
+        assert_eq!(negate(&ex("(t.k ~= nil)", 0)).borrow().text, "(t.k == nil)");
     }
 
     #[test]
