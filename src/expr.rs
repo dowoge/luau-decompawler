@@ -144,6 +144,9 @@ pub fn ex_pure(text: impl Into<String>) -> E {
 /// the table's layout.
 pub const SLOT: char = '\u{1}';
 
+/// A list item no store has given its value yet: nil in its place.
+pub const ITEM: &str = "\u{2}";
+
 impl X {
     pub fn render(&self) -> String {
         match &self.fields {
@@ -151,8 +154,14 @@ impl X {
             Some(f) if f.is_empty() => "{}".to_string(),
             Some(f) => {
                 // a slot never filled stays in the template, with nothing in it
-                let shown: Vec<String> =
-                    f.iter().map(|x| x.strip_prefix(SLOT).map_or_else(|| x.clone(), |k| format!("{k} = nil"))).collect();
+                let shown: Vec<String> = f
+                    .iter()
+                    .map(|x| match x.strip_prefix(SLOT) {
+                        Some(k) => format!("{k} = nil"),
+                        None if x == ITEM => "nil".to_string(),
+                        None => x.clone(),
+                    })
+                    .collect();
                 format!("{{{}}}", shown.join(", "))
             }
         }

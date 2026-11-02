@@ -1,5 +1,2 @@
 # Programs that do not behave yet, and why. A listed one that behaves
 # fails the check until it is taken off.
-fields_folded_into_index_key_constructor.luau  stores after a constructor with [n] keys and list items are folded in: its hash part grows
-index_keys_then_named_fields.luau              {[1] = nil, [2] = ...} printed as {} and stores: later field stores count into its size
-table_shape_after_folded_stores.luau           a copied-in helper with constant arguments loses folded stores: the plain stores left give a smaller array part

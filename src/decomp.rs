@@ -2923,6 +2923,7 @@ impl<'c, 'm> Dec<'c, 'm> {
         let made = self.insn(pc);
         // the stores into r up to its first other use, as table_fills sees them
         let mut stores: Vec<Insn> = Vec::new();
+        let mut flushed: Option<i32> = None; // the list's last flush so far
         let mut left = self.template_holes(pc);
         let mut i = self.flow.idx(pc)? + 1;
         while i < code.len() {
@@ -2931,7 +2932,7 @@ impl<'c, 'm> Dec<'c, 'm> {
                 stores.push(ins);
                 left = left.saturating_sub(1);
             } else if ins.op == op::SETLIST && ins.a() == r {
-                return None; // a list: sized by its items, as it is printed
+                flushed = Some(ins.pc);
             } else {
                 let (rd, wr, barrier) = self.effects_at(i);
                 let joined = self.has_label(ins.pc) && self.first_jump[ins.pc as usize] <= pc;
@@ -2942,6 +2943,29 @@ impl<'c, 'm> Dec<'c, 'm> {
             i += 1;
         }
         let name_of = |s: &Insn| kstr(self.m, p, s.aux as usize).filter(|k| is_ident(k) && !is_keyword(k));
+        if let Some(last) = flushed {
+            // a list: sized by its items, as it is printed. Keyed stores after
+            // its last flush join while the hash part counts them
+            let after: Vec<&Insn> = stores.iter().filter(|s| s.pc > last).collect();
+            if after.is_empty() || made.op != op::NEWTABLE {
+                return None;
+            }
+            let want = made.b() as u8;
+            let total = after.len();
+            let mut count = stores.len() - total;
+            let (mut end, mut taken) = (last, 0);
+            for s in after {
+                if hash_class(count) == want {
+                    break;
+                }
+                count += 1;
+                taken += 1;
+                end = s.pc;
+            }
+            // all of them its own: nothing ends it early (an end would make
+            // it a variable)
+            return (taken < total).then_some(end);
+        }
         if made.op == op::DUPTABLE {
             let K::TableK(keys) = &p.k[kindex(p, made.d() as i64)] else { return None };
             let mut last = pc;
@@ -2992,6 +3016,83 @@ impl<'c, 'm> Dec<'c, 'm> {
             }
         }
         fits
+    }
+
+    /// `{[1] = a, [2] = b}`: a NEWTABLE with an array part and no hash part,
+    /// filled by SETTABLEN inside that part before anything else uses it. The
+    /// last of those stores, which the constructor takes, and whether as list
+    /// items. Luau sizes `[n]` keys as an array only while they count 1, 2, 3
+    /// from the first, and `{}` by the indexed stores after it, so with other
+    /// keys, when `{}` and statements would not make this size either, they
+    /// are list items with nil between: `{a, nil, c}` (stores a copied-in
+    /// helper with constant arguments left gaps in).
+    fn index_keys_end(&self, pc: i32, r: usize) -> Option<(i32, bool)> {
+        let made = self.insn(pc);
+        let array = made.aux as usize;
+        if made.op != op::NEWTABLE || array == 0 || array > 256 || made.b() != 0 {
+            return None;
+        }
+        let code = &self.p.code;
+        let start = self.flow.idx(pc)? + 1;
+        let mut i = start;
+        let mut last = None;
+        let mut keys: Vec<usize> = Vec::new();
+        let mut low = usize::MAX; // the lowest register written since the last store
+        while i < code.len() {
+            let ins = code[i];
+            // straight on: Luau sizes `{}` for the indexed stores after it too,
+            // in branches as well, and those are statements
+            if ins.jump_target().is_some() || self.has_label(ins.pc) {
+                break;
+            }
+            if ins.op == op::SETTABLEN && ins.b() == r && ins.a() != r {
+                if ins.c() as usize >= array {
+                    return None; // past the array part: a statement's
+                }
+                // an item's value is made from its own register up; a write
+                // below it was a local, and the store a statement
+                if low < ins.a() {
+                    break;
+                }
+                last = Some(ins.pc);
+                keys.push(ins.c() as usize + 1);
+                low = usize::MAX;
+            } else {
+                let (rd, wr, barrier) = self.effects_at(i);
+                if let Some(w) = (0..self.p.maxstack).find(|x| wr.has(*x)) {
+                    low = low.min(w);
+                }
+                if rd.has(r) || wr.has(r) || barrier {
+                    break;
+                }
+            }
+            i += 1;
+        }
+        let last = last?;
+        if keys.len() == array && keys.iter().enumerate().all(|(n, k)| *k == n + 1) {
+            return Some((last, false));
+        }
+        if !keys.windows(2).all(|w| w[0] < w[1]) {
+            return None; // a key stored twice: no list says that
+        }
+        // as `{}` and statements, what size Luau gives it: one more for each
+        // store of the next index, until the register holds something else
+        let mut count = 0;
+        for (k, ins) in code.iter().enumerate().skip(start) {
+            if ins.op == op::SETTABLEN && ins.b() == r && ins.a() != r {
+                if ins.c() as usize == count {
+                    count += 1;
+                }
+                continue;
+            }
+            if ins.op == op::SETTABLE && ins.b() == r {
+                return None; // `t[i]` in a loop may size it by its bound
+            }
+            if self.effects_at(k).1.has(r) {
+                break;
+            }
+        }
+        (count != array).then_some((last, true))
     }
 
     /// Keys DUPTABLE's template has no value for: the constructor's own, so
@@ -4634,8 +4735,19 @@ impl<'c, 'm> Dec<'c, 'm> {
                     let table = self.pending[&b].clone();
                     let val = self.get(a);
                     self.pset(b, table.clone());
-                    let f = format!("[{}] = {}", c + 1, val.borrow().text);
-                    self.add_fields(&table, [f]);
+                    let slots = table.borrow().fields.as_ref().map_or(0, |fs| {
+                        if fs.get(c).is_some_and(|x| x == ITEM) { fs.len() } else { 0 }
+                    });
+                    if slots > 0 {
+                        // a list item; the last one is all of a call unless cut
+                        let v = val.borrow();
+                        let item = if c + 1 == slots && v.one { format!("({})", v.text) } else { v.text.clone() };
+                        drop(v);
+                        self.fill_slot(&table, c, item);
+                    } else {
+                        let f = format!("[{}] = {}", c + 1, val.borrow().text);
+                        self.add_fields(&table, [f]);
+                    }
                     self.finish_table(out, ind, b, &table, pc);
                 } else {
                     self.flush(out, ind, &[a, b]);
@@ -4805,7 +4917,16 @@ impl<'c, 'm> Dec<'c, 'm> {
                     self.assign(out, ind, q, &e);
                 }
                 let fills = self.table_fills(pc, a);
-                let limit = self.constructor_limit(pc, a);
+                let mut limit = self.constructor_limit(pc, a);
+                if limit.is_none() {
+                    if let Some((last, list)) = self.index_keys_end(pc, a) {
+                        if list {
+                            // each slot of its array part, a nil until stored
+                            table.borrow_mut().fields = Some(vec![ITEM.to_string(); self.insn(pc).aux as usize]);
+                        }
+                        limit = Some(last);
+                    }
+                }
                 if let Some(last) = limit {
                     // the stores up to `last` were its constructor's, as its
                     // size shows; the rest are statements
