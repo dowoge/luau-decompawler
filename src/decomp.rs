@@ -40,8 +40,11 @@ fn sp(n: usize) -> &'static str {
     &S.get_or_init(|| " ".repeat(1 << 16))[..n]
 }
 
-/// LUAU_WHY=all: every refused helper match, as it happens.
-static WHY_ALL: OnceLock<bool> = OnceLock::new();
+/// LUAU_WHY=all: every refused helper match and value region, as it happens.
+fn why_all() -> bool {
+    static WHY_ALL: OnceLock<bool> = OnceLock::new();
+    *WHY_ALL.get_or_init(|| std::env::var("LUAU_WHY").is_ok_and(|v| v == "all"))
+}
 
 /// `--info`: a comment above each function on what the bytecode holds for it.
 pub static INFO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1525,7 +1528,7 @@ impl<'c, 'm> Dec<'c, 'm> {
     fn note_refusal(&self, helper: usize, why: (usize, String)) {
         if self.ctx.why {
             let name = self.m.protos[helper].name.as_deref().unwrap_or("(anon)");
-            if WHY_ALL.get_or_init(|| std::env::var("LUAU_WHY").is_ok_and(|v| v == "all")).to_owned() {
+            if why_all() {
                 let within = self.p.name.as_deref().unwrap_or("(anon)");
                 eprintln!("REFUSE\t{within}\t{}\t{name}\t{}\t{}", self.cur_pc, why.0, why.1);
             }
@@ -2000,6 +2003,11 @@ impl<'c, 'm> Dec<'c, 'm> {
         flow.add_range(a, if c == 0 { a + 1 } else { a + c - 1 });
         let mut from = self.flow.idx(pc).expect("no instruction at pc") + 1;
         if self.in_region {
+            // read with the call's result before the next jump: one
+            // expression, a test inside the value (`f() ~= g()`)
+            if self.flows_on(from, flow, q) {
+                return true;
+            }
             // a call inside a branch of a value: what matters is who reads
             // that value, after the branches meet
             let Some(j) = self.region_join.and_then(|j| self.flow.idx(j)) else { return false };
@@ -4098,8 +4106,12 @@ impl<'c, 'm> Dec<'c, 'm> {
     /// Inside a value region: does the value written to r at pc go straight
     /// to the region's join, unread on the way?
     fn reaches_join_unread(&self, pc: i32, r: usize) -> bool {
+        self.unread_to_join(pc + self.insn(pc).n, r)
+    }
+
+    /// The same from q on, q included.
+    fn unread_to_join(&self, mut q: i32, r: usize) -> bool {
         let Some(j) = self.region_join else { return false };
-        let mut q = pc + self.insn(pc).n;
         let mut steps = 0;
         while steps < 64 {
             steps += 1;
@@ -4198,7 +4210,7 @@ impl<'c, 'm> Dec<'c, 'm> {
             self.region_head = None;
             let got = self.walk_value(pc, j, &before);
             self.in_region = false;
-            let tell = self.ctx.why && WHY_ALL.get().copied().unwrap_or(false);
+            let tell = self.ctx.why && why_all();
             let within = self.p.name.as_deref().unwrap_or("(anon)").to_string();
             let why = |reason: &str, line: &str| {
                 if tell {
@@ -4334,6 +4346,15 @@ impl<'c, 'm> Dec<'c, 'm> {
             let ins = self.insn(q);
             let a = ins.a();
             if is_cond_jump(ins.op) {
+                // tests whose paths meet again before the join: a value of
+                // their own, read on the way (`f(if c then x else y) or z`)
+                let inner = self.flow.idx(q).and_then(|i| self.closed_region(i));
+                if let Some(j2) = inner.filter(|j2| *j2 < j && *j2 > q + ins.n) {
+                    if self.nested_value(q, j2) {
+                        q = j2;
+                        continue;
+                    }
+                }
                 let tested = if matches!(ins.op, op::JUMPIF | op::JUMPIFNOT) {
                     self.pending.get(&a).cloned()
                 } else {
@@ -4426,13 +4447,54 @@ impl<'c, 'm> Dec<'c, 'm> {
             let wr = full_effects(&ins, self.p.maxstack).1;
             let q2 = self.stmt(&mut scratch, 0, q, j);
             if !scratch.is_empty() {
-                let line = scratch.swap_remove(0);
+                let line = format!("{} @{q}", scratch.swap_remove(0));
                 return Err(RegionFail { why: "code on the way is a statement", line });
             }
             for w in 0..wr.0.len() {
                 self.region_written.0[w] |= wr.0[w];
             }
             q = q2;
+        }
+    }
+
+    /// Inside a value region, the tests at q and their code up to j2, where
+    /// all their paths meet: one value, when every path makes it in the same
+    /// register and what follows reads it once (or takes it to the region's
+    /// join). It waits in its register, and true is returned.
+    fn nested_value(&mut self, q: i32, j2: i32) -> bool {
+        let saved = self.mark();
+        let (outer_join, outer_written) = (self.region_join, self.region_written);
+        let before: Vec<(usize, E)> = self.pending.iter().map(|(r, e)| (*r, e.clone())).collect();
+        self.region_join = Some(j2);
+        self.region_written = RegSet::EMPTY;
+        let got = self.walk_value(q, j2, &before);
+        let inner = self.region_written;
+        self.region_join = outer_join;
+        self.region_written = outer_written;
+        for w in 0..inner.0.len() {
+            self.region_written.0[w] |= inner.0[w];
+        }
+        let fits = got.ok().filter(|(r, _)| {
+            let r = *r;
+            let others = (0..self.p.maxstack)
+                .any(|x| x != r && inner.has(x) && !before.iter().any(|b| b.0 == x) && self.live_at(j2, x));
+            // read by the test at j2 (`(if c then x else y) or z`): the
+            // walk on folds it, as it would a value made by one instruction
+            let tested = {
+                let t = self.insn(j2);
+                matches!(t.op, op::JUMPIF | op::JUMPIFNOT) && t.a() == r
+            };
+            !others && (tested || self.read_once_from(j2, r) || self.unread_to_join(j2, r))
+        });
+        match fits {
+            Some((r, e)) => {
+                self.pset(r, e);
+                true
+            }
+            None => {
+                self.rollback(saved);
+                false
+            }
         }
     }
 
