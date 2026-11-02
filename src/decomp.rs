@@ -3299,6 +3299,9 @@ impl<'c, 'm> Dec<'c, 'm> {
         self.loops.clear();
         self.exits.clear();
         self.consumed.iter_mut().for_each(|c| *c = 0);
+        // a value read by a helper's copy was read once while the copy was a
+        // call; this form never puts one back
+        self.once_cache.clear();
         self.flat = true;
         self.base_indent = -1; // no renaming or hoisting: every name is fixed
         // every variable is declared up front (blocks are siblings, so no
