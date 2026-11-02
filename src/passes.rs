@@ -641,6 +641,12 @@ fn split_params(s: &str) -> Vec<String> {
     s.split(',').map(strip).filter(|x| !x.is_empty()).map(str::to_string).collect()
 }
 
+/// How many functions hold the one whose header is at line fi, itself
+/// included: the depth its generated names carry (`v3_2` two deep).
+fn nesting_depth(funcs: &[(i64, usize, Vec<String>)], fi: usize) -> usize {
+    funcs.iter().filter(|(h, e, _)| *h >= 0 && (*h as usize) <= fi && fi < *e).count()
+}
+
 /// (header index, end index, params) of every function in the text,
 /// including the whole file as the outermost one (header -1).
 fn functions(lines: &[String]) -> Vec<(i64, usize, Vec<String>)> {
@@ -3418,7 +3424,7 @@ fn rename_variables(lines: Vec<String>) -> Vec<String> {
         }
         // generated names carry their function's depth: `v3` at file level,
         // `v3_1`/`arg1_1` one function deep, and so on
-        let depth = if fi < 0 { 0 } else { indent_of(&out[fi as usize]) / 4 + 1 };
+        let depth = if fi < 0 { 0 } else { nesting_depth(&funcs, fi as usize) };
         let mut own: Vec<String> = own
             .into_iter()
             .filter(|n| {
@@ -4995,7 +5001,7 @@ fn name_pass(out: &mut Vec<String>, index: &mut WordIndex, extra: &Extra) -> boo
         let top = *fi < 0;
         let fi = (*fi).max(0) as usize;
         let (lo, hi) = if top { (0, out.len()) } else { (fi + 1, (*fend).min(out.len())) };
-        let depth = if top { 0 } else { indent_of(&out[fi]) / 4 + 1 };
+        let depth = if top { 0 } else { nesting_depth(&funcs, fi) };
         let header = if top { String::new() } else { out[fi].clone() };
         let fname = function_name_of(&header).map(str::to_string);
         let scope_end = (hi + 1).min(out.len());
