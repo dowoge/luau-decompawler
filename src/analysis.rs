@@ -643,19 +643,39 @@ impl Flow {
         // a register a closure captures by reference is one variable shared
         // with the closure from the capture until its upvalue is closed
         // (CLOSEUPVALS at or below it, or the function's end); after that the
-        // register is free for unrelated values
+        // register is free for unrelated values. Every write that can run in
+        // between is to that variable: in a loop, the ones before the capture
+        // too, which the next pass runs after it
         let mut byref_groups: Vec<u32> = Vec::new();
-        for (c, r, mut group) in captures {
-            let first = closes.partition_point(|x| *x <= c);
-            let close = closes[first..].iter().copied().find(|x| code[*x].a() <= r).unwrap_or(n);
+        let mut visited = vec![usize::MAX; n];
+        let mut pending: Vec<usize> = Vec::new();
+        for (k, (c, r, mut group)) in captures.into_iter().enumerate() {
             if r < max_reg {
-                for id in &reg_defs[r] {
-                    if *id < first_entry {
-                        let i = def_idx[*id as usize] as usize;
-                        if i > c && i < close {
-                            group.push(*id);
-                        }
+                let (s, m) = succ_of(c);
+                pending.extend_from_slice(&s[..m]);
+                while let Some(i) = pending.pop() {
+                    if visited[i] == k {
+                        continue;
                     }
+                    visited[i] = k;
+                    if code[i].op == op::CLOSEUPVALS && code[i].a() <= r {
+                        continue;
+                    }
+                    group.extend(def_list[def_at[i] as usize..def_at[i + 1] as usize].iter().filter(|d| d.0 as usize == r).map(|d| d.1));
+                    let (s, m) = succ_of(i);
+                    pending.extend_from_slice(&s[..m]);
+                }
+                // and what comes into that stretch from outside it, even if only
+                // to be replaced: a loop's cell is declared before the loop
+                let (lo, hi) = (reg_base[r], reg_base[r + 1]);
+                for b in 0..nb {
+                    let entered = visited[starts[b]] == k
+                        && (b == 0 || preds[b].iter().any(|q| visited[bend(*q as usize) - 1] != k));
+                    if !entered {
+                        continue;
+                    }
+                    let live = &bits_in[b * words..(b + 1) * words];
+                    group.extend((lo..hi).filter(|bit| live[bit / 64] >> (bit % 64) & 1 != 0).map(|bit| reg_defs[r][bit - lo]));
                 }
             }
             if group.is_empty() {
