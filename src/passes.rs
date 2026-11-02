@@ -4229,9 +4229,12 @@ fn kind_name(name: &str, out: &[String], at: &[u32], defs: &[usize]) -> Option<S
             return Some(if steps.iter().all(|s| *s == "1") { "count" } else { "total" }.to_string());
         }
     }
-    if defs.len() == 1 {
-        let st = strip(&out[defs[0]]);
-        if let Some((_, rhs)) = st.split_once(" = ") {
+    // what it is set to, when every place that sets it agrees (the arms of
+    // an if each set it once)
+    let kind_of = |j: usize| -> Option<&'static str> {
+        let st = strip(&out[j]);
+        let (_, rhs) = st.split_once(" = ")?;
+        {
             let r = rhs.trim();
             let kind = if r.starts_with('{') {
                 Some("t")
@@ -4250,9 +4253,12 @@ fn kind_name(name: &str, out: &[String], at: &[u32], defs: &[usize]) -> Option<S
             } else {
                 None
             };
-            if let Some(k) = kind {
-                return Some(k.to_string());
-            }
+            kind
+        }
+    };
+    if let Some((first, rest)) = defs.split_first() {
+        if let Some(k) = kind_of(*first).filter(|k| rest.iter().all(|j| kind_of(*j) == Some(*k))) {
+            return Some(k.to_string());
         }
     }
     // iterated: a list when its keys go unused or count, else a table
@@ -5067,15 +5073,37 @@ fn unused_params(out: &mut [String]) {
 pub fn more_names(lines: Vec<String>, extra: &Extra) -> Vec<String> {
     let mut out = lines;
     let mut index = WordIndex::new(&out);
-    // the same pass over the same text would find nothing new
-    if name_pass(&mut out, &mut index, extra) {
-        name_pass(&mut out, &mut index, extra);
+    // what the code says first, again when that found something (a name
+    // given here can name what a later function passes); the kind of value
+    // (`n`, `t`) only then, for what is still unnamed: given early it would
+    // stand in the way of a name found later
+    if name_pass(&mut out, &mut index, extra, false) {
+        name_pass(&mut out, &mut index, extra, false);
     }
+    name_pass(&mut out, &mut index, extra, true);
     out
 }
 
-/// One look at every function. Says whether anything was renamed.
-fn name_pass(out: &mut Vec<String>, index: &mut WordIndex, extra: &Extra) -> bool {
+/// What a parameter annotated with a host type is, by that type.
+fn type_noun(t: &str) -> Option<String> {
+    let t = t.trim().trim_end_matches('?');
+    Some(match t {
+        "CFrame" => "cframe".to_string(),
+        "Vector3" => "vector".to_string(),
+        "Vector2" => "vector2".to_string(),
+        "Color3" => "color".to_string(),
+        "buffer" => "buf".to_string(),
+        "number" | "string" | "boolean" | "thread" => return None,
+        _ if t.bytes().all(|c| c.is_ascii_alphanumeric()) && t.as_bytes().first().is_some_and(u8::is_ascii_uppercase) => {
+            lower_first(t)
+        }
+        _ => return None,
+    })
+}
+
+/// One look at every function. Says whether anything was renamed. Without
+/// `fallback`, a name only from what the code says about the value.
+fn name_pass(out: &mut Vec<String>, index: &mut WordIndex, extra: &Extra, fallback: bool) -> bool {
     let mut renamed = false;
     let mut funcs = functions(out);
     funcs.sort_by_key(|f| f.0);
@@ -5131,6 +5159,8 @@ fn name_pass(out: &mut Vec<String>, index: &mut WordIndex, extra: &Extra) -> boo
         let depth = if top { 0 } else { nesting_depth(&funcs, fi) };
         let header = if top { String::new() } else { out[fi].clone() };
         let fname = function_name_of(&header).map(str::to_string);
+        // the parameters as written, annotations included
+        let typed: Vec<String> = if top { Vec::new() } else { func_open(&header).map(split_params_typed).unwrap_or_default() };
         let scope_end = (hi + 1).min(out.len());
         let in_scope = |out: &[String], index: &WordIndex, word: &str| {
             index.within(word, fi, scope_end).iter().any(|j| has_var_word(&out[*j as usize], word))
@@ -5203,9 +5233,17 @@ fn name_pass(out: &mut Vec<String>, index: &mut WordIndex, extra: &Extra) -> boo
                 if let Some((b, count)) = best {
                     if count * 2 >= nsites {
                         let v = if first_upper(b) && !str_isupper(b) { lower_first(b) } else { b.clone() };
-                        match cands.iter_mut().find(|c| c.0 == *pname) {
-                            Some(c) => c.1 = v,
-                            None => cands.push((pname.clone(), v)),
+                        // taken in the function already: the same name with
+                        // a number; none free leaves the other evidence to it
+                        let sep = if v.ends_with(|c: char| c.is_ascii_digit()) { "_" } else { "" };
+                        let free = std::iter::once(v.clone())
+                            .chain((2..=20).map(|k| format!("{v}{sep}{k}")))
+                            .find(|c| !in_scope(&out, &index, c) && !cands.iter().any(|x| x.1 == *c));
+                        if let Some(v) = free {
+                            match cands.iter_mut().find(|c| c.0 == *pname) {
+                                Some(c) => c.1 = v,
+                                None => cands.push((pname.clone(), v)),
+                            }
                         }
                     }
                 }
@@ -5314,9 +5352,26 @@ fn name_pass(out: &mut Vec<String>, index: &mut WordIndex, extra: &Extra) -> boo
             if new.is_none() {
                 new = instance_name(name, &out, at);
             }
-            if new.is_none() {
-                // last: the kind of value, `n2` if `n` is taken
-                if let Some(base) = kind_name(name, &out, at, &defs) {
+            // a parameter's annotation: what a host type is; else, last of
+            // all, the plain type's kind
+            let annotated = params.iter().position(|p| p == name).and_then(|i| typed.get(i)).and_then(|p| p.split_once(':')).map(|(_, t)| t.trim().trim_end_matches('?').to_string());
+            if new.is_none() && fallback {
+                new = annotated.as_deref().and_then(type_noun);
+            }
+            if new.is_none() && fallback {
+                // last: the kind of value, `n2` if `n` is taken; for an
+                // annotated parameter one its type allows, else the type's own
+                let (typed_kind, fits): (Option<&str>, &[&str]) = match annotated.as_deref() {
+                    Some("number") => (Some("n"), &["n", "count", "total", "value"]),
+                    Some("string") => (Some("s"), &["s", "value"]),
+                    Some("boolean") => (Some("flag"), &["flag", "ok", "value"]),
+                    _ => (None, &[]),
+                };
+                let kind = match (kind_name(name, &out, at, &defs), typed_kind) {
+                    (Some(k), Some(t)) => Some(if fits.contains(&k.as_str()) { k } else { t.to_string() }),
+                    (k, t) => k.or_else(|| t.map(str::to_string)),
+                };
+                if let Some(base) = kind {
                     let taken = |c: &str| {
                         in_scope(&out, &index, c) || touched.iter().any(|t| t == c) || cands.iter().any(|x| x.1 == c)
                     };
