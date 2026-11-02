@@ -2991,6 +2991,14 @@ fn derive_name(rhs: &str) -> Option<String> {
                 return Some(lower_first(&rhs[..e]));
             }
         }
+        // `FrameClock()`: a function spelled as a class makes one
+        if rhs[e..].starts_with('(')
+            && matching_paren(b, e) == Some(b.len() - 1)
+            && !is_skip_type(&rhs[..e])
+            && !str_isupper(&rhs[..e])
+        {
+            return Some(lower_first(&rhs[..e]));
+        }
     }
     // ^.*[.:]Get([A-Z][A-Za-z0-9_]*)\([^()]*\)$
     if let Some(s) = rhs.strip_suffix(')') {
@@ -4257,6 +4265,20 @@ fn stored_field<'a>(line: &'a str, tail: &str) -> Option<&'a str> {
     }
 }
 
+/// `local a, b = f(...)` with f ending in `return set, key`: a is `set`.
+fn returned_name(name: &str, def: &str, returns: &HashMap<String, usize>, out: &[String]) -> Option<String> {
+    let (lhs, rhs) = def.strip_prefix("local ").unwrap_or(def).split_once(" = ")?;
+    let at = lhs.split(", ").position(|n| n == name)?;
+    let open = rhs.find('(')?;
+    if !rhs.ends_with(')') || matching_paren(rhs.as_bytes(), open) != Some(rhs.len() - 1) {
+        return None;
+    }
+    let callee = rhs[..open].replace(':', ".");
+    let list = strip(&out[*returns.get(&callee)?]).strip_prefix("return ")?;
+    let n = list.split(", ").nth(at)?;
+    (is_token(n) && !is_generated(n) && !pass_keyword(n)).then(|| n.to_string())
+}
+
 /// `xs[k] = name` or `table.insert(xs, name)`: name is one of xs.
 fn stored_element(line: &str, name: &str) -> Option<String> {
     let s = strip(line);
@@ -4669,11 +4691,19 @@ fn name_pass(out: &mut Vec<String>, index: &mut WordIndex, extra: &Extra) -> boo
     let no_sites: Vec<Vec<String>> = Vec::new();
     // what each function defined here calls its parameters, as calls name it
     let mut signatures: HashMap<String, Vec<String>> = HashMap::default();
-    for (fi, _, params) in &funcs {
+    // and the line where it returns at its end (`return set, key`), read
+    // when asked: an earlier function's names may change on the way
+    let mut returns: HashMap<String, usize> = HashMap::default();
+    for (fi, fend, params) in &funcs {
         if *fi >= 0 {
             if let Some(f) = function_name_of(&out[*fi as usize]) {
                 let f = f.replace(':', ".");
-                signatures.entry(f).or_insert_with(|| params.clone());
+                signatures.entry(f.clone()).or_insert_with(|| params.clone());
+                let from = (*fi as usize + 1).min(out.len());
+                let last = (from..(*fend).min(out.len())).rev().find(|j| !is_blank(&out[*j]));
+                if let Some(j) = last.filter(|j| strip(&out[*j]).starts_with("return ")) {
+                    returns.entry(f).or_insert(j);
+                }
             }
         }
     }
@@ -4821,6 +4851,17 @@ fn name_pass(out: &mut Vec<String>, index: &mut WordIndex, extra: &Extra) -> boo
                         });
                         break;
                     }
+                }
+            }
+            if new.is_none() && !returns.is_empty() {
+                // the declaration, `local a, b = f()` among them
+                let declared = at.iter().map(|j| strip(&out[*j as usize])).find(|l| {
+                    l.strip_prefix("local ")
+                        .and_then(|r| r.split_once(" = "))
+                        .is_some_and(|(lhs, _)| lhs.split(", ").any(|n| n == name))
+                });
+                if let Some(d) = declared {
+                    new = returned_name(name, d, &returns, out);
                 }
             }
             if new.is_none() && defs.len() <= 2 {
