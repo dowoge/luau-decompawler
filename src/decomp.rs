@@ -4055,6 +4055,13 @@ impl<'c, 'm> Dec<'c, 'm> {
             op::LOADKX => self.put(out, ind, a, ex_const(kexpr(m, p, aux as i64)), true),
             op::MOVE => {
                 self.declare_named(out, ind, b); // to where copied-in code keeps it, or an argument
+                // read again after this copy (`own = slot and t[slot]`): the
+                // value has to stay where it is, under its own name
+                if self.pending.contains_key(&b) && !self.shared(pc, b) && self.live_after(pc, b) && b != a {
+                    let e = self.get(b);
+                    self.flush_impure(out, ind, b);
+                    self.assign(out, ind, b, &e);
+                }
                 let shared = !self.pending.contains_key(&b) && self.shared(pc, b);
                 let v = self.get(b);
                 if shared {
