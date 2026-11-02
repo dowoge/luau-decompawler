@@ -1,4 +1,4 @@
-# luau_check and luau_run: the real Luau compiler and VM, which the test harness
+﻿# luau_check and luau_run: the real Luau compiler and VM, which the test harness
 # compares the decompiler against. These are C++ because Luau is. The decompiler
 # and the harness are the Rust crate at the root.
 #
@@ -24,8 +24,10 @@ set(LUAU_BUILD_CLI OFF CACHE BOOL "Build Luau CLI" FORCE)
 set(LUAU_BUILD_TESTS OFF CACHE BOOL "Build Luau tests" FORCE)
 add_subdirectory("${LUAU_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/luau" EXCLUDE_FROM_ALL)
 
+find_package(Threads REQUIRED)
+
 add_executable(luau_check tools/luau_check.cpp)
-target_link_libraries(luau_check PRIVATE Luau.Compiler Luau.Ast Luau.Common)
+target_link_libraries(luau_check PRIVATE Luau.Compiler Luau.Ast Luau.Common Threads::Threads)
 
 add_executable(luau_run tools/luau_run.cpp)
 target_link_libraries(luau_run PRIVATE Luau.VM Luau.Compiler Luau.Ast Luau.Common)

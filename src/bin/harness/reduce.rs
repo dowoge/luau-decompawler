@@ -18,8 +18,6 @@ use crate::shape::shape;
 
 type Lines = Vec<String>;
 
-/// Files per compiler process within a batch.
-const SPLIT: usize = 8;
 /// Seconds before a batch counts as hung.
 const DECOMPILE_LIMIT: u64 = 30;
 const RUN_LIMIT: u64 = 10;
@@ -48,7 +46,7 @@ impl Probe<'_> {
                 path
             })
             .collect();
-        let code = self.tools.compile(&sources, &dir.path("a"), SPLIT).bytecode;
+        let code = self.tools.compile(&sources, &dir.path("a")).bytecode;
         let compiled: Vec<usize> = (0..programs.len()).filter(|i| code.contains_key(&sources[*i])).collect();
         let files: Vec<String> = compiled.iter().map(|i| code[&sources[*i]].clone()).collect();
         let texts = decompile_many(&self.binary, &files, &dir.path("d"), DECOMPILE_LIMIT);
@@ -62,7 +60,7 @@ impl Probe<'_> {
             }
         }
         let paths: Vec<String> = decompiled.iter().map(|d| d.1.clone()).collect();
-        let back = self.tools.compile(&paths, &dir.path("b"), SPLIT).bytecode;
+        let back = self.tools.compile(&paths, &dir.path("b")).bytecode;
         let mut good: Vec<(usize, String)> = Vec::with_capacity(decompiled.len());
         for (i, path) in decompiled {
             if back.contains_key(&path) {

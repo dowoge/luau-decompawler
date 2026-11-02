@@ -87,7 +87,7 @@ pub fn compare_place(tools: &Tools, dumps: &Path, output: &Path, place: &str) ->
     let files = scripts(&output.join(place));
     let paths: Vec<String> = files.keys().cloned().collect();
     let tmp = Temp::new("ed");
-    let done = tools.compile(&paths, &tmp.path("bc"), 100).bytecode;
+    let done = tools.compile(&paths, &tmp.path("bc")).bytecode;
     let parts = par_map(&paths, |path| {
         let Some(bc) = done.get(path) else { return (Vec::new(), 0) };
         let script = &files[path];

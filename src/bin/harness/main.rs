@@ -1,4 +1,4 @@
-//! harness: tests the decompiler against the real Luau compiler and VM.
+﻿//! harness: tests the decompiler against the real Luau compiler and VM.
 //!
 //!   harness check [--full]        everything that has to hold before a change goes in
 //!   harness cases [--show NAME]   the hand-written programs in tools/luau_cases
@@ -66,5 +66,6 @@ fn main() -> ExitCode {
             2
         }
     };
+    luau::clean_up();
     ExitCode::from(code)
 }

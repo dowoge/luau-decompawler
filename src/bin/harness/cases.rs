@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::luau::{clip, decompile_many, module, percent, read_text, repo, Args, Temp, Tools, BATCH, USUAL_BUDGET};
+use crate::luau::{clip, decompile_many, module, percent, read_text, repo, Args, Temp, Tools, USUAL_BUDGET};
 use crate::shape::{exact, pair, shape};
 
 struct Row {
@@ -48,7 +48,7 @@ pub fn run(args: &Args, loud: bool) -> usize {
         .collect();
     srcs.sort();
     let tmp = Temp::new("cs");
-    let bc = tools.compile(&srcs, &tmp.path("a"), BATCH).bytecode;
+    let bc = tools.compile(&srcs, &tmp.path("a")).bytecode;
     let mut decs: HashMap<String, String> = HashMap::new();
     let mut crashed: HashMap<String, String> = HashMap::new();
     let compiled: Vec<&String> = srcs.iter().filter(|s| bc.contains_key(*s)).collect();
@@ -63,7 +63,7 @@ pub fn run(args: &Args, loud: bool) -> usize {
         };
     }
     let dec_paths: Vec<String> = srcs.iter().filter_map(|s| decs.get(s).cloned()).collect();
-    let back = tools.compile(&dec_paths, &tmp.path("b"), BATCH).bytecode;
+    let back = tools.compile(&dec_paths, &tmp.path("b")).bytecode;
     let all: Vec<String> = srcs.iter().chain(&dec_paths).cloned().collect();
     let out = tools.outputs(&all, 60, USUAL_BUDGET);
     let mut totals = [0usize; 3];

@@ -1,10 +1,10 @@
-//! Checks on decompiled text: names used without a declaration, which would be
+﻿//! Checks on decompiled text: names used without a declaration, which would be
 //! globals, and whether two output trees are the same.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 
-use crate::luau::{clip, read_text, walk, Args};
+use crate::luau::{clip, par_map, read_text, walk, Args};
 
 /// `"` strings become `""`, so nothing in them counts as code.
 fn without_strings(text: &str) -> String {
@@ -165,10 +165,13 @@ pub fn undeclared(roots: &[String]) -> Undeclared {
         let mut files = Vec::new();
         walk(Path::new(root), &mut files);
         files.sort();
-        for path in files.iter().filter(|p| p.extension().is_some_and(|x| x == "lua")) {
+        files.retain(|p| p.extension().is_some_and(|x| x == "lua"));
+        let found = par_map(&files, |path| {
             let text = without_strings(&read_text(&path.to_string_lossy()));
             let known = declared(&text);
-            let bad: Vec<String> = used_names(&text).into_iter().filter(|n| !known.contains(n)).collect();
+            used_names(&text).into_iter().filter(|n| !known.contains(n)).collect::<Vec<String>>()
+        });
+        for (path, bad) in files.iter().zip(found) {
             if !bad.is_empty() {
                 out.files += 1;
                 out.names += bad.len();

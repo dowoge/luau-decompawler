@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::gen;
-use crate::luau::{decompile_many, module, par_map, percent, read_text, Args, Temp, Tools, BATCH, USUAL_BUDGET};
+use crate::luau::{decompile_many, module, par_map, percent, read_text, Args, Temp, Tools, USUAL_BUDGET};
 use crate::shape::{pair, shape};
 
 const DECOMPILE_LIMIT: u64 = 300;
@@ -73,7 +73,7 @@ pub fn run(tools: &Tools, o: &Options) -> Outcome {
         path
     });
     let mut detail = Vec::new();
-    let source = tools.compile(&srcs, &tmp.path("bc"), BATCH);
+    let source = tools.compile(&srcs, &tmp.path("bc"));
     if !source.failed.is_empty() {
         let first: Vec<&(String, String)> = source.failed.iter().take(3).collect();
         detail.push(format!("generator wrote invalid programs: {first:?}"));
@@ -92,7 +92,7 @@ pub fn run(tools: &Tools, o: &Options) -> Outcome {
         }
     }
     let dec_paths: Vec<String> = decs.iter().map(|d| d.1.clone()).collect();
-    let back = tools.compile(&dec_paths, &tmp.path("dbc"), BATCH);
+    let back = tools.compile(&dec_paths, &tmp.path("dbc"));
     let compile_fail: Vec<String> = back.failed.iter().map(|f| f.0.clone()).collect();
 
     let all: Vec<String> = srcs.iter().chain(&dec_paths).cloned().collect();

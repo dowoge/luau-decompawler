@@ -10,15 +10,24 @@
 //                                   (-O2), to DIR/<n>.bc, and print "n path"
 //                                   (the harness compares them with the
 //                                   original bytecode)
+//   --stdin                         the paths come from standard input too,
+//                                   one per line
+//
+// Files go through on every core; what they report comes out in file order.
 #include "Luau/Common.h"
 #include "luacode.h"
 
+#include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iostream>
 #include <iterator>
 #include <string>
+#include <thread>
+#include <vector>
 
 // Compiler changes Roblox's bytecode shows, which are off by default here.
 static const char* const kFlags[] = {
@@ -32,12 +41,26 @@ static const char* const kMutableGlobals[] = {
 };
 
 int main(int argc, char** argv) {
-    int first = 1;
     const char* emit = nullptr;
-    if (argc > 2 && std::strcmp(argv[1], "--emit") == 0) {
-        emit = argv[2];
-        first = 3;
+    bool from_stdin = false;
+    std::vector<std::string> paths;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--emit") == 0 && i + 1 < argc)
+            emit = argv[++i];
+        else if (std::strcmp(argv[i], "--stdin") == 0)
+            from_stdin = true;
+        else
+            paths.push_back(argv[i]);
     }
+    for (std::string line; from_stdin && std::getline(std::cin, line);) {
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        if (paths.empty() && line.rfind("\xEF\xBB\xBF", 0) == 0)
+            line.erase(0, 3);  // a byte order mark, as PowerShell pipes
+        if (!line.empty())
+            paths.push_back(line);
+    }
+    const int count = int(paths.size());
     lua_CompileOptions opts = {};
     opts.optimizationLevel = emit ? 2 : 1;
     opts.debugLevel = 1;
@@ -51,33 +74,47 @@ int main(int argc, char** argv) {
                 if (std::strcmp(f->name, name) == 0)
                     f->value = true;
     }
-    int ok = 0, bad = 0;
-    for (int i = first; i < argc; ++i) {
-        std::ifstream f(argv[i], std::ios::binary);
-        if (!f) {
-            std::fprintf(stderr, "%s: cannot open\n", argv[i]);
-            ++bad;
-            continue;
-        }
-        const std::string src((std::istreambuf_iterator<char>(f)),
-                              std::istreambuf_iterator<char>());
-        size_t size = 0;
-        char* bc = luau_compile(src.data(), src.size(), &opts, &size);
-        // A failed compile returns version byte 0 followed by the message.
-        if (size > 0 && bc[0] == 0) {
-            std::printf("%s: %.*s\n", argv[i], int(size - 1), bc + 1);
-            ++bad;
-        } else {
-            ++ok;
-            if (emit) {
-                const std::string out = std::string(emit) + "/" + std::to_string(i - first) + ".bc";
-                std::ofstream o(out, std::ios::binary);
-                o.write(bc, std::streamsize(size));
-                std::printf("%d %s\n", i - first, argv[i]);
+    std::atomic<int> next{0}, ok{0}, bad{0};
+    std::vector<std::string> said(count);
+    const auto work = [&] {
+        for (int i = next++; i < count; i = next++) {
+            const std::string& path = paths[i];
+            std::ifstream f(path, std::ios::binary);
+            if (!f) {
+                std::fprintf(stderr, "%s: cannot open\n", path.c_str());
+                ++bad;
+                continue;
             }
+            const std::string src((std::istreambuf_iterator<char>(f)),
+                                  std::istreambuf_iterator<char>());
+            size_t size = 0;
+            char* bc = luau_compile(src.data(), src.size(), &opts, &size);
+            std::string& line = said[i];
+            // A failed compile returns version byte 0 followed by the message.
+            if (size > 0 && bc[0] == 0) {
+                line = path + ": " + std::string(bc + 1, size - 1) + "\n";
+                ++bad;
+            } else {
+                ++ok;
+                if (emit) {
+                    const std::string n = std::to_string(i);
+                    std::ofstream o(std::string(emit) + "/" + n + ".bc", std::ios::binary);
+                    o.write(bc, std::streamsize(size));
+                    line = n + " " + path + "\n";
+                }
+            }
+            std::free(bc);
         }
-        std::free(bc);
-    }
-    std::printf("%d compile, %d fail\n", ok, bad);
-    return bad ? 1 : 0;
+    };
+    size_t workers = std::min<size_t>(std::max(std::thread::hardware_concurrency(), 1u), said.size());
+    std::vector<std::thread> others;
+    while (workers-- > 1)
+        others.emplace_back(work);
+    work();
+    for (std::thread& t : others)
+        t.join();
+    for (const std::string& line : said)
+        std::fputs(line.c_str(), stdout);
+    std::printf("%d compile, %d fail\n", ok.load(), bad.load());
+    return bad.load() ? 1 : 0;
 }

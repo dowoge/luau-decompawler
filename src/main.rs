@@ -9,7 +9,9 @@
 //!   luau_decompile --dir DIR [--out OUT]  every *.wire in DIR (index.tsv
 //!                                         paths name the outputs)
 //!   luau_decompile --each OUT FILE...     each file by itself, as if run alone:
-//!                                         OUT/<n>.lua, or OUT/<n>.error
+//!                                         OUT/<n>.lua, or OUT/<n>.error; with
+//!                                         --stdin, paths from stdin as well.
+//!                                         Ends saying how many files it read.
 //!
 //! Output is Luau that compiles. `harness difftest` is the ground-truth test:
 //! generated programs must behave the same after a trip through here.
@@ -361,6 +363,8 @@ fn run_each(out: &Path, files: &[String], upstream: bool, noflat: bool) -> i32 {
         }
         .is_ok()
     });
+    // what tells a caller this binary understood the list it was given
+    println!("{} files", files.len());
     i32::from(written.contains(&false))
 }
 
@@ -385,7 +389,13 @@ fn run(args: Vec<String>) -> i32 {
         return run_dir(&src, &dst, upstream, noflat);
     }
     if args.len() >= 2 && args[0] == "--each" {
-        return run_each(Path::new(&args[1]), &args[2..], upstream, noflat);
+        let mut files: Vec<String> = args[2..].iter().filter(|a| *a != "--stdin").cloned().collect();
+        if args[2..].iter().any(|a| a == "--stdin") {
+            let lines = std::io::stdin().lines().map_while(Result::ok);
+            // a byte order mark first, as PowerShell pipes
+            files.extend(lines.map(|l| l.trim_start_matches('\u{feff}').to_string()).filter(|l| !l.is_empty()));
+        }
+        return run_each(Path::new(&args[1]), &files, upstream, noflat);
     }
     let disasm = args.iter().any(|a| a == "--disasm");
     let Some(file) = args.iter().find(|a| !a.starts_with("--")) else { return usage() };
