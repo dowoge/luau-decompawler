@@ -3805,10 +3805,10 @@ impl<'c, 'm> Dec<'c, 'm> {
                 }
             }
             let (cond, taken) = self.cond_expr(j);
-            nodes.push(Node { start, c: cond, t: taken, f: j + ji.n });
+            nodes.push(Node { start, c: cond, t: taken, f: self.past_dead(j + ji.n) });
         }
         let last = blocks[blocks.len() - 1].1;
-        let region_end = last + self.insn(last).n;
+        let region_end = self.past_dead(last + self.insn(last).n);
         let mut preds: HashMap<i32, i32> = HashMap::default();
         for n in &nodes {
             *preds.entry(n.t).or_insert(0) += 1;
@@ -3868,6 +3868,25 @@ impl<'c, 'm> Dec<'c, 'm> {
             return Some((negate(&n.c), n.f, region_end));
         }
         None
+    }
+
+    /// `b and true or false`: a jump over a dead one, which `or false` left
+    /// (nothing jumps to it, and the jump before it does not fall in), is
+    /// falling through to past both: where q's code goes on.
+    fn past_dead(&self, q: i32) -> i32 {
+        if !self.valid(q) || self.has_label(q) || self.insn(q).op != op::JUMP {
+            return q;
+        }
+        let over = q + self.insn(q).n;
+        if !self.valid(over) || self.has_label(over) || !matches!(self.insn(over).op, op::JUMP | op::JUMPX) {
+            return q;
+        }
+        let beyond = over + self.insn(over).n;
+        if self.insn(q).jump_target() == Some(beyond) {
+            beyond
+        } else {
+            q
+        }
     }
 
     /// break / continue when the target is the enclosing loop's edge.
