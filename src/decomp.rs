@@ -2458,17 +2458,75 @@ impl<'c, 'm> Dec<'c, 'm> {
                 if back < end && Some(pc) != loop_head {
                     // a backward jump closes a loop that starts here
                     self.flush(out, ind, &[]);
+                    let at = out.len();
                     out.push(format!("{}while true do", sp(ind)));
                     self.loops.push((pc, back + 1));
                     self.emit_range(out, ind + 4, pc, back + 1, Some(pc), Some(pc));
                     self.flush(out, ind + 4, &[]);
                     self.loops.pop();
                     out.push(format!("{}end", sp(ind)));
+                    self.loop_form(out, at, ind, pc, back);
                     pc = back + 1;
                     continue;
                 }
             }
             pc = self.stmt(out, ind, pc, end);
+        }
+    }
+
+    /// `while true do` as it was written, which only the lines tell: `while c
+    /// do`, `repeat ... until c` and `while true do` with a test that breaks
+    /// compile to the same code, but the jump back carries the line of the
+    /// loop's own condition. So a test on that line, ahead of the body, is the
+    /// `while` condition; a last test on a line after the body's first is the
+    /// `until`. out[at..] is the loop as emitted, its `end` last.
+    fn loop_form(&self, out: &mut Vec<String>, at: usize, ind: usize, head: i32, back: i32) {
+        let line = |pc: i32| self.p.lines.get(pc as usize).copied();
+        let mut first = head;
+        while first < back && !self.valid(first) {
+            first += 1;
+        }
+        let (Some(jump_line), Some(head_line)) = (line(back), line(first)) else { return };
+        let (pad, inner) = (sp(ind), sp(ind + 4));
+        let n = out.len();
+        if n < at + 3 || out[at] != format!("{pad}while true do") || out[n - 1] != format!("{pad}end") {
+            return;
+        }
+        // `if X then break end`, on one line or three, at the body's own level
+        let exit_test = |i: usize| -> Option<(String, usize)> {
+            let l = out.get(i)?;
+            let rest = l.strip_prefix(inner)?.strip_prefix("if ")?;
+            if l.contains('\n') {
+                return None;
+            }
+            if let Some(t) = rest.strip_suffix(" then break end") {
+                return Some((t.to_string(), 1));
+            }
+            let t = rest.strip_suffix(" then")?;
+            let brk = format!("{inner}    break");
+            let end = format!("{inner}end");
+            (*out.get(i + 1)? == brk && *out.get(i + 2)? == end).then(|| (t.to_string(), 3))
+        };
+        // jumps left for later passes stay with the code they were made for;
+        // `continue` reaches the test in a `while` either way, but in a
+        // `repeat` it goes to the `until`, past what came before the test
+        let has_word = |lines: &[String], word: &str| {
+            lines.iter().any(|l| l.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).any(|w| w == word))
+        };
+        let plain = |lines: &[String]| !has_word(lines, "goto") && !lines.iter().any(|l| l.contains("::"));
+        if jump_line == head_line {
+            if let Some((test, used)) = exit_test(at + 1) {
+                if at + 1 + used < n && plain(&out[at + 1..n - 1]) {
+                    out[at] = format!("{pad}while {} do", passes::loop_condition(&test));
+                    out.drain(at + 1..at + 1 + used);
+                }
+            }
+        } else if jump_line > head_line && n >= at + 3 && exit_test(n - 2).is_some_and(|t| t.1 == 1) {
+            // `repeat ... until X`, written as such only at the very end
+            // (passes::final_forms): `until` sits outside the body's indent
+            // but sees its locals, which the passes in between, scoping by
+            // indent, would not know. Two spaces mark the loop meanwhile.
+            out[at] = format!("{pad}while true  do");
         }
     }
 

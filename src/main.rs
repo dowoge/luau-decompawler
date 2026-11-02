@@ -73,7 +73,7 @@ fn decompile_core(m: &Module, path: Option<&str>, noflat: bool) -> Vec<String> {
 
 /// The naming rounds that can use other scripts' call sites.
 fn name_round(lines: Vec<String>, extra: &Extra) -> Vec<String> {
-    passes::blank_lines(passes::more_names(passes::role_names(lines), extra))
+    passes::final_forms(passes::blank_lines(passes::more_names(passes::role_names(lines), extra)))
 }
 
 /// `--tabs`: indent with tabs, one for each four leading spaces.

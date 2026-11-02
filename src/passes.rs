@@ -967,6 +967,58 @@ fn negated_test(c: &str) -> String {
     negated(c)
 }
 
+/// The condition a `while` runs on, from X in the `if X then break end` that
+/// opened its body: what X negates to, `not a or not b` as `a and b` when
+/// every term loses its `not` that way, without brackets around it all.
+pub fn loop_condition(x: &str) -> String {
+    let terms = split_top_word(x, " or ");
+    if terms.len() > 1 {
+        let negs: Vec<String> = terms.iter().map(|t| negated_test(t)).collect();
+        if negs.iter().all(|n| !n.starts_with("not ")) {
+            return negs.join(" and ");
+        }
+    }
+    let c = negated_test(x);
+    match c.strip_prefix('(').and_then(|r| r.strip_suffix(')')) {
+        Some(inner) if matching_paren(c.as_bytes(), 0) == Some(c.len() - 1) => inner.to_string(),
+        _ => c,
+    }
+}
+
+/// s split at each `sep` outside brackets and strings.
+fn split_top_word<'a>(s: &'a str, sep: &str) -> Vec<&'a str> {
+    let b = s.as_bytes();
+    let (mut depth, mut quote, mut i, mut from) = (0i32, None::<u8>, 0usize, 0usize);
+    let mut parts = Vec::new();
+    while i < b.len() {
+        let ch = b[i];
+        match quote {
+            Some(q) => {
+                if ch == b'\\' {
+                    i += 1;
+                } else if ch == q {
+                    quote = None;
+                }
+            }
+            None => match ch {
+                b'"' | b'\'' | b'`' => quote = Some(ch),
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => depth -= 1,
+                _ if depth == 0 && s[i..].starts_with(sep) => {
+                    parts.push(&s[from..i]);
+                    i += sep.len();
+                    from = i;
+                    continue;
+                }
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    parts.push(&s[from..]);
+    parts
+}
+
 /// No space outside brackets and strings: one operand, as this code prints.
 fn one_operand(s: &str) -> bool {
     let b = s.as_bytes();
@@ -5430,6 +5482,62 @@ fn reindent(lines: Vec<String>) -> Vec<String> {
         depth = (depth + opens - closes).max(0);
     }
     out
+}
+
+/// Last of all: `local a, b = nil` is `local a, b`, which compiles the same
+/// (both load nil) and is how a declaration with no value is written; and a
+/// loop the emitter marked `while true  do` (its lines say `repeat`) whose
+/// body still ends with `if X then break end` is `repeat ... until X`: the
+/// same code, `until` seeing the body's locals as that `if` did. A body with
+/// `continue` keeps its form (that goes to the `until` in a repeat).
+pub fn final_forms(mut lines: Vec<String>) -> Vec<String> {
+    let mut i = 0;
+    while i < lines.len() {
+        let ind = indent_of(&lines[i]);
+        if &lines[i][ind..] == "while true  do" {
+            let pad = lines[i][..ind].to_string();
+            let end = block_end(&lines, i);
+            let mut last = end;
+            while last > i + 1 && is_blank(&lines[last - 1]) {
+                last -= 1;
+            }
+            let last = last - 1;
+            let inner = format!("{pad}    if ");
+            let test = (lines[end] == format!("{pad}end") && last > i + 1)
+                .then(|| lines[last].strip_prefix(inner.as_str()).and_then(|r| r.strip_suffix(" then break end")))
+                .flatten()
+                .filter(|t| !t.contains('\n'))
+                .map(str::to_string);
+            let body = &lines[i + 1..last];
+            let plain = body.iter().all(|l| !has_word(l, "continue") && !has_word(l, "goto") && !l.contains("::"));
+            match test {
+                Some(t) if plain => {
+                    // `until f(x)` before a line opening with `(` would call on
+                    let next_opens = lines[end + 1..].iter().find(|l| !is_blank(l)).is_some_and(|l| strip(l).starts_with('('));
+                    let sep = if next_opens { ";" } else { "" };
+                    lines[i] = format!("{pad}repeat");
+                    lines[end] = format!("{pad}until {t}{sep}");
+                    lines.remove(last);
+                }
+                _ => lines[i] = format!("{pad}while true do"),
+            }
+        }
+        i += 1;
+    }
+    for l in lines.iter_mut() {
+        let ind = indent_of(l);
+        let Some(rest) = l[ind..].strip_prefix("local ") else { continue };
+        let Some((names, values)) = rest.split_once(" = ") else { continue };
+        let names_ok = names.split(", ").all(|n| {
+            let b = n.as_bytes();
+            !b.is_empty() && is_start(b[0]) && b.iter().all(|c| is_word(*c)) && !pass_keyword(n)
+        });
+        let nils = values.split(", ").collect::<Vec<_>>();
+        if names_ok && nils.iter().all(|v| *v == "nil") && nils.len() <= names.split(", ").count() {
+            *l = format!("{}local {names}", &l[..ind]);
+        }
+    }
+    lines
 }
 
 /// Everything in `tidy` before the cross-script naming rounds.
