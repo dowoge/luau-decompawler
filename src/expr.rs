@@ -55,9 +55,11 @@ pub struct X {
     pub uses: HashSet<u64>,
     /// The function this value creates.
     pub closure: Option<usize>,
-    /// A table constructor; the names in its fields.
+    /// A table constructor.
     pub constructor: bool,
-    pub field_names: HashSet<u64>,
+    /// The names a constructor's fields or a closure's captures read: all a
+    /// constructor or closure reads when it is made (a body runs later).
+    pub names_read: HashSet<u64>,
 }
 
 thread_local! {
@@ -90,7 +92,7 @@ pub fn ex(text: impl Into<String>, prec: i32) -> E {
         uses: HashSet::default(),
         closure: None,
         constructor: false,
-        field_names: HashSet::default(),
+        names_read: HashSet::default(),
     }))
 }
 

@@ -730,7 +730,7 @@ impl<'c, 'm> Dec<'c, 'm> {
         for text in new {
             // kept after an undo too: at worst a value is written out early
             let names = text.as_bytes().split(|c| !is_ident_byte(*c));
-            x.field_names.extend(names.filter(|n| !n.is_empty()).map(key));
+            x.names_read.extend(names.filter(|n| !n.is_empty()).map(key));
             f.push(text);
         }
     }
@@ -1216,8 +1216,8 @@ impl<'c, 'm> Dec<'c, 'm> {
         let word = key(name.as_bytes());
         let reads = |e: &E| {
             let x = e.borrow();
-            if x.constructor {
-                return !x.method && x.field_names.contains(&word);
+            if x.constructor || x.closure.is_some() {
+                return !x.method && x.names_read.contains(&word);
             }
             !x.method && contains_ident(&x.text, name)
         };
@@ -3558,7 +3558,13 @@ impl<'c, 'm> Dec<'c, 'm> {
                 if shared {
                     v.borrow_mut().pure_ = false; // a call may change it
                 }
-                self.put(out, ind, a, v, true);
+                // a named function made in a temporary (copied-in code returned
+                // it) and moved to where it is kept: declared there, by name
+                let named = {
+                    let x = v.borrow();
+                    x.closure.is_some() && x.hint.as_deref().is_some_and(|h| !h.is_empty())
+                };
+                self.put(out, ind, a, v, !named);
             }
             op::GETGLOBAL => {
                 let t = match kstr(m, p, aux as usize) {
@@ -3696,6 +3702,16 @@ impl<'c, 'm> Dec<'c, 'm> {
                 self.pset(a + 1, s);
             }
             op::CALL | op::CALLFB => {
+                // a named function (inlined code kept it in a temporary) is
+                // called by its name, not written out in the call
+                let named = self.pending.get(&a).is_some_and(|e| {
+                    let x = e.borrow();
+                    x.closure.is_some() && x.hint.as_deref().is_some_and(|h| !h.is_empty())
+                });
+                if named {
+                    let e = self.get(a);
+                    self.assign(out, ind, a, &e);
+                }
                 let f = self.get(a);
                 let mut nargs = b as i32 - 1;
                 let self_call = self.pending.get(&(a + 1)).is_some_and(|e| e.borrow().text == "<self>");
@@ -4012,11 +4028,32 @@ impl<'c, 'm> Dec<'c, 'm> {
             }
             q += 1;
         }
-        let text = self.closure_text(child, caps, ind);
+        let captured = caps.iter().map(|c| key(c.as_bytes())).collect();
+        let names = self.ctx.helper_names.get();
+        let mut text = self.closure_text(child, caps.clone(), ind);
+        // a helper the body calls by name (its code put back as a call, not
+        // an upvalue) has to be a local by then: one made here still waiting
+        // to be written goes out first
+        let called: Vec<usize> = {
+            let helpers = self.ctx.helpers.borrow();
+            let calls = |e: &E| {
+                let c = e.borrow().closure;
+                c.is_some_and(|c| helpers.iter().any(|h| h.0 == c && contains_ident(&text, &h.1)))
+            };
+            self.pending.iter().filter(|(_, e)| calls(e)).map(|(q, _)| *q).collect()
+        };
+        for q in called {
+            let e = self.get(q);
+            self.assign(out, ind, q, &e);
+        }
+        if self.ctx.helper_names.get() != names {
+            text = self.closure_text(child, caps, ind); // under the name it got
+        }
         let fname = m.protos[child].name.clone();
         let closure = ex_pure(text);
         closure.borrow_mut().hint = fname;
         closure.borrow_mut().closure = Some(child);
+        closure.borrow_mut().names_read = captured;
         self.put(out, ind, a, closure, true);
         q
     }
