@@ -30,6 +30,11 @@ fn is_keyword(s: &str) -> bool {
     KEYWORDS.contains(&s)
 }
 
+/// Make what is built on first use now, outside any job.
+pub fn warm() {
+    sp(0);
+}
+
 fn sp(n: usize) -> &'static str {
     static S: OnceLock<String> = OnceLock::new();
     &S.get_or_init(|| " ".repeat(1 << 16))[..n]

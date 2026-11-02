@@ -69,6 +69,14 @@ fn decompile_core(m: &Module, path: Option<&str>, noflat: bool) -> Vec<String> {
     passes::tidy_before_names(lines)
 }
 
+/// A job's text (or error), copied out of the job's memory.
+fn keep_text(r: Result<String, String>) -> Result<String, String> {
+    match r {
+        Ok(s) => Ok(s.as_str().to_owned()),
+        Err(e) => Err(e.as_str().to_owned()),
+    }
+}
+
 /// The naming rounds that can use other scripts' call sites.
 fn name_round(lines: Vec<String>, extra: &Extra) -> Vec<String> {
     passes::blank_lines(passes::more_names(passes::role_names(lines), extra))
@@ -101,13 +109,18 @@ fn par_map<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
         for _ in 0..workers {
             std::thread::Builder::new()
                 .stack_size(STACK)
-                .spawn_scoped(s, || loop {
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    if i >= n {
-                        break;
+                .spawn_scoped(s, || {
+                    // the free blocks of a worker that is done, not new ones
+                    alloc::adopt();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= n {
+                            break;
+                        }
+                        let v = f(i);
+                        *slots[i].lock().unwrap() = Some(v);
                     }
-                    let v = f(i);
-                    *slots[i].lock().unwrap() = Some(v);
+                    alloc::park();
                 })
                 .expect("cannot start a worker");
         }
@@ -116,16 +129,59 @@ fn par_map<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
 }
 
 /// par_map for jobs of very different sizes: the biggest start first, so the
-/// longest are not left for last on one worker.
-fn par_map_sized<T: Send>(sizes: &[u64], f: impl Fn(usize) -> T + Sync) -> Vec<T> {
-    let mut order: Vec<usize> = (0..sizes.len()).collect();
+/// longest are not left for last on one worker. A job's memory grows with
+/// its size, so jobs run only as many at once as `budget` bytes of them
+/// allow (one always may). A worker takes the biggest left that fits, else
+/// the smallest, else waits for one to end.
+fn par_map_sized<T: Send>(sizes: &[u64], budget: u64, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+    let n = sizes.len();
+    let mut order: Vec<usize> = (0..n).collect();
     order.sort_by_key(|i| std::cmp::Reverse(sizes[*i]));
-    let picks = par_map(order.len(), |k| (order[k], f(order[k])));
-    let mut slots: Vec<Option<T>> = (0..sizes.len()).map(|_| None).collect();
-    for (i, v) in picks {
-        slots[i] = Some(v);
-    }
-    slots.into_iter().map(|s| s.unwrap()).collect()
+    // (next biggest, one past the smallest, bytes running)
+    let state = Mutex::new((0usize, n, 0u64));
+    let ended = std::sync::Condvar::new();
+    let cores = std::thread::available_parallelism().map_or(1, |c| c.get());
+    let wanted = std::env::var("LUAU_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(cores);
+    let workers = wanted.clamp(1, n.max(1));
+    let slots: Vec<Mutex<Option<T>>> = (0..n).map(|_| Mutex::new(None)).collect();
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            std::thread::Builder::new()
+                .stack_size(STACK)
+                .spawn_scoped(s, || {
+                    alloc::adopt();
+                    loop {
+                        let i = {
+                            let mut st = state.lock().unwrap();
+                            loop {
+                                let (lo, hi, running) = *st;
+                                if lo >= hi {
+                                    break None;
+                                }
+                                let (big, small) = (order[lo], order[hi - 1]);
+                                if running == 0 || running + sizes[big] <= budget {
+                                    *st = (lo + 1, hi, running + sizes[big]);
+                                    break Some(big);
+                                }
+                                if running + sizes[small] <= budget {
+                                    *st = (lo, hi - 1, running + sizes[small]);
+                                    break Some(small);
+                                }
+                                st = ended.wait(st).unwrap();
+                            }
+                        };
+                        let Some(i) = i else { break };
+                        let v = f(i);
+                        *slots[i].lock().unwrap() = Some(v);
+                        state.lock().unwrap().2 -= sizes[i];
+                        ended.notify_all();
+                    }
+                    alloc::park();
+                })
+                .expect("cannot start a worker");
+        }
+    });
+    slots.into_iter().map(|s| s.into_inner().unwrap().unwrap()).collect()
 }
 
 /// Writing a file costs several times what reading it does, and most of what
@@ -198,13 +254,16 @@ fn run_dir(src: &Path, dst: &Path, upstream: bool, noflat: bool) -> i32 {
     // Each is kept as one string until it is written: a place's text is
     // tens of megabytes, and as separate lines it costs half as much again.
     let sizes: Vec<u64> = files.iter().map(|f| fs::metadata(src.join(f)).map_or(0, |m| m.len())).collect();
-    let core: Vec<Result<String, String>> = par_map_sized(&sizes, |i| {
+    // a script's bytecode in memory costs some forty times as much while it is
+    // decompiled: a few megabytes of it at once keep all cores busy
+    let budget = std::env::var("LUAU_BUDGET").ok().and_then(|v| v.parse().ok()).unwrap_or(2 << 20);
+    let core: Vec<Result<String, String>> = par_map_sized(&sizes, budget, |i| {
         let run = || -> Result<String, String> {
             let data = fs::read(src.join(&files[i])).map_err(|e| e.to_string())?;
             let m = parse(&data, !upstream)?;
             Ok(decompile_core(&m, names.get(sids[i]).map(String::as_str), noflat).join("\n"))
         };
-        panic::catch_unwind(AssertUnwindSafe(run)).unwrap_or_else(|e| Err(panic_text(e)))
+        alloc::job(|| panic::catch_unwind(AssertUnwindSafe(run)).unwrap_or_else(|e| Err(panic_text(e))), keep_text)
     });
     let lines_of = |text: &str| -> Vec<String> { text.split('\n').map(String::from).collect() };
 
@@ -215,22 +274,29 @@ fn run_dir(src: &Path, dst: &Path, upstream: bool, noflat: bool) -> i32 {
     // a script defines. So name every script in parallel as if it were alone;
     // the result stands unless one of those functions has call sites elsewhere.
     let mut extra = Extra::default();
-    let defined: Vec<Vec<String>> = par_map(core.len(), |i| match &core[i] {
-        Ok(text) => passes::defined_keys(&lines_of(text)),
-        Err(_) => Vec::new(),
+    let defined: Vec<Vec<String>> = par_map(core.len(), |i| {
+        alloc::job(
+            || match &core[i] {
+                Ok(text) => passes::defined_keys(&lines_of(text)),
+                Err(_) => Vec::new(),
+            },
+            |keys| keys.iter().map(|k| k.as_str().to_owned()).collect(),
+        )
     });
     extra.want(defined.iter().flatten().cloned());
     let alone = Extra::default();
     let wanted = extra.wanted();
-    let name_and_tally = |text: &str, seen: &Extra| {
+    // the call sites a script's names give: its text itself is named again
+    // at the end, which costs less than holding a second copy of every script
+    let tally_of = |text: &str, seen: &Extra| {
         let named = name_round(lines_of(text), seen);
         let mut calls = CallMap::default();
         passes::collect_calls(&named, &mut calls, wanted);
-        (to_text(&named), passes::tally(&calls))
+        passes::tally(&calls)
     };
-    let mut draft: Vec<Option<(String, Tally)>> = par_map(core.len(), |i| {
+    let draft: Vec<Option<Tally>> = par_map(core.len(), |i| {
         let text = core[i].as_ref().ok()?;
-        panic::catch_unwind(AssertUnwindSafe(|| name_and_tally(text, &alone))).ok()
+        alloc::job(|| panic::catch_unwind(AssertUnwindSafe(|| tally_of(text, &alone))).ok(), |d| d.map(|calls| calls.clone()))
     });
     if timing {
         eprintln!("draft {:?}", t0.elapsed());
@@ -242,8 +308,7 @@ fn run_dir(src: &Path, dst: &Path, upstream: bool, noflat: bool) -> i32 {
     // turn depends only on scripts further back, so there is one answer however
     // it is reached: in rounds, redo what saw something change until nothing
     // does, which costs one pass in file order only if each waits on the last.
-    let mut sites: Vec<Tally> =
-        draft.iter_mut().map(|d| d.as_mut().map(|d| std::mem::take(&mut d.1)).unwrap_or_default()).collect();
+    let mut sites: Vec<Tally> = draft.into_iter().map(Option::unwrap_or_default).collect();
     // key -> the first script whose call sites of it changed; the drafts saw nothing
     let mut changed: HashMap<String, usize> = HashMap::default();
     for (j, calls) in sites.iter().enumerate().rev() {
@@ -265,7 +330,7 @@ fn run_dir(src: &Path, dst: &Path, upstream: bool, noflat: bool) -> i32 {
                 callers.entry(key).or_default().push(j);
             }
         }
-        let fresh: Vec<Tally> = par_map(todo.len(), |t| {
+        let fresh: Vec<Tally> = par_map(todo.len(), |t| alloc::job(|| {
             let i = todo[t];
             let mut seen = Extra::default();
             for key in &defined[i] {
@@ -278,8 +343,8 @@ fn run_dir(src: &Path, dst: &Path, upstream: bool, noflat: bool) -> i32 {
                 }
             }
             let Ok(text) = &core[i] else { return Tally::default() };
-            panic::catch_unwind(AssertUnwindSafe(|| name_and_tally(text, &seen).1)).unwrap_or_default()
-        });
+            panic::catch_unwind(AssertUnwindSafe(|| tally_of(text, &seen))).unwrap_or_default()
+        }, |calls| calls.clone()));
         changed.clear();
         for (i, new) in todo.iter().zip(fresh) {
             let old = std::mem::replace(&mut sites[*i], new);
@@ -299,16 +364,12 @@ fn run_dir(src: &Path, dst: &Path, upstream: bool, noflat: bool) -> i32 {
         eprintln!("calls {:?} ({redone} redone over {rounds} rounds)", t0.elapsed());
     }
 
-    // a script none of whose functions is called elsewhere keeps its draft
-    let drafts: Vec<Mutex<Option<String>>> = draft.into_iter().map(|d| Mutex::new(d.map(|d| d.0))).collect();
+    // a script none of whose functions is called elsewhere is named as it was
+    // alone: what the place knows is about functions it does not define
     let finish = |i: usize| -> Result<String, String> {
         let text = core[i].as_ref().map_err(Clone::clone)?;
-        if !defined[i].iter().any(|k| extra.knows(k)) {
-            if let Some(named) = drafts[i].lock().unwrap().take() {
-                return Ok(named);
-            }
-        }
-        panic::catch_unwind(AssertUnwindSafe(|| to_text(&name_round(lines_of(text), &extra)))).map_err(panic_text)
+        let seen = if defined[i].iter().any(|k| extra.knows(k)) { &extra } else { &alone };
+        panic::catch_unwind(AssertUnwindSafe(|| to_text(&name_round(lines_of(text), seen)))).map_err(panic_text)
     };
 
     // Paths in order (a repeated game path decides who gets the suffix), then
@@ -332,7 +393,7 @@ fn run_dir(src: &Path, dst: &Path, upstream: bool, noflat: bool) -> i32 {
         let _ = fs::create_dir_all(dir);
     }
     // each written as soon as its text is final: none waits on the others
-    let written: Vec<[usize; 5]> = par_map(files.len(), |i| {
+    let written: Vec<[usize; 5]> = par_map(files.len(), |i| alloc::job(|| {
         let finished = finish(i);
         let (path, head) = &targets[i];
         let result = match &finished {
@@ -355,7 +416,7 @@ fn run_dir(src: &Path, dst: &Path, upstream: bool, noflat: bool) -> i32 {
         });
         let made = usize::from(finished.is_ok());
         [usize::from(result.is_err()), count(" = false\n"), jumps, count("local block = 0"), made]
-    });
+    }, |counts| counts));
     if timing {
         eprintln!("names and write {:?}", t0.elapsed());
     }
@@ -467,6 +528,12 @@ fn run(args: Vec<String>) -> i32 {
 fn main() {
     // One bad script is reported as a failed file, not a backtrace per file.
     panic::set_hook(Box::new(|_| {}));
+    // what is made once and kept must not be made inside a job, whose memory
+    // goes when it ends
+    decomp::warm();
+    passes::warm();
+    let _ = std::io::stdout();
+    alloc::poison(std::env::var_os("LUAU_POISON").is_some());
     let args: Vec<String> = std::env::args().skip(1).collect();
     let code = std::thread::Builder::new()
         .stack_size(STACK)

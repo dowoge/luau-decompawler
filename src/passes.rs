@@ -3729,6 +3729,11 @@ impl WordIndex {
     }
 }
 
+/// Make the tables built on first use now, outside any job.
+pub fn warm() {
+    usage_members();
+}
+
 /// USAGE_TYPES the other way round: member -> (type, weight).
 fn usage_members() -> &'static HashMap<&'static str, Vec<(usize, i32)>> {
     static TABLE: OnceLock<HashMap<&'static str, Vec<(usize, i32)>>> = OnceLock::new();
