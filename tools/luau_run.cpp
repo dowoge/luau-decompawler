@@ -3,9 +3,10 @@
 // For the decompiler's differential tests: a generated program and its
 // decompiled version must print the same thing. Each file runs in a fresh
 // VM (standard libraries, sandboxed), compiled at -O2 like Roblox game
-// scripts, with an instruction budget so a broken program cannot hang.
+// scripts unless -O0 or -O1 says otherwise, with an instruction budget so a
+// broken program cannot hang.
 //
-//   luau_run [--budget N] [--seconds S] [--stream] FILE...
+//   luau_run [-O0|-O1|-O2] [--budget N] [--seconds S] [--stream] FILE...
 // prints, per file:  "=== FILE" then its output, then "=== ok" or
 // "=== error: MESSAGE" (chunk names and line numbers stripped, since they
 // differ between a program and its decompiled form). With --stream, programs
@@ -155,6 +156,9 @@ int main(int argc, char** argv) {
             seconds = std::atof(argv[++i]);
         else if (std::strcmp(argv[i], "--stream") == 0)
             stream = true;
+        else if (std::strcmp(argv[i], "-O0") == 0 || std::strcmp(argv[i], "-O1") == 0 ||
+                 std::strcmp(argv[i], "-O2") == 0)
+            opts.optimizationLevel = argv[i][2] - '0';
         else
             files.push_back({argv[i], {}});
     }
