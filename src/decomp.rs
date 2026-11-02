@@ -4325,6 +4325,14 @@ impl<'c, 'm> Dec<'c, 'm> {
                             let mut every: Vec<String> = enter.iter().map(|e| wrap(e, 3)).collect();
                             every.push(wrap(&c2, 3));
                             self.flush(out, ind, &[]);
+                            if self.jump_word(t2) == Some("break") {
+                                // t2 leaves the loop: the chain is a break, and
+                                // the block what follows it (falling out of an
+                                // if would go round again; to a continue it is
+                                // the same either way)
+                                out.push(format!("{pad}if {} then break end", every.join(" and ")));
+                                return target;
+                            }
                             out.push(format!("{pad}if not ({}) then", every.join(" and ")));
                             // the block may end by jumping over an else
                             let blast = self.last_insn_before(t2);
