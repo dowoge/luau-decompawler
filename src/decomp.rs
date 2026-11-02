@@ -258,6 +258,9 @@ struct Dec<'c, 'm> {
     used: HashSet<Rc<str>>,
     param_names: Vec<Rc<str>>,
     once_cache: HashMap<(i32, u32, i32), bool>,
+    /// Register-named output: per web, a helper made here whose calls a
+    /// later pass puts back by name (filled when that output starts).
+    helper_webs: Vec<bool>,
     hoisted: Vec<Rc<str>>,
     hoisted_set: HashSet<Rc<str>>,
     /// Closure constants with no upvalues loaded at several places: one
@@ -699,6 +702,7 @@ impl<'c, 'm> Dec<'c, 'm> {
             flat: false,
             param_names: Vec::new(),
             once_cache: HashMap::default(),
+            helper_webs: Vec::new(),
             hoisted: Vec::new(),
             hoisted_set: HashSet::default(),
             shared_closures: HashMap::default(),
@@ -878,9 +882,10 @@ impl<'c, 'm> Dec<'c, 'm> {
         let w = self.flow.use_web(pc, r).or_else(|| self.flow.def_web(pc, r));
         if self.flat_regs {
             // too many variables for one function: name registers, except
-            // variables a closure shares (those must stay apart)
+            // variables a closure shares and helpers whose calls come back
+            // by name (those must stay apart)
             return match w {
-                Some(w) if self.flow.byref_webs[w as usize] => KW + w,
+                Some(w) if self.apart(w) => KW + w,
                 _ => r as u32,
             };
         }
@@ -1158,7 +1163,7 @@ impl<'c, 'm> Dec<'c, 'm> {
         let dk = e.borrow().def_key;
         let key = match dk {
             Some((dr, k)) if dr == r => {
-                if self.flat_regs && (k < KW || !self.flow.byref_webs[(k - KW) as usize]) {
+                if self.flat_regs && (k < KW || !self.apart(k - KW)) {
                     r as u32 // named by register in this mode
                 } else {
                     k
@@ -2229,7 +2234,43 @@ impl<'c, 'm> Dec<'c, 'm> {
         self.defs_left = Vec::new();
     }
 
+    /// Named by register, does web w keep a name of its own? One a closure
+    /// refers to does, and a helper made here whose calls come back by name:
+    /// Luau puts the next local in its register once nothing reads it (every
+    /// call copied in), and sharing it, the calls would reach that one.
+    fn apart(&self, w: u32) -> bool {
+        self.flow.byref_webs[w as usize] || self.helper_webs.get(w as usize).copied().unwrap_or(false)
+    }
+
+    /// helper_webs for register-named output.
+    fn find_helper_webs(&mut self) {
+        let names = self.copies_within();
+        let mut webs = vec![false; self.flow.ndefs];
+        let p = self.p;
+        for ins in &p.code {
+            let child = match ins.op {
+                op::NEWCLOSURE => {
+                    let d = ins.d();
+                    p.children.get(if d < 0 { (p.children.len() as i32 + d) as usize } else { d as usize }).copied()
+                }
+                op::DUPCLOSURE => match p.k.get(kindex(p, ins.d() as i64)) {
+                    Some(K::Closure(c)) => Some(*c),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let named = child.and_then(|c| self.m.protos[c].name.as_deref()).is_some_and(|n| names.contains(&n));
+            if let Some(w) = self.flow.def_web(ins.pc, ins.a()).filter(|_| named) {
+                webs[w as usize] = true;
+            }
+        }
+        self.helper_webs = webs;
+    }
+
     fn decompile_once(&mut self) -> (Vec<String>, Vec<String>) {
+        if self.flat_regs && self.helper_webs.is_empty() {
+            self.find_helper_webs();
+        }
         let p = self.p;
         let mut params: Vec<String> = (0..p.numparams).map(|i| self.reg(i).to_string()).collect();
         if p.vararg != 0 {
