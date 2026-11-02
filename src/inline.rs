@@ -977,6 +977,10 @@ fn match_once(m: &Module, caller: &Proto, id: usize, start: usize, assumed: &[Op
                         c.a()
                     } else if inside {
                         value
+                    } else if matches!(walk.args.get(p.a()), Some(Some(Arg::Reg(r, _))) if *r == value) {
+                        // `return v` of a parameter: the copy left its argument's
+                        // register alone, and the caller reads the result there
+                        value
                     } else {
                         return refuse("returns a local with no store");
                     };

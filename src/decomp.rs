@@ -1540,9 +1540,14 @@ impl<'c, 'm> Dec<'c, 'm> {
         }
         // `(function() ... end)()`: inlined, and no closure was ever made
         if found.is_none() {
+            // two such literals on one line, alike: neither holds the other
+            let twin = |idx: usize| {
+                let (a, b) = (&self.m.protos[idx].code, &self.p.code);
+                a.len() == b.len() && a.iter().zip(b).all(|(x, y)| (x.w, x.aux) == (y.w, y.aux))
+            };
             for &idx in &self.ctx.orphans {
                 let (from, to) = self.ctx.spans[idx];
-                if idx == self.idx || line < from || line > to || from < own.0 || to > own.1 {
+                if idx == self.idx || line < from || line > to || from < own.0 || to > own.1 || twin(idx) {
                     continue;
                 }
                 let Some(call) = match_call(self.m, self.p, idx, start) else {
@@ -3139,7 +3144,9 @@ impl<'c, 'm> Dec<'c, 'm> {
                 if let Some((call, _)) = self.inline_at(q) {
                     let passed = call.args.iter().flatten().any(|a| matches!(a, Arg::Reg(x, _) if *x == r));
                     if passed {
-                        result = !self.live_at(call.end, r);
+                        // `return v` leaves the result where the argument was:
+                        // what is read there after is the call
+                        result = call.holds_result(r) || !self.live_at(call.end, r);
                         break;
                     }
                     if call.written.contains(&r) || call.upvals.contains(&Some(Up::Reg(r))) {
