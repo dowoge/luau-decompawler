@@ -40,6 +40,9 @@ fn sp(n: usize) -> &'static str {
     &S.get_or_init(|| " ".repeat(1 << 16))[..n]
 }
 
+/// LUAU_WHY=all: every refused helper match, as it happens.
+static WHY_ALL: OnceLock<bool> = OnceLock::new();
+
 /// `--info`: a comment above each function on what the bytecode holds for it.
 pub static INFO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -1443,6 +1446,10 @@ impl<'c, 'm> Dec<'c, 'm> {
     fn note_refusal(&self, helper: usize, why: (usize, String)) {
         if self.ctx.why {
             let name = self.m.protos[helper].name.as_deref().unwrap_or("(anon)");
+            if WHY_ALL.get_or_init(|| std::env::var("LUAU_WHY").is_ok_and(|v| v == "all")).to_owned() {
+                let within = self.p.name.as_deref().unwrap_or("(anon)");
+                eprintln!("REFUSE\t{within}\t{}\t{name}\t{}\t{}", self.cur_pc, why.0, why.1);
+            }
             self.refusals.borrow_mut().push((why.0, format!("{name}: {}", why.1)));
         }
     }

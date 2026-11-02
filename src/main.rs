@@ -26,7 +26,8 @@
 //!
 //! LUAU_NOFLAT=1 prints leftover jumps as `goto` instead of restructuring them.
 //! LUAU_THREADS=N limits the workers; LUAU_TIMING=1 prints stage times;
-//! LUAU_WHY=1 lists each `jump_N` flag and what stopped its helper coming back.
+//! LUAU_WHY=1 lists each `jump_N` flag and what stopped its helper coming back;
+//! LUAU_WHY=all lists every refused helper match too (`REFUSE` lines).
 
 mod alloc;
 mod analysis;
