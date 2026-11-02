@@ -1031,6 +1031,16 @@ impl<'c, 'm> Dec<'c, 'm> {
                 self.note_refusal(idx, last_refusal());
                 continue;
             };
+            // made here, its upvalues are what it captured: code reading some
+            // other register only looks like it (a line after a copy keeps
+            // the helper's line too)
+            if let Some(caps) = self.captures_of(idx) {
+                let wrong = call.upvals.iter().enumerate().any(|(k, u)| u.is_some_and(|u| caps.get(k) != Some(&u)));
+                if wrong {
+                    self.note_refusal(idx, (usize::MAX, "an upvalue the closure did not capture".to_string()));
+                    continue;
+                }
+            }
             let leftover = call
                 .written
                 .iter()
@@ -1067,6 +1077,30 @@ impl<'c, 'm> Dec<'c, 'm> {
         }
         self.inlined.borrow_mut()[pc as usize] = Some(found.clone());
         found
+    }
+
+    /// What the closure of `child` captures, if this function makes it.
+    fn captures_of(&self, child: usize) -> Option<Vec<Up>> {
+        let code = &self.p.code;
+        for (i, ins) in code.iter().enumerate() {
+            let made = match ins.op {
+                op::NEWCLOSURE => {
+                    let d = ins.d();
+                    let k = if d < 0 { self.p.children.len() as i32 + d } else { d };
+                    self.p.children.get(k as usize).copied()
+                }
+                op::DUPCLOSURE => match &self.p.k[kindex(self.p, ins.d() as i64)] {
+                    K::Closure(c) => Some(*c),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if made == Some(child) {
+                let caps = code[i + 1..].iter().take_while(|c| c.op == op::CAPTURE);
+                return Some(caps.map(|c| if c.a() == 2 { Up::Up(c.b()) } else { Up::Reg(c.b()) }).collect());
+            }
+        }
+        None
     }
 
     /// Put the call back where a helper's code was copied in. The pc after it.
@@ -2993,9 +3027,18 @@ impl<'c, 'm> Dec<'c, 'm> {
         let prep = self.insn(pc);
         let body = pc + prep.n;
         let code = &self.p.code[self.flow.idx(pc).expect("no instruction at pc")..];
-        let close = code.iter().find(|i| {
-            i.op == op::FORNLOOP && i.a() == prep.a() && i.jump_target() == Some(body)
-        });
+        // the compiler sends a jump that lands on a forward JUMP where that one
+        // goes, so a body starting with one (`do break end`) is jumped past
+        let land = |mut t: i32| {
+            while self.valid(t) && self.insn(t).op == op::JUMP && self.insn(t).jump_target().is_some_and(|n| n > t) {
+                t = self.insn(t).jump_target().unwrap();
+            }
+            t
+        };
+        let back = land(body);
+        let close = code
+            .iter()
+            .find(|i| i.op == op::FORNLOOP && i.a() == prep.a() && i.jump_target().map(land) == Some(back));
         let close = close.expect("FORNPREP without its FORNLOOP");
         (close.pc, close.pc + close.n)
     }
