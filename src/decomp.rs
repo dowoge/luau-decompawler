@@ -1661,6 +1661,28 @@ impl<'c, 'm> Dec<'c, 'm> {
         let mut joined: Option<i32> = None;
         while i < code.len() {
             let ins = &code[i];
+            // a helper copied in after: a call, whatever branches it has
+            // (`Color3.new(f(r), f(g), f(b))` with f copied in three times)
+            if i != from {
+                if let Some((call, _)) = self.inline_at(ins.pc) {
+                    let reads = |r: usize| call.args.iter().any(|x| matches!(x, Some(Arg::Reg(a, _)) if *a == r));
+                    if reads(q) || call.written.contains(&q) || call.upvals.iter().flatten().any(|u| *u == Up::Reg(q)) {
+                        return false;
+                    }
+                    if (0..self.p.maxstack).any(|r| flow.has(r) && reads(r)) {
+                        for k in call.result.into_iter().flat_map(|t| t..t + call.results) {
+                            flow.add(k);
+                        }
+                    }
+                    let Some(next) = self.flow.idx(call.end) else { return false };
+                    if next <= i {
+                        return false;
+                    }
+                    joined = Some(call.end); // the copy's own jumps land there
+                    i = next;
+                    continue;
+                }
+            }
             let entered = joined == Some(ins.pc);
             if (ins.pc != code[from].pc && self.has_label(ins.pc) && !entered) || self.is_loop_head(ins.pc) {
                 return false;
