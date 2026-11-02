@@ -46,16 +46,16 @@ end)
 ```lua
 local Players = game:GetService("Players")
 Players.PlayerAdded:Connect(function(player)
-    local folder = Instance.new("Folder")
-    folder.Name = "leaderstats"
-    folder.Parent = player
-    local intValue = Instance.new("IntValue")
-    intValue.Name = "Coins"
-    intValue.Parent = folder
+    local leaderstats = Instance.new("Folder")
+    leaderstats.Name = "leaderstats"
+    leaderstats.Parent = player
+    local coins = Instance.new("IntValue")
+    coins.Name = "Coins"
+    coins.Parent = leaderstats
     player.CharacterAdded:Connect(function(character)
-        local Humanoid = character:WaitForChild("Humanoid")
-        Humanoid.Died:Connect(function()
-            intValue.Value = math.max(intValue.Value - 10, 0)
+        local humanoid = character:WaitForChild("Humanoid")
+        humanoid.Died:Connect(function()
+            coins.Value = math.max(coins.Value - 10, 0)
         end)
     end)
 end)
@@ -84,14 +84,14 @@ return follow
 <td>
 
 ```lua
-local function lerp(x, targetX, arg3_1)
-    return x + (targetX - x) * arg3_1
+local function lerp(x, targetX, n)
+    return x + (targetX - x) * n
 end
 
-local function follow(arg1_1, arg2_1)
-    local v2_1 = math.min(arg2_1 * 8, 1)
-    arg1_1.x = lerp(arg1_1.x, arg1_1.targetX, v2_1)
-    arg1_1.y = lerp(arg1_1.y, arg1_1.targetY, v2_1)
+local function follow(t, n)
+    local n2 = math.min(n * 8, 1)
+    t.x = lerp(t.x, t.targetX, n2)
+    t.y = lerp(t.y, t.targetY, n2)
 end
 
 return follow
@@ -123,17 +123,17 @@ return summarize
 <td>
 
 ```lua
-local function summarize(arg1_1)
-    local v1_1 = 0
-    local v2_1 = 0
-    for _, v7_1 in arg1_1 do
-        if not v7_1.enabled then
-            v2_1 += 1
+local function summarize(list)
+    local total = 0
+    local count = 0
+    for _, v in list do
+        if not v.enabled then
+            count += 1
         else
-            v1_1 += v7_1.price * (v7_1.count or 1)
+            total += v.price * (v.count or 1)
         end
     end
-    return (`{v1_1 > 100 and "big" or "small"}: {v1_1} ({v2_1} skipped)`)
+    return `{total > 100 and "big" or "small"}: {total} ({count} skipped)`
 end
 
 return summarize
@@ -174,29 +174,29 @@ return Stack
 <td>
 
 ```lua
-local v0 = {}
-v0.__index = v0
+local Class = {}
+Class.__index = Class
 
-function v0.new()
-    return (setmetatable({size = 0, items = {}}, v0))
+function Class.new()
+    return setmetatable({items = {}, size = 0}, Class)
 end
 
-function v0:push(arg2_1)
+function Class:push(item)
     self.size += 1
-    self.items[self.size] = arg2_1
+    self.items[self.size] = item
 end
 
-function v0:pop()
+function Class:pop()
     if self.size == 0 then
         return nil
     end
-    local v1_1 = self.items[self.size]
+    local item = self.items[self.size]
     self.items[self.size] = nil
     self.size -= 1
-    return v1_1
+    return item
 end
 
-return v0
+return Class
 ```
 
 </td>
