@@ -3320,7 +3320,12 @@ fn rename_variables(lines: Vec<String>) -> Vec<String> {
 
 fn signal_params(name: &str) -> Option<&'static [&'static str]> {
     Some(match name {
-        "PlayerAdded" | "PlayerRemoving" | "Triggered" => &["player"],
+        "PlayerAdded" | "PlayerRemoving" | "Triggered" | "TriggerEnded" | "OnServerEvent" => &["player"],
+        "PromptShown" | "PromptHidden" => &["prompt"],
+        "Equipped" => &["mouse"],
+        "KeyframeReached" => &["keyframeName"],
+        "MarkerReached" => &["parameter"],
+        "MouseEnter" | "MouseLeave" | "MouseMoved" => &["x", "y"],
         "CharacterAdded" | "CharacterRemoving" | "CharacterAppearanceLoaded" => &["character"],
         "ChildAdded" | "ChildRemoved" => &["child"],
         "DescendantAdded" | "DescendantRemoving" => &["descendant"],
@@ -3381,16 +3386,18 @@ fn callback_params(lines: Vec<String>) -> Vec<String> {
         let Some((sig, params)) = signal_handler(&out[i]) else { continue };
         let Some(names) = signal_params(sig) else { continue };
         let params = split_params(params);
-        let end = block_end(&out, i);
+        // up to its end line: what follows the `end` there is the enclosing
+        // code's (`end), x.Other:Connect(function(a)` opens the next handler)
+        let end = block_end(&out, i).max(i + 1);
         let mut taken = HashSet::default();
-        for l in &out[i..=end] {
+        for l in &out[i..end] {
             words_into(&mut taken, l);
         }
         for (old, new) in params.iter().zip(names.iter()) {
             if !is_generated(old) || taken.contains(*new) {
                 continue;
             }
-            for l in out[i..=end].iter_mut() {
+            for l in out[i..end].iter_mut() {
                 replace_token(l, old, new);
             }
             taken.insert((*new).to_string());
@@ -3723,6 +3730,68 @@ fn usage_name(name: &str, out: &[String], at: &[u32]) -> Option<String> {
     } else {
         None
     }
+}
+
+/// The kind of value a variable holds, as a short name: by the value it is
+/// given, else by what is done with it.
+fn kind_name(name: &str, out: &[String], at: &[u32], defs: &[usize]) -> Option<String> {
+    let arith = |r: &str| [" + ", " - ", " * ", " / ", " // ", " % ", " ^ "].iter().any(|o| r.contains(o));
+    let logic = |r: &str| [" and ", " or ", " == ", " ~= ", " < ", " > ", " <= ", " >= ", " .. "].iter().any(|o| r.contains(o));
+    if defs.len() == 1 {
+        let st = strip(&out[defs[0]]);
+        if let Some((_, rhs)) = st.split_once(" = ") {
+            let r = rhs.trim();
+            let kind = if r.starts_with('{') {
+                Some("t")
+            } else if r == "true" || r == "false" {
+                Some("flag")
+            } else if r.starts_with('"') || r.starts_with('`') || (r.contains(" .. ") && !r.contains(" and ") && !r.contains(" or ")) {
+                Some("s")
+            } else if r.starts_with('#') || r.trim_start_matches('-').parse::<f64>().is_ok() || (arith(r) && !logic(r)) {
+                Some("n")
+            } else if r.starts_with("function") {
+                Some("fn")
+            } else if r.starts_with("not ") || [" == ", " ~= ", " < ", " > ", " <= ", " >= "].iter().any(|o| r.contains(o)) && !r.contains(" and ") && !r.contains(" or ") {
+                Some("ok")
+            } else if r.ends_with(']') && !r.contains('(') {
+                Some("value")
+            } else {
+                None
+            };
+            if let Some(k) = kind {
+                return Some(k.to_string());
+            }
+        }
+    }
+    // by what is done with it
+    let (mut table, mut number, mut string) = (0, 0, 0);
+    for j in at {
+        let l = &out[*j as usize];
+        let b = l.as_bytes();
+        let mut from = 0;
+        while let Some(p) = l[from..].find(name).map(|x| x + from) {
+            from = p + name.len();
+            if p > 0 && (is_word(b[p - 1]) || b[p - 1] == b'.' || b[p - 1] == b':') {
+                continue;
+            }
+            if from < b.len() && is_word(b[from]) {
+                continue;
+            }
+            let after = &l[from..];
+            let before = &l[..p];
+            if after.starts_with('[') || before.ends_with('#') || (after.starts_with('.') && after[1..].starts_with(|c: char| c.is_ascii_lowercase())) {
+                table += 1;
+            }
+            if [" + ", " - ", " * ", " / ", " % ", " // ", " ^ "].iter().any(|o| after.starts_with(o) || before.ends_with(o)) {
+                number += 1;
+            }
+            if after.starts_with(" ..") || before.ends_with(".. ") {
+                string += 1;
+            }
+        }
+    }
+    let best = [(table, "t"), (number, "n"), (string, "s")].into_iter().max_by_key(|x| x.0)?;
+    (best.0 > 0).then(|| best.1.to_string())
 }
 
 /// A name from what the variable is passed to or done with: the argument
@@ -4142,54 +4211,11 @@ pub fn defined_keys(lines: &[String]) -> Vec<String> {
 ///   * returned at the end of `GetFoo` -> foo
 ///   * used like a known Roblox type (`x.Character`, `x.UserId`) -> player
 /// Parameters take part too, and are named from their call sites first.
-/// What an event hands the function connected to it, by the event's name.
-const EVENT_PARAMS: &[(&str, &[&str])] = &[
-    ("PlayerAdded", &["player"]),
-    ("PlayerRemoving", &["player"]),
-    ("CharacterAdded", &["character"]),
-    ("CharacterRemoving", &["character"]),
-    ("CharacterAppearanceLoaded", &["character"]),
-    ("Touched", &["hit"]),
-    ("TouchEnded", &["hit"]),
-    ("ChildAdded", &["child"]),
-    ("ChildRemoved", &["child"]),
-    ("DescendantAdded", &["descendant"]),
-    ("DescendantRemoving", &["descendant"]),
-    ("InputBegan", &["input", "gameProcessedEvent"]),
-    ("InputEnded", &["input", "gameProcessedEvent"]),
-    ("InputChanged", &["input", "gameProcessedEvent"]),
-    ("Heartbeat", &["deltaTime"]),
-    ("RenderStepped", &["deltaTime"]),
-    ("PreRender", &["deltaTime"]),
-    ("PreSimulation", &["deltaTime"]),
-    ("PostSimulation", &["deltaTime"]),
-    ("Stepped", &["time", "deltaTime"]),
-    ("OnServerEvent", &["player"]),
-    ("HealthChanged", &["health"]),
-    ("FocusLost", &["enterPressed", "inputThatCausedFocusLoss"]),
-    ("Triggered", &["player"]),
-    ("TriggerEnded", &["player"]),
-    ("PromptTriggered", &["prompt", "player"]),
-    ("PromptShown", &["prompt"]),
-    ("PromptHidden", &["prompt"]),
-    ("Chatted", &["message"]),
-    ("AncestryChanged", &["child", "parent"]),
-    ("StateChanged", &["oldState", "newState"]),
-    ("Equipped", &["mouse"]),
-    ("KeyframeReached", &["keyframeName"]),
-    ("MarkerReached", &["parameter"]),
-    ("AttributeChanged", &["attribute"]),
-    ("MouseEnter", &["x", "y"]),
-    ("MouseLeave", &["x", "y"]),
-    ("MouseMoved", &["x", "y"]),
-];
-
-/// Names by convention and by role where the decompiler had none: what an
-/// event hands its handler, loop variables (`i`, `k`, `v`, or the singular of
-/// what is iterated), and `_` for a parameter nothing reads.
+/// Names by convention and by role where the decompiler had none: loop
+/// variables (`i`, `k`, `v`, or the singular of what is iterated), and `_`
+/// for a parameter nothing reads.
 pub fn role_names(lines: Vec<String>) -> Vec<String> {
     let mut out = lines;
-    event_params(&mut out);
     loop_names(&mut out);
     unused_params(&mut out);
     out
@@ -4200,36 +4226,39 @@ fn word_in(out: &[String], lo: usize, hi: usize, w: &str) -> bool {
 }
 
 fn rename_in(out: &mut [String], lo: usize, hi: usize, old: &str, new: &str) {
-    for j in lo..=hi.min(out.len().saturating_sub(1)) {
-        replace_token(&mut out[j], old, new);
-    }
+    let lines: Vec<usize> = (lo..=hi.min(out.len().saturating_sub(1))).collect();
+    rename_lines(out, &lines, old, new);
 }
 
-/// `x.Event:Connect(function(a, b)`: a and b named for what the event passes.
-fn event_params(out: &mut [String]) {
-    for i in 0..out.len() {
-        let Some(params) = func_open(&out[i]).map(split_params) else { continue };
-        let line = out[i].clone();
-        let Some(at) = line.rfind("function(") else { continue };
-        let head = &line[..at];
-        let event = [":Connect(", ":Once(", ":ConnectParallel("]
-            .iter()
-            .find_map(|c| head.strip_suffix(c))
-            .or_else(|| head.strip_suffix(" = ").filter(|h| h.ends_with("OnServerInvoke")))
-            .map(|h| h.rsplit(['.', ':', ' ', '(']).next().unwrap_or(""));
-        let Some(names) = event.and_then(|e| EVENT_PARAMS.iter().find(|(n, _)| *n == e).map(|(_, p)| *p)).or_else(|| {
-            head.strip_suffix(" = ").filter(|h| h.ends_with("OnServerInvoke")).map(|_| &["player"][..])
-        }) else {
-            continue;
-        };
-        let end = block_end(out, i).saturating_sub(1).max(i); // its `end` line is not its own
-        for (k, p) in params.iter().enumerate() {
-            let Some(new) = names.get(k) else { break };
-            if is_generated(p) && !word_in(out, i, end, new) {
-                rename_in(out, i, end, p, new);
+/// Rename `old` to `new` on these lines, or leave them as they were if some
+/// use of it is out of reach (a nested interpolated string). Whether it did.
+fn rename_lines(out: &mut [String], lines: &[usize], old: &str, new: &str) -> bool {
+    let saved: Vec<String> = lines.iter().map(|j| out[*j].clone()).collect();
+    for j in lines {
+        replace_token(&mut out[*j], old, new);
+    }
+    // raw text, strings and interpolations included: a use replace_token
+    // could not reach shows there
+    let left = |l: &str| {
+        let b = l.as_bytes();
+        let mut from = 0;
+        while let Some(p) = l[from..].find(old).map(|x| x + from) {
+            from = p + old.len();
+            let before = p > 0 && (is_word(b[p - 1]) || b[p - 1] == b'.');
+            let after = from < b.len() && is_word(b[from]);
+            if !before && !after {
+                return true;
             }
         }
+        false
+    };
+    if lines.iter().any(|j| left(&out[*j])) {
+        for (j, l) in lines.iter().zip(saved) {
+            out[*j] = l;
+        }
+        return false;
     }
+    true
 }
 
 /// The singular of what a loop goes over, if that says: `players` (or
@@ -4543,6 +4572,17 @@ fn name_pass(out: &mut Vec<String>, index: &mut WordIndex, extra: &Extra) -> boo
             if new.is_none() {
                 new = slot_name(name, &out, at);
             }
+            if new.is_none() {
+                // last: the kind of value, `n2` if `n` is taken
+                if let Some(base) = kind_name(name, &out, at, &defs) {
+                    let taken = |c: &str| {
+                        in_scope(&out, &index, c) || touched.iter().any(|t| t == c) || cands.iter().any(|x| x.1 == c)
+                    };
+                    new = std::iter::once(base.clone())
+                        .chain((2..=20).map(|k| format!("{base}{k}")))
+                        .find(|c| !taken(c));
+                }
+            }
             if let Some(n) = new {
                 if !n.is_empty() {
                     cands.push((name.clone(), n));
@@ -4561,8 +4601,9 @@ fn name_pass(out: &mut Vec<String>, index: &mut WordIndex, extra: &Extra) -> boo
             // there is the enclosing code's (`end}, function(a)` opens the next)
             let stop = hi;
             let hits: Vec<u32> = index.within(old, fi, stop).to_vec();
-            for j in &hits {
-                replace_token(&mut out[*j as usize], old, new);
+            let lines: Vec<usize> = hits.iter().map(|j| *j as usize).collect();
+            if !rename_lines(out, &lines, old, new) {
+                continue; // a use it could not reach: inside a string's interpolation
             }
             renamed |= !hits.is_empty();
             index.add(new, &hits);
