@@ -1523,28 +1523,29 @@ impl<'c, 'm> Dec<'c, 'm> {
     /// Not one calling a helper by name, which may be declared later.
     fn share_closures(&mut self, base: usize) -> Vec<(Rc<str>, String)> {
         let p = self.p;
-        let mut sites: HashMap<usize, (usize, usize)> = HashMap::default(); // constant -> (count, child)
-        for ins in &p.code {
+        // constant -> (loads, child); a load counts if it captures nothing but
+        // itself (a recursive local function)
+        let mut sites: HashMap<usize, (usize, usize)> = HashMap::default();
+        let mut mixed: HashSet<usize> = HashSet::default();
+        for (i, ins) in p.code.iter().enumerate() {
             if ins.op != op::DUPCLOSURE {
                 continue;
             }
             let k = kindex(p, ins.d() as i64);
-            if let K::Closure(c) = &p.k[k] {
-                if self.m.protos[*c].nups == 0 {
-                    sites.entry(k).or_insert((0, *c)).0 += 1;
-                }
+            let K::Closure(c) = &p.k[k] else { continue };
+            let caps = p.code[i + 1..].iter().take_while(|c| c.op == op::CAPTURE);
+            let own = caps.clone().all(|c| c.a() != 2 && c.b() == ins.a());
+            if own && caps.count() == self.m.protos[*c].nups {
+                sites.entry(k).or_insert((0, *c)).0 += 1;
+            } else {
+                mixed.insert(k);
             }
         }
-        let mut keys: Vec<usize> = sites.iter().filter(|(_, v)| v.0 > 1).map(|(k, _)| *k).collect();
+        let mut keys: Vec<usize> = sites.iter().filter(|(k, v)| v.0 > 1 && !mixed.contains(*k)).map(|(k, _)| *k).collect();
         keys.sort_unstable();
         let mut lines = Vec::new();
         for k in keys {
             let child = sites[&k].1;
-            let text = self.closure_text(child, Vec::new(), base);
-            let helpers = self.ctx.helpers.borrow().iter().map(|h| h.1.clone()).collect::<Vec<_>>();
-            if helpers.iter().any(|h| !h.is_empty() && contains_ident(&text, h)) {
-                continue;
-            }
             let hint = self.m.protos[child].name.clone().filter(|n| is_ident(n) && !is_keyword(n));
             let stem = hint.unwrap_or_else(|| "shared".to_string());
             let mut name = stem.clone();
@@ -1554,6 +1555,12 @@ impl<'c, 'm> Dec<'c, 'm> {
                 name = format!("{stem}{n}");
             }
             let name: Rc<str> = Rc::from(name.as_str());
+            let caps = vec![name.clone(); self.m.protos[child].nups];
+            let text = self.closure_text(child, caps, base);
+            let helpers = self.ctx.helpers.borrow().iter().map(|h| h.1.clone()).collect::<Vec<_>>();
+            if helpers.iter().any(|h| !h.is_empty() && **h != *name && contains_ident(&text, h)) {
+                continue;
+            }
             self.add_used(&name);
             let body = text.strip_prefix("function").unwrap_or(&text);
             lines.push((name.clone(), format!("{}local function {name}{body}", sp(base))));
