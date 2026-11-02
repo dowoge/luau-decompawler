@@ -1342,10 +1342,110 @@ fn copy_unless_guards(lines: &mut Vec<String>) {
             .filter(|f| f.strip_prefix("jump_").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())))
             .map(str::to_string);
         match flag {
-            Some(f) if copy_unless(lines, k, &f) => {}
+            Some(f) if copy_unless(lines, k, &f) || copy_unless_repeat(lines, k, &f) => {}
             _ => k += 1,
         }
     }
+}
+
+/// `local F = false  repeat ... F = true break until true  if not F then S
+/// end`: every other way out of the `repeat` (its own `break`s and
+/// `continue`s) skips the set, so S goes before each of those, and the set,
+/// the last break and the flag go.
+fn copy_unless_repeat(lines: &mut Vec<String>, decl: usize, flag: &str) -> bool {
+    let d = indent_of(&lines[decl]);
+    let Some(open) = (decl + 1..lines.len()).find(|&i| !is_blank(&lines[i])) else { return false };
+    if indent_of(&lines[open]) != d || strip(&lines[open]) != "repeat" {
+        return false;
+    }
+    let Some(until) = (open + 1..lines.len()).find(|&i| !is_blank(&lines[i]) && indent_of(&lines[i]) <= d) else { return false };
+    if indent_of(&lines[until]) != d || strip(&lines[until]) != "until true" {
+        return false;
+    }
+    let body_lines: Vec<usize> = (open + 1..until).filter(|&i| !is_blank(&lines[i])).collect();
+    let [.., set_at, brk_at] = body_lines[..] else { return false };
+    if strip(&lines[set_at]) != format!("{flag} = true") || strip(&lines[brk_at]) != "break" || indent_of(&lines[set_at]) != d + 4 || indent_of(&lines[brk_at]) != d + 4 {
+        return false;
+    }
+    let Some(c) = (until + 1..lines.len()).find(|&i| !is_blank(&lines[i])) else { return false };
+    if indent_of(&lines[c]) != d || strip(&lines[c]) != format!("if not {flag} then") {
+        return false;
+    }
+    let mut e = c + 1;
+    while e < lines.len() && (is_blank(&lines[e]) || indent_of(&lines[e]) > d) {
+        e += 1;
+    }
+    if e >= lines.len() || indent_of(&lines[e]) != d || strip(&lines[e]) != "end" {
+        return false;
+    }
+    if (0..lines.len()).any(|i| has_word(&lines[i], flag) && i != decl && i != set_at && i != c) {
+        return false;
+    }
+    let s: Vec<String> = lines[c + 1..e].iter().filter(|l| !is_blank(l)).map(|l| l[d + 4..].to_string()).collect();
+    if s.is_empty() || s.len() > 12 || s.iter().any(|l| has_any_goto(l) || parse_label(l).is_some()) {
+        return false;
+    }
+    let mut words = HashSet::default();
+    for l in &s {
+        words_into(&mut words, l);
+    }
+    if declares_any(&lines[open + 1..until], &words) {
+        return false;
+    }
+    // this repeat's own ways out: not those of a loop inside it
+    let own = |i: usize| -> bool {
+        let mut min = indent_of(&lines[i]);
+        for j in (open + 1..i).rev() {
+            if is_blank(&lines[j]) || indent_of(&lines[j]) >= min {
+                continue;
+            }
+            min = indent_of(&lines[j]);
+            if loop_open(&lines[j]) || strip(&lines[j]).contains("function") {
+                return false;
+            }
+        }
+        true
+    };
+    let mut exits: Vec<usize> = Vec::new();
+    for &i in &body_lines[..body_lines.len() - 2] {
+        let t = strip(&lines[i]);
+        if !(has_word(t, "break") || has_word(t, "continue")) || !own(i) {
+            continue;
+        }
+        let inline = t.starts_with("if ") && (t.ends_with(" then break end") || t.ends_with(" then continue end"));
+        if t == "break" || t == "continue" || inline {
+            exits.push(i);
+        } else {
+            return false; // a way out of a form not known here
+        }
+    }
+    if exits.is_empty() || exits.len() * s.len() > 32 {
+        return false;
+    }
+    let copy_at = |at: usize| -> Vec<String> { s.iter().map(|l| format!("{}{l}", spaces(at))).collect() };
+    // from the bottom up, so the indices above stay put
+    lines.drain(c..=e);
+    lines.remove(brk_at);
+    lines.remove(set_at);
+    for &i in exits.iter().rev() {
+        let at = indent_of(&lines[i]);
+        let t = strip(&lines[i]).to_string();
+        let new: Vec<String> = if let Some(cond) = t.strip_prefix("if ").and_then(|r| r.strip_suffix(" then break end").or_else(|| r.strip_suffix(" then continue end"))) {
+            let word = if t.ends_with(" then break end") { "break" } else { "continue" };
+            let mut v = vec![format!("{}if {cond} then", spaces(at))];
+            v.extend(copy_at(at + 4));
+            v.push(format!("{}{word}", spaces(at + 4)));
+            v.push(format!("{}end", spaces(at)));
+            v
+        } else {
+            let mut v = copy_at(at);
+            v.push(lines[i].clone());
+            v
+        };
+        lines.splice(i..=i, new);
+    }
+    lines.remove(decl);
+    true
 }
 
 fn copy_unless(lines: &mut Vec<String>, decl: usize, flag: &str) -> bool {
