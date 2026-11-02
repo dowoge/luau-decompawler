@@ -2543,6 +2543,8 @@ impl<'c, 'm> Dec<'c, 'm> {
                 }
                 continue;
             }
+            // what it steps through ends with the value
+            let end = end.min(stop);
             let ins = self.insn(q);
             if is_cond_jump(ins.op)
                 || matches!(ins.op, op::JUMP | op::JUMPBACK | op::JUMPX | op::RETURN)
