@@ -98,6 +98,30 @@ fn is_native(m: &Module) -> bool {
     m.protos[m.main].flags & 1 != 0
 }
 
+/// `--strict`: a script whose text needs a flag for a jump or the block
+/// dispatcher is reported as failed instead of written.
+static STRICT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A finished text as `--strict` takes it: the text, or why it is refused.
+fn strict_check(text: String) -> Result<String, String> {
+    if !STRICT.load(std::sync::atomic::Ordering::Relaxed) {
+        return Ok(text);
+    }
+    // `local jump_<pc> = `, not `local jump_height`
+    let flag = text.match_indices("local jump_").any(|(i, m)| {
+        let rest = &text[i + m.len()..];
+        let d = rest.bytes().take_while(u8::is_ascii_digit).count();
+        d > 0 && rest[d..].starts_with(" = ")
+    });
+    if flag {
+        return Err("strict: a jump is kept as a flag".to_string());
+    }
+    if text.contains("local block = 0") {
+        return Err("strict: blocks dispatched by number".to_string());
+    }
+    Ok(text)
+}
+
 /// `--tabs`: indent with tabs, one for each four leading spaces.
 static TABS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -371,11 +395,11 @@ fn run_dir(src: &Path, dst: &Path, opcodes: Opcodes, noflat: bool) -> i32 {
     // than keep every script's
     let finished = |i: usize, lines: Vec<String>, native: bool| -> Result<String, String> {
         if !decomp::INFO.load(std::sync::atomic::Ordering::Relaxed) {
-            return Ok(to_text(&finish_lines(lines, None, native)));
+            return strict_check(to_text(&finish_lines(lines, None, native)));
         }
         let data = fs::read(src.join(&files[i])).map_err(|e| e.to_string())?;
         let m = load(&data, opcodes)?;
-        Ok(to_text(&finish_lines(lines, Some(&m), native)))
+        strict_check(to_text(&finish_lines(lines, Some(&m), native)))
     };
 
     // Script by script, in parallel: the work that needs no other script, up
@@ -580,7 +604,7 @@ fn run_stream(opcodes: Opcodes, noflat: bool) -> i32 {
         let one = || -> Result<String, String> {
             let m = load(items[i], opcodes)?;
             let lines = name_round(decompile_core(&m, None, noflat), &Extra::default());
-            Ok(to_text(&finish_lines(lines, Some(&m), is_native(&m))))
+            strict_check(to_text(&finish_lines(lines, Some(&m), is_native(&m))))
         };
         let result = panic::catch_unwind(AssertUnwindSafe(one)).unwrap_or_else(|e| Err(panic_text(e)));
         let (kind, body) = match &result {
@@ -606,6 +630,8 @@ fn usage() -> i32 {
          \x20 --tabs       indent with tabs\n\
          \x20 --info       above each function, a comment with its upvalues, constants,\n\
          \x20              parameters, registers, instructions and flags\n\
+         \x20 --strict     a script needing a flag for a jump, or blocks dispatched by\n\
+         \x20              number, fails instead of being written\n\
          Bytecode saved as text, a `--` line and then base64, is read as such."
     );
     2
@@ -616,6 +642,7 @@ fn run(args: Vec<String>) -> i32 {
     let upstream = args.iter().any(|a| a == "--upstream");
     TABS.store(args.iter().any(|a| a == "--tabs"), std::sync::atomic::Ordering::Relaxed);
     decomp::INFO.store(args.iter().any(|a| a == "--info"), std::sync::atomic::Ordering::Relaxed);
+    STRICT.store(args.iter().any(|a| a == "--strict"), std::sync::atomic::Ordering::Relaxed);
     let key = match args.iter().position(|a| a == "--key") {
         Some(i) => match args.get(i + 1).and_then(|v| v.parse::<u8>().ok()) {
             Some(k) => Some(k),
@@ -628,7 +655,8 @@ fn run(args: Vec<String>) -> i32 {
         None if upstream => Opcodes::Stock,
         None => Opcodes::Wire,
     };
-    let mut args: Vec<String> = args.into_iter().filter(|a| a != "--upstream" && a != "--tabs" && a != "--info").collect();
+    let flags = ["--upstream", "--tabs", "--info", "--strict"];
+    let mut args: Vec<String> = args.into_iter().filter(|a| !flags.contains(&a.as_str())).collect();
     if let Some(i) = args.iter().position(|a| a == "--key") {
         args.drain(i..i + 2);
     }
@@ -656,7 +684,13 @@ fn run(args: Vec<String>) -> i32 {
         Ok(m) if disasm => decomp::disassemble(&m),
         Ok(m) => {
             let lines = name_round(decompile_core(&m, None, noflat), &Extra::default());
-            to_text(&finish_lines(lines, Some(&m), is_native(&m)))
+            match strict_check(to_text(&finish_lines(lines, Some(&m), is_native(&m)))) {
+                Ok(text) => text,
+                Err(why) => {
+                    eprintln!("{file}: {why}");
+                    return 1;
+                }
+            }
         }
         Err(e) => {
             eprintln!("{file}: {e}");
