@@ -1961,12 +1961,44 @@ impl<'c, 'm> Dec<'c, 'm> {
                 // the same function: its analysis carries over, and only one
                 // is held at a time
                 let flow = std::mem::take(&mut self.flow);
+                // nothing of this attempt is read again: what it made goes
+                // before the next one makes its own
+                drop((params, body));
+                self.shed();
                 let mut again = Dec::with_flow(self.ctx, self.idx, self.upvals.clone(), self.depth, Some(flow));
                 again.flat_regs = true;
                 return again.decompile_once();
             }
         }
         (params, body)
+    }
+
+    /// Let go of what printing made, per instruction and per variable.
+    fn shed(&mut self) {
+        self.regname = Vec::new();
+        self.declared = Vec::new();
+        self.used = HashSet::default();
+        self.once_cache = HashMap::default();
+        self.hoisted = Vec::new();
+        self.hoisted_set = HashSet::default();
+        self.shared_closures = HashMap::default();
+        self.goto_targets = BTreeSet::new();
+        self.label_pcs = BTreeSet::new();
+        self.backward = Vec::new();
+        self.repeat_back = Vec::new();
+        self.labels = Vec::new();
+        self.incoming = Vec::new();
+        self.first_jump = Vec::new();
+        self.consumed = Vec::new();
+        self.pending = BTreeMap::new();
+        self.region_head = None;
+        self.region_lines = None;
+        self.trail = Vec::new();
+        self.decl_log = Vec::new();
+        self.flat_used = None;
+        self.inlined = RefCell::new(Vec::new());
+        self.refusals = RefCell::new(Vec::new());
+        self.defs_left = Vec::new();
     }
 
     fn decompile_once(&mut self) -> (Vec<String>, Vec<String>) {
