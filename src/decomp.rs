@@ -249,6 +249,9 @@ struct Dec<'c, 'm> {
     cur_pc: i32,
     key_pc: Option<i32>,
     flat_regs: bool,
+    /// Past the local limit even so: values wait through the tests on their
+    /// way (`if` expressions, comparisons, `and`/`or` choices).
+    tight: bool,
     flat: bool,
     regname: Vec<Option<Rc<str>>>,
     declared: Vec<bool>,
@@ -657,6 +660,7 @@ impl<'c, 'm> Dec<'c, 'm> {
             cur_pc: 0,
             key_pc: None,
             flat_regs: false,
+            tight: false,
             flat: false,
             param_names: Vec::new(),
             once_cache: HashMap::default(),
@@ -1675,6 +1679,7 @@ impl<'c, 'm> Dec<'c, 'm> {
         let mut i = from;
         // a join the walk came to itself, from a test it went through
         let mut joined: Option<i32> = None;
+        let building = self.pending.get(&q).is_some_and(|e| e.borrow().fields.is_some());
         while i < code.len() {
             let ins = &code[i];
             // a helper copied in after: a call, whatever branches it has
@@ -1720,6 +1725,12 @@ impl<'c, 'm> Dec<'c, 'm> {
             if rd.has(q) && snapshot && !matches!(ins.op, op::CALL | op::CALLFB | op::SETLIST | op::RETURN) {
                 return false;
             }
+            // past a test, a value waits only for its last reader: one that
+            // reads it again after would find it folded into this one (a
+            // table being built is read by each of its stores)
+            if self.tight && !building && rd.has(q) && joined.is_some() && !wr.has(q) && self.live_after(ins.pc, q) {
+                return false;
+            }
             if rd.has(q) && method_args {
                 return true;
             }
@@ -1733,29 +1744,36 @@ impl<'c, 'm> Dec<'c, 'm> {
                 return carries && !(binary && c == q && b != q); // `g() + f()` keeps its order
             }
             // `if f() then a else b`, as a constructor's item: the value its
-            // arms make flows on from where they meet
-            let building = self.pending.get(&q).is_some_and(|e| e.borrow().fields.is_some());
-            if carries && building && matches!(ins.op, op::JUMPIF | op::JUMPIFNOT) {
-                if let Some(join) = self.if_else_join(i) {
-                    let to = self.flow.idx(join).unwrap_or(code.len());
-                    for arm in &code[i + 1..to] {
-                        if arm.pc != ins.pc && self.has_label(arm.pc) && arm.pc != ins.jump_target().unwrap_or(-1) {
-                            return false;
-                        }
-                        let (ard, awr, abarrier) = effects(arm, self.p.maxstack);
-                        if abarrier || ard.has(q) || awr.has(q) {
-                            return false;
-                        }
-                        for r in 0..self.p.maxstack {
-                            if awr.has(r) {
-                                flow.add(r);
-                            }
+            // arms make flows on from where they meet. Past the local limit,
+            // any value a test makes on the way (an `if` expression, a
+            // comparison, `a and b or c`) is read with the rest
+            let region = if self.tight {
+                is_cond_jump(ins.op).then(|| self.closed_region(i)).flatten()
+            } else if carries && building && matches!(ins.op, op::JUMPIF | op::JUMPIFNOT) {
+                self.if_else_join(i)
+            } else {
+                None
+            };
+            if let Some(join) = region {
+                let to = self.flow.idx(join).unwrap_or(code.len());
+                for arm in &code[i + 1..to] {
+                    // (all of a closed region's jumps land inside it)
+                    if !self.tight && arm.pc != ins.pc && self.has_label(arm.pc) && arm.pc != ins.jump_target().unwrap_or(-1) {
+                        return false;
+                    }
+                    let (ard, awr, abarrier) = effects(arm, self.p.maxstack);
+                    if abarrier || ard.has(q) || awr.has(q) {
+                        return false;
+                    }
+                    for r in 0..self.p.maxstack {
+                        if awr.has(r) {
+                            flow.add(r);
                         }
                     }
-                    joined = Some(join);
-                    i = to;
-                    continue;
                 }
+                joined = Some(join);
+                i = to;
+                continue;
             }
             let (s, n) = ins.successors();
             if barrier || wr.has(q) || !(n == 1 && s[0] == ins.pc + ins.n) {
@@ -1771,6 +1789,35 @@ impl<'c, 'm> Dec<'c, 'm> {
             i += 1;
         }
         false
+    }
+
+    /// Where the forward region the test at code index i opens ends, when
+    /// every jump in it lands inside it or at its end, and none from outside
+    /// lands in it or there: an `if` expression, a comparison's boolean, an
+    /// `and`/`or` choice.
+    fn closed_region(&self, i: usize) -> Option<i32> {
+        let code = &self.p.code;
+        let test = &code[i];
+        let mut end = test.jump_target()?;
+        if end <= test.pc {
+            return None;
+        }
+        let entered = |pc: i32| self.first_jump.get(pc as usize).is_some_and(|f| *f < test.pc);
+        let mut k = i + 1;
+        while k < code.len() && code[k].pc < end {
+            let c = &code[k];
+            if c.op == op::RETURN || is_for(c.op) || self.is_loop_head(c.pc) || (self.has_label(c.pc) && entered(c.pc)) {
+                return None;
+            }
+            if let Some(t) = c.jump_target() {
+                if t <= test.pc {
+                    return None;
+                }
+                end = end.max(t);
+            }
+            k += 1;
+        }
+        (self.valid(end) && !entered(end) && !self.is_loop_head(end)).then_some(end)
     }
 
     /// The join of `JUMPIF(NOT) c -> T; A; JUMP -> J; T: B; J:` starting at
@@ -1940,6 +1987,28 @@ impl<'c, 'm> Dec<'c, 'm> {
     }
 
     fn decompile_body(&mut self) -> (Vec<String>, Vec<String>) {
+        let (params, body) = self.decompile_fitted();
+        let given = self.p.numparams as usize;
+        if self.tight || given + locals_in_scope(&body) <= LOCAL_LIMIT {
+            return (params, body);
+        }
+        // Still past the limit: a value computed before a test waits for its
+        // call or table past it, instead of taking a local of its own. Kept
+        // only if it needs fewer.
+        let flow = std::mem::take(&mut self.flow);
+        self.shed();
+        let mut again = Dec::with_flow(self.ctx, self.idx, self.upvals.clone(), self.depth, Some(flow));
+        again.tight = true;
+        let (tparams, tbody) = again.decompile_fitted();
+        if locals_in_scope(&tbody) < locals_in_scope(&body) {
+            (tparams, tbody)
+        } else {
+            (params, body)
+        }
+    }
+
+    /// The body, in fewer locals than Luau's limit if it can be.
+    fn decompile_fitted(&mut self) -> (Vec<String>, Vec<String>) {
         let (params, body) = self.decompile_once();
         if !self.flat_regs {
             let peak = peak_locals(&body);
@@ -1967,7 +2036,10 @@ impl<'c, 'm> Dec<'c, 'm> {
                 self.shed();
                 let mut again = Dec::with_flow(self.ctx, self.idx, self.upvals.clone(), self.depth, Some(flow));
                 again.flat_regs = true;
-                return again.decompile_once();
+                again.tight = self.tight;
+                let made = again.decompile_once();
+                self.flow = std::mem::take(&mut again.flow); // for a retry after this one
+                return made;
             }
         }
         (params, body)
@@ -4927,6 +4999,39 @@ fn declared_names(chunk: &str, base: &str) -> Vec<String> {
     }
     let head = rest.split(" = ").next().unwrap_or(rest);
     head.split(',').map(|s| s.trim().to_string()).filter(|s| is_ident(s)).collect()
+}
+
+/// Luau's limit on locals in scope in one function, its parameters included.
+const LOCAL_LIMIT: usize = 200;
+
+/// The most locals in scope at once in a body, loop variables included, as
+/// they count against LOCAL_LIMIT (nested functions' own are counted too).
+fn locals_in_scope(body: &[String]) -> usize {
+    let (mut alive, mut peak) = (0usize, 0usize);
+    let mut scopes: Vec<(usize, usize)> = Vec::new(); // (indent, locals there)
+    for line in body.iter().flat_map(|c| c.split('\n')).filter(|l| !l.trim().is_empty()) {
+        let ind = passes::indent_of(line);
+        while scopes.last().is_some_and(|s| s.0 > ind) {
+            alive -= scopes.pop().unwrap().1;
+        }
+        // a loop's variables live in its body, one level in
+        let looped = line[ind..].strip_prefix("for ").map_or(0, |rest| {
+            let head = rest.split(" = ").next().unwrap_or(rest).split(" in ").next().unwrap_or(rest);
+            head.split(',').count()
+        });
+        for (at, new) in [(ind, base_locals(line, &line[..ind])), (ind + 1, looped)] {
+            if new == 0 {
+                continue;
+            }
+            match scopes.last_mut() {
+                Some(s) if s.0 == at => s.1 += new,
+                _ => scopes.push((at, new)),
+            }
+            alive += new;
+        }
+        peak = peak.max(alive);
+    }
+    peak
 }
 
 /// The most locals in scope at once anywhere in these lines, nested blocks
