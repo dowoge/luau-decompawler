@@ -5673,6 +5673,13 @@ fn scope_level(lines: &[String], off: usize, ind: usize, mentions: &Mentions, de
                     i += 1;
                 }
                 let inner = &stmt[start..i];
+                // a function's body (its header ends in `)`: lines are never
+                // wrapped) has its own limit and was scoped on its own
+                let opener = stmt[start - 1].trim_end();
+                if opener.ends_with(')') && opener.contains("function") {
+                    done.extend(inner.iter().cloned());
+                    continue;
+                }
                 let inner_ind = inner.iter().find(|l| !l.trim().is_empty()).map_or(ind + 4, |l| passes::indent_of(l));
                 done.extend(scope_level(inner, off + a + start, inner_ind, mentions, deep, keep));
             } else {
