@@ -8,6 +8,7 @@
 //!   harness undeclared DIR...     generated names used without a declaration
 //!   harness same A B              are two output trees identical?
 //!   harness gen SEED SIZE         prints one generated program
+//!   harness validate DIR...       every file in an output tree compiles
 //!
 //! `luau_check` and `luau_run` (see CMakeLists.txt) are the real compiler and
 //! VM; they are looked for in build/Release, or in $LUAU_BIN.
@@ -27,6 +28,7 @@ mod reduce;
 mod rng;
 mod shape;
 mod text;
+mod validate;
 
 use std::process::ExitCode;
 
@@ -42,6 +44,7 @@ harness edits [--places a,b] [--top N] [--show KEY] [--count N]
 harness undeclared DIR...
 harness same A B
 harness gen SEED SIZE
+harness validate DIR... [--level N]
 ";
 
 fn main() -> ExitCode {
@@ -61,6 +64,7 @@ fn main() -> ExitCode {
         "undeclared" => text::undeclared_main(&args),
         "same" => text::same_main(&args),
         "gen" => gen::main(&args),
+        "validate" => validate::main(&args),
         _ => {
             eprint!("{USAGE}");
             2
