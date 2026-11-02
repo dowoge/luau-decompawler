@@ -2434,7 +2434,16 @@ impl<'c, 'm> Dec<'c, 'm> {
                 let folded = if is_cond_jump(ins.op) {
                     let nxt = q + ins.n;
                     let v = self.bool_value(q, nxt, Some(&mut scratch), ind, false);
-                    v.or_else(|| self.and_or_value(q, nxt, stop))
+                    v.or_else(|| {
+                        self.joined_value = None;
+                        let f = self.and_or_value(q, nxt, stop)?;
+                        // read again after its join: a variable, which no
+                        // expression declares (the value itself is the caller's)
+                        match self.joined_value.take() {
+                            Some(j) if (j != r || f < stop) && self.pending.contains_key(&j) && !self.read_once_from(f, j) => None,
+                            _ => Some(f),
+                        }
+                    })
                 } else {
                     None
                 };
