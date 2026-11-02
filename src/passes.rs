@@ -368,7 +368,9 @@ fn replace_token(line: &mut String, old: &str, new: &str) {
                 j += m;
             }
             let prev = if i > 0 { b[i - 1] } else { 0 };
-            if &s[i..j] == old && prev != b'.' && prev != b':' {
+            // `p: number`: a parameter's type, no variable
+            let annotation = prev == b' ' && i >= 2 && b[i - 2] == b':';
+            if &s[i..j] == old && prev != b'.' && prev != b':' && !annotation {
                 out.push_str(&s[plain..i]);
                 out.push_str(new);
                 plain = j;
@@ -637,7 +639,13 @@ fn block_end(lines: &[String], i: usize) -> usize {
     lines.len() - 1
 }
 
+/// The parameters' names, without the types some are annotated with.
 fn split_params(s: &str) -> Vec<String> {
+    split_params_typed(s).iter().map(|p| strip(p.split(':').next().unwrap_or("")).to_string()).collect()
+}
+
+/// The parameters as written, `name: type` included.
+fn split_params_typed(s: &str) -> Vec<String> {
     s.split(',').map(strip).filter(|x| !x.is_empty()).map(str::to_string).collect()
 }
 
@@ -2895,7 +2903,8 @@ fn local_functions(lines: Vec<String>) -> Vec<String> {
             if taken || called_plainly || !(used_as_obj || (free && called_as_method)) {
                 continue;
             }
-            (format!("{pad}function {obj}:{key}({})", plist[1..].join(", ")), first.clone(), end)
+            let typed = split_params_typed(params);
+            (format!("{pad}function {obj}:{key}({})", typed[1..].join(", ")), first.clone(), end)
         };
         if first != "_" {
             for l in out[i + 1..end.max(i + 1)].iter_mut() {

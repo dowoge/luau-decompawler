@@ -281,6 +281,9 @@ pub struct Proto {
     /// Source line the function starts at, and of each pc (empty if stripped).
     pub linedefined: u32,
     pub lines: Vec<u32>,
+    /// The type the compiler recorded for each parameter (its annotation),
+    /// one byte each; empty when none was.
+    pub param_types: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -290,6 +293,46 @@ pub struct Module {
     pub text: Vec<String>,
     pub protos: Vec<Proto>,
     pub main: usize,
+    /// Names of the host types a type byte 64 + i refers to.
+    pub userdata: Vec<Option<String>>,
+}
+
+/// An annotation as the source wrote it, from a recorded type byte; None for
+/// those that name no type a source could have spelled that way (`any`, a
+/// table or function type, nil, plain userdata).
+pub fn type_name(m: &Module, t: u8) -> Option<String> {
+    let base = t & 0x7F;
+    let name = match base {
+        1 => "boolean".to_string(),
+        2 => "number".to_string(),
+        3 => "string".to_string(),
+        6 => "thread".to_string(),
+        8 => "Vector3".to_string(), // the host's vector type
+        9 => "buffer".to_string(),
+        64..=95 => m.userdata.get((base - 64) as usize)?.clone()?,
+        _ => return None,
+    };
+    Some(if t & 0x80 != 0 { format!("{name}?") } else { name })
+}
+
+/// Parameter types from a function's type information: the function type
+/// `[5 nparams type...]`, first in it from types version 2 on (after the
+/// sizes of it, the upvalue types and the local types).
+fn param_types(blob: &[u8], tv: u8) -> Vec<u8> {
+    let mut r = Reader { d: blob, o: 0 };
+    let func: &[u8] = if tv >= 2 {
+        let Ok(n) = r.varint() else { return Vec::new() };
+        if r.varint().is_err() || r.varint().is_err() {
+            return Vec::new();
+        }
+        r.take(n as usize).unwrap_or(&[])
+    } else {
+        blob
+    };
+    match func {
+        [5, n, rest @ ..] => rest.iter().take(*n as usize).copied().collect(),
+        _ => Vec::new(),
+    }
 }
 
 struct Reader<'a> {
@@ -358,10 +401,16 @@ pub fn parse(data: &[u8], scrambled: bool) -> R<Module> {
         strings.push(r.take(n)?.to_vec());
     }
     let text: Vec<String> = strings.iter().map(|s| String::from_utf8_lossy(s).into_owned()).collect();
+    let mut userdata: Vec<Option<String>> = Vec::new();
     if tv == 3 {
         let mut idx = r.u8()?;
         while idx != 0 {
-            r.varint()?;
+            let s = r.varint()? as usize;
+            let at = idx as usize - 1;
+            if userdata.len() <= at {
+                userdata.resize(at + 1, None);
+            }
+            userdata[at] = s.checked_sub(1).and_then(|s| text.get(s)).cloned();
             idx = r.u8()?;
         }
     }
@@ -376,9 +425,10 @@ pub fn parse(data: &[u8], scrambled: bool) -> R<Module> {
         if version >= 4 {
             r.u8()?; // flags
         }
+        let mut types = Vec::new();
         if tv != 0 {
             let n = r.varint()? as usize;
-            r.take(n)?;
+            types = param_types(r.take(n)?, tv);
         }
         let sizecode = r.varint()? as usize;
         let raw = r.take(sizecode.checked_mul(4).ok_or("truncated")?)?;
@@ -528,6 +578,7 @@ pub fn parse(data: &[u8], scrambled: bool) -> R<Module> {
             locals,
             linedefined,
             lines,
+            param_types: types,
         });
     }
     let main = r.varint()? as usize;
@@ -536,5 +587,5 @@ pub fn parse(data: &[u8], scrambled: bool) -> R<Module> {
     if trailer != 0 && trailer != 24 {
         return Err(format!("{trailer} unexpected bytes after the main proto"));
     }
-    Ok(Module { strings, text, protos, main })
+    Ok(Module { strings, text, protos, main, userdata })
 }

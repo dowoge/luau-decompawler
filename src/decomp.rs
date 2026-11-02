@@ -5371,7 +5371,17 @@ impl<'c, 'm> Dec<'c, 'm> {
         let (fparams, body) = (&result.0, &result.1);
         // the body sits one level under the line that writes the closure
         let shift = ind as i64 + 4 - 4 * (self.depth as i64 + 2);
-        let mut text = format!("function({})\n", fparams.join(", "));
+        // with the type each parameter was annotated with, where recorded
+        let types = &self.m.protos[child].param_types;
+        let shown: Vec<String> = fparams
+            .iter()
+            .enumerate()
+            .map(|(i, p)| match types.get(i).and_then(|t| crate::bytecode::type_name(self.m, *t)) {
+                Some(t) if p != "..." => format!("{p}: {t}"),
+                _ => p.clone(),
+            })
+            .collect();
+        let mut text = format!("function({})\n", shown.join(", "));
         if shift != 0 {
             let mut first = true;
             for chunk in body {

@@ -42,8 +42,9 @@ fn list_char(c: char) -> bool {
     name_char(c) || c == ',' || c == ' '
 }
 
+/// The names in a list, a parameter's `: type` left off.
 fn add_names(found: &mut HashSet<String>, list: &str) {
-    found.extend(list.split(',').map(|x| x.trim().to_string()));
+    found.extend(list.split(',').map(|x| x.split(':').next().unwrap_or("").trim().to_string()));
 }
 
 /// After `local`: the names, up to ` =`, `(` or the end of the line.
