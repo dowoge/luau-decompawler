@@ -303,6 +303,7 @@ pub fn truthy_constant(e: &E) -> bool {
     let x = e.borrow();
     let t = x.text.trim_start_matches('-');
     let number = t.parse::<f64>().is_ok()
+        || matches!(t, "math.pi" | "math.huge")
         || t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).is_some_and(|h| !h.is_empty() && h.bytes().all(|c| c.is_ascii_hexdigit()));
     let string = t.len() >= 2 && t.starts_with('"') && t.ends_with('"') && {
         // one literal: no quote inside but escaped ones
@@ -655,7 +656,21 @@ fn float_repr(v: f64) -> String {
     }
 }
 
+thread_local! {
+    /// The module being printed leaves `math` alone and never calls getfenv
+    /// or setfenv: Luau folds `math.pi` to its value there, so that value
+    /// prints as `math.pi` again.
+    static LIBRARY_CONSTANTS: Cell<bool> = const { Cell::new(false) };
+}
+
+pub fn set_library_constants(on: bool) {
+    LIBRARY_CONSTANTS.with(|c| c.set(on));
+}
+
 pub fn fmt_number(v: f64) -> String {
+    if v.abs() == std::f64::consts::PI && LIBRARY_CONSTANTS.with(Cell::get) {
+        return if v > 0.0 { "math.pi" } else { "-math.pi" }.to_string();
+    }
     if v.is_nan() {
         // 0/0 folds to the default NaN, its sign bit set where Luau compiles
         // (x86); the other sign is its negation

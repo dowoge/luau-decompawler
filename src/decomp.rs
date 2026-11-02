@@ -52,6 +52,8 @@ pub static INFO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::
 /// the flags the compiler gave it, its upvalues as this text names them, and
 /// its constants.
 pub fn info_comments(lines: Vec<String>, m: &Module) -> Vec<String> {
+    // constants as the bytecode holds them: π as a number
+    set_library_constants(false);
     // how each function's creator captures its upvalues
     let mut kinds: HashMap<usize, Vec<u8>> = HashMap::default();
     for p in &m.protos {
@@ -734,7 +736,21 @@ fn field_tail(text: &str) -> Option<&str> {
     is_ident(tail).then_some(tail)
 }
 
+/// Luau folds library constants (`math.pi`) in a module that leaves `math`
+/// alone and calls neither getfenv nor setfenv.
+fn library_constants_fold(m: &Module) -> bool {
+    !m.protos.iter().any(|p| {
+        p.code.iter().any(|ins| match ins.op {
+            op::SETGLOBAL => kstr(m, p, ins.aux as usize) == Some("math"),
+            op::GETGLOBAL => matches!(kstr(m, p, ins.aux as usize), Some("getfenv" | "setfenv")),
+            op::GETIMPORT => matches!(import_expr(m, p, ins.aux).as_str(), "getfenv" | "setfenv"),
+            _ => false,
+        })
+    })
+}
+
 pub fn decompile_lines(m: &Module, noflat: bool) -> Vec<String> {
+    set_library_constants(library_constants_fold(m));
     let spans = m
         .protos
         .iter()
