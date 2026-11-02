@@ -1467,7 +1467,13 @@ impl<'c, 'm> Dec<'c, 'm> {
                             let e = self.get(r);
                             self.assign(out, ind, r, &e);
                         }
-                        self.name_for(r)
+                        // the variable the copy reads, where it first reads it:
+                        // before the copy the register may hold another
+                        let at = self.known_read(pc, call.end, r).or(self.key_pc);
+                        let old = std::mem::replace(&mut self.key_pc, at);
+                        let name = self.name_for(r);
+                        self.key_pc = old;
+                        name
                     }
                 });
             }
