@@ -139,6 +139,21 @@ struct Walk<'a> {
     need: Option<usize>,
     /// Caller locals written in place of the helper's upvalue stores.
     upval_writes: Vec<usize>,
+    /// Helper registers holding a number Luau folded: arithmetic on numbers
+    /// the call gave. The copy has no code for them; what reads one reads
+    /// that number, loaded.
+    known: HashMap<usize, f64>,
+}
+
+/// A number written as source text (a constant, or a LOADN's operand).
+fn number(text: &str) -> Option<f64> {
+    let t = text.trim();
+    let digit = t.trim_start_matches('-').starts_with(|c: char| c.is_ascii_digit() || c == '.');
+    if digit {
+        t.parse::<f64>().ok()
+    } else {
+        None
+    }
 }
 
 fn falsy(text: &str) -> bool {
@@ -164,6 +179,10 @@ impl Walk<'_> {
     }
 
     fn read(&mut self, p: usize, c: usize, pc: i32) -> Option<()> {
+        if let Some(v) = self.known.get(&p).copied() {
+            // a folded number: the caller loaded it where it is read
+            return self.loaded.get(&c).and_then(|l| number(&l.0)).is_some_and(|x| x == v).then_some(());
+        }
         if let Some(Some(Arg::Const(text))) = self.args.get(p) {
             return (self.loaded.get(&c).map(|l| &l.0) == Some(text)).then_some(());
         }
@@ -197,6 +216,9 @@ impl Walk<'_> {
 
     /// Parameter p is this constant, wherever it is read.
     fn constant(&mut self, p: usize, text: String) -> Option<()> {
+        if let Some(v) = self.known.get(&p).copied() {
+            return (number(&text) == Some(v)).then_some(()); // the K form of a folded number
+        }
         if self.map.get(p)?.is_some() || p >= self.helper.numparams {
             return None;
         }
@@ -215,6 +237,7 @@ impl Walk<'_> {
 
     fn write(&mut self, p: usize, c: usize) -> Option<()> {
         self.unread.remove(&p);
+        self.known.remove(&p);
         *self.map.get_mut(p)? = Some(c);
         self.loaded.remove(&c);
         self.written.push(c);
@@ -265,6 +288,72 @@ impl Walk<'_> {
                     _ => kexpr(self.m, self.helper, (p.aux & 0xFFFFFF) as i64),
                 };
                 Some((text == k) != (p.aux >> 31 != 0))
+            }
+            _ => None,
+        }
+    }
+
+    /// The number helper register r holds as Luau saw it at compile time: a
+    /// folded value, or a parameter given a number and never assigned.
+    fn value(&self, r: usize) -> Option<f64> {
+        if let Some(v) = self.known.get(&r) {
+            return Some(*v);
+        }
+        if r < self.helper.numparams && !self.assigned[r] && self.map[r].is_none() {
+            if let Some(Some(Arg::Const(t))) = self.args.get(r) {
+                return number(t);
+            }
+        }
+        None
+    }
+
+    /// p's result when all it reads are known numbers: what Luau's constant
+    /// folding makes of it.
+    fn fold(&self, p: &Insn) -> Option<f64> {
+        let k = |i: i64| number(&kexpr(self.m, self.helper, i));
+        let o = plain(p.op);
+        if o == op::MINUS {
+            return Some(-self.value(p.b())?);
+        }
+        let (a, b) = match o {
+            op::ADD | op::SUB | op::MUL | op::DIV | op::MOD | op::POW | op::IDIV => (self.value(p.b())?, self.value(p.c())?),
+            op::ADDK | op::SUBK | op::MULK | op::DIVK | op::MODK | op::POWK | op::IDIVK => (self.value(p.b())?, k(p.c() as i64)?),
+            op::SUBRK | op::DIVRK => (k(p.b() as i64)?, self.value(p.c())?),
+            _ => return None,
+        };
+        Some(match o {
+            op::ADD | op::ADDK => a + b,
+            op::SUB | op::SUBK | op::SUBRK => a - b,
+            op::MUL | op::MULK => a * b,
+            op::DIV | op::DIVK | op::DIVRK => a / b,
+            op::MOD | op::MODK => a - (a / b).floor() * b,
+            op::POW | op::POWK => a.powf(b),
+            _ => (a / b).floor(), // IDIV, IDIVK
+        })
+    }
+
+    /// A test of known numbers, folded: Some(true) if it jumps.
+    fn known_test(&self, p: &Insn) -> Option<bool> {
+        let o = plain(p.op);
+        match o {
+            // a number is true
+            op::JUMPIF | op::JUMPIFNOT => self.known.contains_key(&p.a()).then_some(o == op::JUMPIF),
+            op::JUMPIFEQ | op::JUMPIFNOTEQ | op::JUMPIFLT | op::JUMPIFNOTLT | op::JUMPIFLE | op::JUMPIFNOTLE => {
+                let (x, y) = (self.value(p.a())?, self.value((p.aux & 0xFF) as usize)?);
+                if !self.known.contains_key(&p.a()) && !self.known.contains_key(&((p.aux & 0xFF) as usize)) {
+                    return None; // two parameters: the tests on those are another matter
+                }
+                let holds = match o {
+                    op::JUMPIFEQ | op::JUMPIFNOTEQ => x == y,
+                    op::JUMPIFLT | op::JUMPIFNOTLT => x < y,
+                    _ => x <= y,
+                };
+                Some(holds != matches!(o, op::JUMPIFNOTEQ | op::JUMPIFNOTLT | op::JUMPIFNOTLE))
+            }
+            op::JUMPXEQKN => {
+                let x = *self.known.get(&p.a())?;
+                let k = number(&kexpr(self.m, self.helper, (p.aux & 0xFFFFFF) as i64))?;
+                Some((x == k) != (p.aux >> 31 != 0))
             }
             _ => None,
         }
@@ -774,6 +863,7 @@ fn match_once(m: &Module, caller: &Proto, id: usize, start: usize, assumed: &[Op
         assumed: assumed.to_vec(),
         need: None,
         upval_writes: Vec::new(),
+        known: HashMap::default(),
         assigned: (0..helper.numparams)
             .map(|r| helper.code.iter().any(|i| !ignored(i.op) && full_effects(i, helper.maxstack).1.has(r)))
             .collect(),
@@ -831,8 +921,13 @@ fn match_once(m: &Module, caller: &Proto, id: usize, start: usize, assumed: &[Op
             && p.a() < helper.numparams
             && (matches!(walk.args[p.a()], Some(Arg::Const(_))) || walk.assumed[p.a()].is_some());
         let tested_here = code.get(i).is_some_and(|c| plain(c.op) == plain(p.op));
-        if tests && (constant || !tested_here) {
-            let jumps = walk.folded_test(p);
+        // a test of numbers folded from the arguments, the same way
+        let known = if tested_here { None } else { walk.known_test(p) };
+        if known.is_some() || tests && (constant || !tested_here) {
+            let jumps = match known {
+                Some(j) => Some(j),
+                None => walk.folded_test(p),
+            };
             if walk.need.is_some() {
                 *need = walk.need;
                 return refuse("a test of a parameter not known yet");
@@ -855,6 +950,17 @@ fn match_once(m: &Module, caller: &Proto, id: usize, start: usize, assumed: &[Op
                         }
                     }
                 }
+                continue;
+            }
+        }
+        // arithmetic on numbers the call gave: folded, nothing of it in the
+        // copy, and what reads the result reads that number
+        if let Some(v) = walk.fold(p) {
+            let c = code.get(i)?;
+            if plain(c.op) != plain(p.op) {
+                walk.known.insert(p.a(), v);
+                walk.map[p.a()] = None;
+                landing.entry(p.pc).or_insert(c.pc);
                 continue;
             }
         }
@@ -930,6 +1036,15 @@ fn match_once(m: &Module, caller: &Proto, id: usize, start: usize, assumed: &[Op
                         last = c.pc;
                         i = skip(code, i + 1);
                     }
+                }
+                // `return x * 2` folded to a number: the copy loads it where
+                // the result goes
+                2 if walk.known.get(&p.a()).is_some_and(|v| walk.load_text(c).and_then(|t| number(&t)) == Some(*v))
+                    && result.is_none_or(|r| r == c.a()) =>
+                {
+                    result = Some(c.a());
+                    last = c.pc;
+                    i = skip(code, i + 1);
                 }
                 // `return value` of a parameter given a constant (or first read
                 // here): the copy loads that constant where the result goes
