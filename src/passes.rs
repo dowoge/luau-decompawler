@@ -4203,8 +4203,9 @@ fn key_of(kind: &str, name: &str) -> String {
 
 /// (kind, function name) -> argument lists, kind "" f(...), "." t.f(...),
 /// ":" t:f(...); only for the keys asked for, since finding a call's closing
-/// parenthesis and splitting its arguments is what costs.
-pub fn collect_calls(lines: &[String], calls: &mut CallMap, wanted: &HashSet<String>) {
+/// parenthesis and splitting its arguments is what costs. None asks for every
+/// `.f` and `:f` (the only kinds a script defines functions under).
+pub fn collect_calls(lines: &[String], calls: &mut CallMap, wanted: Option<&HashSet<String>>) {
     let mut key = String::new();
     for l in lines {
         let Some(first) = l.find('(') else { continue };
@@ -4232,7 +4233,11 @@ pub fn collect_calls(lines: &[String], calls: &mut CallMap, wanted: &HashSet<Str
             key.clear();
             key.push_str(&l[st - k..st]);
             key.push_str(name);
-            if !wanted.contains(&key) || pass_keyword(name) {
+            let asked = match wanted {
+                Some(w) => w.contains(&key),
+                None => k == 1,
+            };
+            if !asked || pass_keyword(name) {
                 continue;
             }
             if let Some(close) = matching_paren(b, e) {
@@ -4405,6 +4410,89 @@ pub fn tally(calls: &CallMap) -> Tally {
                     kv.params[i].vote(&n, 1);
                 }
             }
+        }
+    }
+    out
+}
+
+/// A tally as bytes, a fraction of its size as maps: a script's call sites of
+/// every function it calls, kept until the place's functions are known.
+pub fn tally_bytes(t: &Tally) -> Vec<u8> {
+    fn num(out: &mut Vec<u8>, mut n: usize) {
+        loop {
+            let b = (n & 0x7F) as u8;
+            n >>= 7;
+            if n == 0 {
+                out.push(b);
+                return;
+            }
+            out.push(b | 0x80);
+        }
+    }
+    fn text(out: &mut Vec<u8>, s: &str) {
+        num(out, s.len());
+        out.extend_from_slice(s.as_bytes());
+    }
+    let mut out = Vec::new();
+    for (key, kv) in t {
+        text(&mut out, key);
+        num(&mut out, kv.total);
+        num(&mut out, kv.params.len());
+        for p in &kv.params {
+            num(&mut out, p.order.len());
+            for (name, count) in &p.order {
+                text(&mut out, name);
+                num(&mut out, *count);
+            }
+        }
+    }
+    out
+}
+
+/// The tally tally_bytes wrote, of the keys asked for: the same as tallying
+/// only those, since each key's call sites are counted by themselves.
+pub fn tally_from(bytes: &[u8], wanted: &HashSet<String>) -> Tally {
+    fn num(b: &[u8], at: &mut usize) -> usize {
+        let (mut n, mut shift) = (0usize, 0);
+        loop {
+            let x = b[*at];
+            *at += 1;
+            n |= usize::from(x & 0x7F) << shift;
+            if x & 0x80 == 0 {
+                return n;
+            }
+            shift += 7;
+        }
+    }
+    fn text<'a>(b: &'a [u8], at: &mut usize) -> &'a str {
+        let n = num(b, at);
+        let s = std::str::from_utf8(&b[*at..*at + n]).unwrap_or_default();
+        *at += n;
+        s
+    }
+    let mut out = Tally::default();
+    let mut at = 0;
+    while at < bytes.len() {
+        let key = text(bytes, &mut at);
+        let keep = wanted.contains(key);
+        let total = num(bytes, &mut at);
+        let params = num(bytes, &mut at);
+        let mut kv = KeyVotes { total, params: Vec::new() };
+        for _ in 0..params {
+            let mut p = ParamVotes::default();
+            for _ in 0..num(bytes, &mut at) {
+                let name = text(bytes, &mut at);
+                let count = num(bytes, &mut at);
+                if keep {
+                    p.vote(name, count);
+                }
+            }
+            if keep {
+                kv.params.push(p);
+            }
+        }
+        if keep {
+            out.insert(key.to_string(), kv);
         }
     }
     out
@@ -4687,7 +4775,7 @@ fn name_pass(out: &mut Vec<String>, index: &mut WordIndex, extra: &Extra) -> boo
         }
     }
     let mut calls = CallMap::default();
-    collect_calls(out, &mut calls, &asked);
+    collect_calls(out, &mut calls, Some(&asked));
     let no_sites: Vec<Vec<String>> = Vec::new();
     // what each function defined here calls its parameters, as calls name it
     let mut signatures: HashMap<String, Vec<String>> = HashMap::default();

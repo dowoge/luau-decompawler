@@ -178,6 +178,33 @@ fn par_map_sized<T: Send>(sizes: &[u64], budget: u64, f: impl Fn(usize) -> T + S
     slots.into_iter().map(|s| s.into_inner().unwrap().unwrap()).collect()
 }
 
+/// What a script's first stage leaves: its text if later stages need it, the
+/// functions it defines, its call sites of every function (tally_bytes), and
+/// what the summary counts in it once it is written.
+#[derive(Default)]
+struct Core {
+    text: Option<Packed>,
+    defined: Vec<String>,
+    calls: Vec<u8>,
+    done: Option<[usize; 5]>,
+}
+
+impl Core {
+    fn done(counts: [usize; 5]) -> Core {
+        Core { done: Some(counts), ..Core::default() }
+    }
+
+    /// Out of a job's memory.
+    fn copy(&self) -> Core {
+        Core {
+            text: self.text.as_ref().map(Packed::copy),
+            defined: self.defined.iter().map(|k| k.as_str().to_owned()).collect(),
+            calls: self.calls.as_slice().to_vec(),
+            done: self.done,
+        }
+    }
+}
+
 /// Writing a file costs several times what reading it does, and most of what
 /// a repeat run produces is already there. The length goes first: the first
 /// read of a new file can cost far more than writing it, with a virus scanner
@@ -244,66 +271,135 @@ fn run_dir(src: &Path, dst: &Path, upstream: bool, noflat: bool) -> i32 {
 
     let t0 = std::time::Instant::now();
     let timing = std::env::var_os("LUAU_TIMING").is_some();
-    // Script by script, in parallel: the work that needs no other script.
-    // Each is kept as one string until it is written: a place's text is
-    // tens of megabytes, and as separate lines it costs half as much again.
+
+    // Paths in order (a repeated game path decides who gets the suffix).
+    let mut taken: HashSet<PathBuf> = HashSet::default();
+    let mut dirs: HashSet<PathBuf> = HashSet::default();
+    let mut targets: Vec<(PathBuf, String)> = Vec::with_capacity(files.len());
+    for sid in &sids {
+        let rel = sanitize(names.get(*sid).map_or(sid, String::as_str), sid);
+        let mut path = dst.join(format!("{rel}.lua"));
+        if taken.contains(&path) {
+            path = dst.join(format!("{rel} ({sid}).lua")); // two scripts at the same game path
+        }
+        taken.insert(path.clone());
+        if let Some(dir) = path.parent() {
+            dirs.insert(dir.to_path_buf());
+        }
+        targets.push((path, format!("-- {rel} (script {sid})\n")));
+    }
+    for dir in &dirs {
+        let _ = fs::create_dir_all(dir);
+    }
+    // a script's text written out, and what the summary counts in it
+    let write_out = |i: usize, finished: &Result<String, String>| -> [usize; 5] {
+        let (path, head) = &targets[i];
+        let result = match finished {
+            Ok(t) => write_text(path, head, t),
+            Err(e) => fs::write(path, format!("{head}-- decompile failed: {e}\n")),
+        };
+        if let Err(e) = &result {
+            eprintln!("{}: {e}", path.display());
+        }
+        let count = |needle: &str| finished.as_ref().map_or(0, |text| text.matches(needle).count());
+        // a flag the dispatcher left: `local jump_<pc> = `, not `local jump_height`
+        let jumps = finished.as_ref().map_or(0, |text| {
+            text.match_indices("local jump_")
+                .filter(|(i, m)| {
+                    let rest = &text[i + m.len()..];
+                    let d = rest.bytes().take_while(u8::is_ascii_digit).count();
+                    d > 0 && rest[d..].starts_with(" = ")
+                })
+                .count()
+        });
+        let made = usize::from(finished.is_ok());
+        [usize::from(result.is_err()), count(" = false\n"), jumps, count("local block = 0"), made]
+    };
+    let lines_of = |text: &str| -> Vec<String> { text.split('\n').map(String::from).collect() };
+    let alone = Extra::default();
+
+    // Script by script, in parallel: the work that needs no other script, up
+    // to naming each as if it were alone. Naming sees other scripts only
+    // through the call sites of the functions a script defines, so one that
+    // defines none is done then, and written. The others keep their text,
+    // packed, until the place's call sites are known: a place's text is tens
+    // of megabytes.
     let sizes: Vec<u64> = files.iter().map(|f| fs::metadata(src.join(f)).map_or(0, |m| m.len())).collect();
-    // a script's bytecode in memory costs some forty times as much while it is
-    // decompiled: a few megabytes of it at once keep all cores busy
-    let budget = std::env::var("LUAU_BUDGET").ok().and_then(|v| v.parse().ok()).unwrap_or(2 << 20);
-    // each kept packed till the last stage: the place's text is tens of
-    // megabytes, a fraction of that packed
-    let core: Vec<Result<Packed, String>> = par_map_sized(&sizes, budget, |i| {
+    // a script's bytecode costs up to fifty times as much while it is
+    // decompiled, and the biggest come first: a megabyte and a quarter of it
+    // at once keeps all cores busy, and more only costs memory
+    let budget = std::env::var("LUAU_BUDGET").ok().and_then(|v| v.parse().ok()).unwrap_or(5 << 18);
+    let core: Vec<Core> = par_map_sized(&sizes, budget, |i| {
         let run = || -> Result<String, String> {
             let data = fs::read(src.join(&files[i])).map_err(|e| e.to_string())?;
             let m = parse(&data, !upstream)?;
             Ok(decompile_core(&m, names.get(sids[i]).map(String::as_str), noflat).join("\n"))
         };
         alloc::job(
-            || panic::catch_unwind(AssertUnwindSafe(run)).unwrap_or_else(|e| Err(panic_text(e))).map(|t| Packed::new(&t)),
-            |r| r.map(|p| p.copy()).map_err(|e| e.as_str().to_owned()),
-        )
-    });
-    let lines_of = |text: &str| -> Vec<String> { text.split('\n').map(String::from).collect() };
-
-    if timing {
-        let (text, packed) = core.iter().flatten().map(Packed::sizes).fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
-        eprintln!("core  {:?} ({:.1} MB of text kept in {:.1})", t0.elapsed(), text as f64 / 1048576.0, packed as f64 / 1048576.0);
-    }
-    // Naming sees other scripts only through the call sites of the functions
-    // a script defines. So name every script in parallel as if it were alone;
-    // the result stands unless one of those functions has call sites elsewhere.
-    let mut extra = Extra::default();
-    let defined: Vec<Vec<String>> = par_map(core.len(), |i| {
-        alloc::job(
-            || match &core[i] {
-                Ok(p) => passes::defined_keys(&lines_of(&p.text())),
-                Err(_) => Vec::new(),
+            || {
+                let text = match panic::catch_unwind(AssertUnwindSafe(run)).unwrap_or_else(|e| Err(panic_text(e))) {
+                    Ok(text) => text,
+                    Err(e) => return Core::done(write_out(i, &Err(e))),
+                };
+                let lines = lines_of(&text);
+                let defined = passes::defined_keys(&lines);
+                let kept = (!defined.is_empty()).then(|| Packed::new(&text));
+                drop(text);
+                // its call sites of every function: which the place defines is
+                // not known yet
+                let named = panic::catch_unwind(AssertUnwindSafe(|| {
+                    let named = name_round(lines, &alone);
+                    let mut calls = CallMap::default();
+                    passes::collect_calls(&named, &mut calls, None);
+                    (named, passes::tally_bytes(&passes::tally(&calls)))
+                }));
+                match (named, kept) {
+                    (Ok((named, calls)), None) => Core { calls, ..Core::done(write_out(i, &Ok(to_text(&named)))) },
+                    (Ok((_, calls)), Some(text)) => Core { text: Some(text), defined, calls, done: None },
+                    // named the same way again, it would fail the same way
+                    (Err(e), None) => Core::done(write_out(i, &Err(panic_text(e)))),
+                    (Err(_), Some(text)) => Core { text: Some(text), defined, calls: Vec::new(), done: None },
+                }
             },
-            |keys| keys.iter().map(|k| k.as_str().to_owned()).collect(),
+            |c| c.copy(),
         )
     });
-    extra.want(defined.iter().flatten().cloned());
-    let alone = Extra::default();
+    if timing {
+        let (text, packed) = core.iter().filter_map(|c| c.text.as_ref()).map(Packed::sizes).fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+        let written = core.iter().filter(|c| c.done.is_some()).count();
+        eprintln!(
+            "core  {:?} ({:.1} MB of text kept in {:.1}; {written} of {} written)",
+            t0.elapsed(),
+            text as f64 / 1048576.0,
+            packed as f64 / 1048576.0,
+            core.len()
+        );
+    }
+
+    // The drafts' call sites, of the functions some script defines.
+    let mut extra = Extra::default();
+    extra.want(core.iter().flat_map(|c| c.defined.iter().cloned()));
     let wanted = extra.wanted();
+    let mut done: Vec<Option<[usize; 5]>> = Vec::with_capacity(core.len());
+    let mut defined: Vec<Vec<String>> = Vec::with_capacity(core.len());
+    let mut texts: Vec<Mutex<Option<Packed>>> = Vec::with_capacity(core.len());
+    let mut sites: Vec<Tally> = Vec::with_capacity(core.len());
+    for c in core {
+        sites.push(passes::tally_from(&c.calls, wanted));
+        done.push(c.done);
+        defined.push(c.defined);
+        texts.push(Mutex::new(c.text));
+    }
+    // the text a script kept, read in place
+    let text_of = |i: usize| -> Option<String> { texts[i].lock().unwrap().as_ref().map(Packed::text) };
     // the call sites a script's names give: its text itself is named again
     // at the end, which costs less than holding a second copy of every script
     let tally_of = |text: &str, seen: &Extra| {
         let named = name_round(lines_of(text), seen);
         let mut calls = CallMap::default();
-        passes::collect_calls(&named, &mut calls, wanted);
+        passes::collect_calls(&named, &mut calls, Some(wanted));
         passes::tally(&calls)
     };
-    let draft: Vec<Option<Tally>> = par_map(core.len(), |i| {
-        let packed = core[i].as_ref().ok()?;
-        alloc::job(
-            || panic::catch_unwind(AssertUnwindSafe(|| tally_of(&packed.text(), &alone))).ok(),
-            |d| d.map(|calls| calls.clone()),
-        )
-    });
-    if timing {
-        eprintln!("draft {:?}", t0.elapsed());
-    }
 
     // Call sites across the place: each script sees the calls of those before
     // it, and of those only the functions it defines (a rename cannot change
@@ -311,7 +407,6 @@ fn run_dir(src: &Path, dst: &Path, upstream: bool, noflat: bool) -> i32 {
     // turn depends only on scripts further back, so there is one answer however
     // it is reached: in rounds, redo what saw something change until nothing
     // does, which costs one pass in file order only if each waits on the last.
-    let mut sites: Vec<Tally> = draft.into_iter().map(Option::unwrap_or_default).collect();
     // key -> the first script whose call sites of it changed; the drafts saw nothing
     let mut changed: HashMap<String, usize> = HashMap::default();
     for (j, calls) in sites.iter().enumerate().rev() {
@@ -345,8 +440,8 @@ fn run_dir(src: &Path, dst: &Path, upstream: bool, noflat: bool) -> i32 {
                     seen.add(key, &sites[*j][key]);
                 }
             }
-            let Ok(packed) = &core[i] else { return Tally::default() };
-            panic::catch_unwind(AssertUnwindSafe(|| tally_of(&packed.text(), &seen))).unwrap_or_default()
+            let Some(text) = text_of(i) else { return Tally::default() };
+            panic::catch_unwind(AssertUnwindSafe(|| tally_of(&text, &seen))).unwrap_or_default()
         }, |calls| calls.clone()));
         changed.clear();
         for (i, new) in todo.iter().zip(fresh) {
@@ -367,62 +462,16 @@ fn run_dir(src: &Path, dst: &Path, upstream: bool, noflat: bool) -> i32 {
         eprintln!("calls {:?} ({redone} redone over {rounds} rounds)", t0.elapsed());
     }
 
-    // a script none of whose functions is called elsewhere is named as it was
-    // alone: what the place knows is about functions it does not define
-    // each text is read once more, here, and goes as soon as it is written
-    let core: Vec<Mutex<Option<Result<Packed, String>>>> = core.into_iter().map(|c| Mutex::new(Some(c))).collect();
+    // the rest, named with what the place knows; each text goes once written
     let finish = |i: usize| -> Result<String, String> {
-        let taken = core[i].lock().unwrap().take().ok_or_else(|| "named twice".to_string())?;
-        let text = &taken.as_ref().map_err(Clone::clone)?.text();
+        let text = &texts[i].lock().unwrap().take().ok_or_else(|| "named twice".to_string())?.text();
         let seen = if defined[i].iter().any(|k| extra.knows(k)) { &extra } else { &alone };
         panic::catch_unwind(AssertUnwindSafe(|| to_text(&name_round(lines_of(text), seen)))).map_err(panic_text)
     };
-
-    // Paths in order (a repeated game path decides who gets the suffix), then
-    // the writes in parallel.
-    let mut written: HashSet<PathBuf> = HashSet::default();
-    let mut dirs: HashSet<PathBuf> = HashSet::default();
-    let mut targets: Vec<(PathBuf, String)> = Vec::with_capacity(files.len());
-    for sid in &sids {
-        let rel = sanitize(names.get(*sid).map_or(sid, String::as_str), sid);
-        let mut path = dst.join(format!("{rel}.lua"));
-        if written.contains(&path) {
-            path = dst.join(format!("{rel} ({sid}).lua")); // two scripts at the same game path
-        }
-        written.insert(path.clone());
-        if let Some(dir) = path.parent() {
-            dirs.insert(dir.to_path_buf());
-        }
-        targets.push((path, format!("-- {rel} (script {sid})\n")));
-    }
-    for dir in &dirs {
-        let _ = fs::create_dir_all(dir);
-    }
-    // each written as soon as its text is final: none waits on the others
-    let written: Vec<[usize; 5]> = par_map(files.len(), |i| alloc::job(|| {
-        let finished = finish(i);
-        let (path, head) = &targets[i];
-        let result = match &finished {
-            Ok(t) => write_text(path, head, t),
-            Err(e) => fs::write(path, format!("{head}-- decompile failed: {e}\n")),
-        };
-        if let Err(e) = &result {
-            eprintln!("{}: {e}", path.display());
-        }
-        let count = |needle: &str| finished.as_ref().map_or(0, |text| text.matches(needle).count());
-        // a flag the dispatcher left: `local jump_<pc> = `, not `local jump_height`
-        let jumps = finished.as_ref().map_or(0, |text| {
-            text.match_indices("local jump_")
-                .filter(|(i, m)| {
-                    let rest = &text[i + m.len()..];
-                    let d = rest.bytes().take_while(u8::is_ascii_digit).count();
-                    d > 0 && rest[d..].starts_with(" = ")
-                })
-                .count()
-        });
-        let made = usize::from(finished.is_ok());
-        [usize::from(result.is_err()), count(" = false\n"), jumps, count("local block = 0"), made]
-    }, |counts| counts));
+    let written: Vec<[usize; 5]> = par_map(files.len(), |i| match done[i] {
+        Some(counts) => counts,
+        None => alloc::job(|| write_out(i, &finish(i)), |counts| counts),
+    });
     if timing {
         eprintln!("names and write {:?}", t0.elapsed());
     }
@@ -556,6 +605,36 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::sanitize;
+    use crate::hash::HashSet;
+    use crate::passes::{self, CallMap};
+
+    #[test]
+    fn call_sites_kept_as_bytes_read_back_as_those_asked_for() {
+        let lines: Vec<String> = [
+            "local x = M.f(alpha, beta)",
+            "M:g(gamma)",
+            "M:g(delta, 1, M.f(beta))",
+            "print(M.h(alpha), self.player)",
+            "helper(alpha)",
+            "function M:g(a, b)",
+        ]
+        .iter()
+        .map(|l| l.to_string())
+        .collect();
+        let tally_of = |wanted: Option<&HashSet<String>>| {
+            let mut calls = CallMap::default();
+            passes::collect_calls(&lines, &mut calls, wanted);
+            passes::tally(&calls)
+        };
+        let all = tally_of(None);
+        assert!(all.contains_key(".h") && !all.contains_key("helper") && !all.contains_key("print"));
+        let bytes = passes::tally_bytes(&all);
+        let some: HashSet<String> = [".f", ":g", ".missing"].iter().map(|k| k.to_string()).collect();
+        assert!(passes::tally_from(&bytes, &some) == tally_of(Some(&some)));
+        let every: HashSet<String> = all.keys().cloned().collect();
+        assert!(passes::tally_from(&bytes, &every) == all);
+        assert!(passes::tally_from(&[], &every).is_empty());
+    }
 
     #[test]
     fn output_paths_stay_inside_the_output_folder() {
