@@ -480,10 +480,13 @@ impl Flow {
             }
         }
 
-        // reaching definitions over blocks
+        // reaching definitions over blocks: what reaches each one is kept, and
+        // what leaves one is made from that when a successor asks (a table of
+        // both is blocks times definitions twice over, megabytes in a big
+        // function); the least fixed point is the same
         let mut bits_in = vec![0u64; nb * words];
-        let mut bits_out = vec![0u64; nb * words];
         let mut scratch = vec![0u64; words];
+        let mut leaving = vec![0u64; words];
         let mut changed = true;
         while changed {
             changed = false;
@@ -496,22 +499,27 @@ impl Flow {
                     }
                 }
                 for q in &preds[b] {
-                    let o = &bits_out[*q as usize * words..(*q as usize + 1) * words];
-                    for (s, v) in scratch.iter_mut().zip(o) {
+                    let q = *q as usize;
+                    let reaching = &bits_in[q * words..(q + 1) * words];
+                    if gen[q].is_empty() {
+                        for (s, v) in scratch.iter_mut().zip(reaching) {
+                            *s |= *v;
+                        }
+                        continue;
+                    }
+                    leaving.copy_from_slice(reaching);
+                    for (r, bit) in &gen[q] {
+                        let (lo, hi) = (reg_base[*r as usize], reg_base[*r as usize + 1]);
+                        clear_bits(&mut leaving, lo, hi);
+                        leaving[*bit as usize / 64] |= 1 << (*bit % 64);
+                    }
+                    for (s, v) in scratch.iter_mut().zip(&leaving) {
                         *s |= *v;
                     }
                 }
-                if scratch.as_slice() != &bits_in[b * words..(b + 1) * words] {
-                    bits_in[b * words..(b + 1) * words].copy_from_slice(&scratch);
-                }
-                for (r, bit) in &gen[b] {
-                    let (lo, hi) = (reg_base[*r as usize], reg_base[*r as usize + 1]);
-                    clear_bits(&mut scratch, lo, hi);
-                    scratch[*bit as usize / 64] |= 1 << (*bit % 64);
-                }
-                let o = &mut bits_out[b * words..(b + 1) * words];
-                if o != scratch.as_slice() {
-                    o.copy_from_slice(&scratch);
+                let row = &mut bits_in[b * words..(b + 1) * words];
+                if row != scratch.as_slice() {
+                    row.copy_from_slice(&scratch);
                     changed = true;
                 }
             }
