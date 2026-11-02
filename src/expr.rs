@@ -61,6 +61,9 @@ pub struct X {
     pub snapshot: bool,
     /// A table constructor.
     pub constructor: bool,
+    /// A snapshot of a local register (not of an upvalue): printed as the
+    /// local, Luau would read it where it is used.
+    pub local_copy: bool,
     /// The names a constructor's fields or a closure's captures read: all a
     /// constructor or closure reads when it is made (a body runs later).
     pub names_read: HashSet<u64>,
@@ -97,6 +100,7 @@ pub fn ex(text: impl Into<String>, prec: i32) -> E {
         closure: None,
         snapshot: false,
         constructor: false,
+        local_copy: false,
         names_read: HashSet::default(),
     }))
 }

@@ -68,6 +68,10 @@ pub struct Inlined {
     pub results: usize,
     /// Registers the code writes.
     pub written: Vec<usize>,
+    /// Caller locals the copy wrote for an upvalue of the helper's: the call
+    /// writes them through the closure. Only a closure made where its
+    /// captures show can be trusted to.
+    pub upval_writes: Vec<usize>,
 }
 
 fn ignored(o: u8) -> bool {
@@ -129,6 +133,8 @@ struct Walk<'a> {
     assumed: Vec<Option<bool>>,
     /// A parameter a test needed to know, unknown yet.
     need: Option<usize>,
+    /// Caller locals written in place of the helper's upvalue stores.
+    upval_writes: Vec<usize>,
 }
 
 fn falsy(text: &str) -> bool {
@@ -693,6 +699,7 @@ fn match_once(m: &Module, caller: &Proto, id: usize, start: usize, assumed: &[Op
         held: HashSet::default(),
         assumed: assumed.to_vec(),
         need: None,
+        upval_writes: Vec::new(),
         assigned: (0..helper.numparams)
             .map(|r| helper.code.iter().any(|i| !ignored(i.op) && full_effects(i, helper.maxstack).1.has(r)))
             .collect(),
@@ -779,9 +786,25 @@ fn match_once(m: &Module, caller: &Proto, id: usize, start: usize, assumed: &[Op
             walk.map[p.a()] = if p.op == op::MOVE { walk.map[p.b()] } else { None };
             continue;
         }
+        // a store into an upvalue that is a local where the copy is: the copy
+        // made the value in that local, and has no store of its own
+        if p.op == op::SETUPVAL {
+            let src = walk.map[p.a()];
+            let stored = c.op == op::SETUPVAL || (c.op == op::MOVE && Some(c.b()) == src);
+            if let Some(r) = src.filter(|r| !stored && walk.written.contains(r)) {
+                walk.upvalue(p.b(), Up::Reg(r))?;
+                walk.upval_writes.push(r);
+                continue;
+            }
+        }
         // constants the caller loads for the helper to read (an upvalue read
         // may have no instruction in the copy, and reads none of them)
-        while plain(p.op) != plain(c.op) && p.op != op::RETURN && p.op != op::MOVE && p.op != op::GETUPVAL {
+        while plain(p.op) != plain(c.op)
+            && p.op != op::RETURN
+            && p.op != op::MOVE
+            && p.op != op::GETUPVAL
+            && p.op != op::SETUPVAL
+        {
             let Some(text) = walk.load_text(c) else { break };
             walk.loaded.insert(c.a(), (text, c.pc));
             walk.written.push(c.a());
@@ -982,7 +1005,17 @@ fn match_once(m: &Module, caller: &Proto, id: usize, start: usize, assumed: &[Op
             }
         }
     }
-    Some(Inlined { helper: id, upvals: walk.upvals, args, end, last, result, results, written: walk.written })
+    Some(Inlined {
+        helper: id,
+        upvals: walk.upvals,
+        args,
+        end,
+        last,
+        result,
+        results,
+        written: walk.written,
+        upval_writes: walk.upval_writes,
+    })
 }
 
 /// Does this load only set up a value of the `return` that follows it?

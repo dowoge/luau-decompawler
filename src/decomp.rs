@@ -1255,17 +1255,26 @@ impl<'c, 'm> Dec<'c, 'm> {
             // made here, its upvalues are what it captured: code reading some
             // other register only looks like it (a line after a copy keeps
             // the helper's line too)
-            if let Some(caps) = self.captures_of(idx) {
+            let caps = self.captures_of(idx);
+            if let Some(caps) = &caps {
                 let wrong = call.upvals.iter().enumerate().any(|(k, u)| u.is_some_and(|u| caps.get(k) != Some(&u)));
                 if wrong {
                     self.note_refusal(idx, (usize::MAX, "an upvalue the closure did not capture".to_string()));
                     continue;
                 }
             }
-            let leftover = call
-                .written
-                .iter()
-                .any(|r| !call.holds_result(*r) && self.valid(call.end) && self.live_at(call.end, *r));
+            // a local written for the helper's upvalue: only a closure whose
+            // captures show it does that
+            if !call.upval_writes.is_empty() && caps.is_none() {
+                self.note_refusal(idx, (usize::MAX, "writes a local no capture shows".to_string()));
+                continue;
+            }
+            let leftover = call.written.iter().any(|r| {
+                !call.holds_result(*r)
+                    && !call.upval_writes.contains(r)
+                    && self.valid(call.end)
+                    && self.live_at(call.end, *r)
+            });
             let dropped = self.ctx.defs.values().flatten().any(|d| d.1 == idx);
             if !leftover && (!dropped || call.upvals.iter().all(Option::is_some)) {
                 found = Some((Rc::new(call), name));
@@ -1358,6 +1367,13 @@ impl<'c, 'm> Dec<'c, 'm> {
     /// Put the call back where a helper's code was copied in. The pc after it.
     fn helper_call(&mut self, out: &mut Vec<String>, ind: usize, pc: i32) -> Option<i32> {
         let (call, name) = self.inline_at(pc)?;
+        // the call writes these through its closure: what waits in them goes first
+        for r in &call.upval_writes {
+            if self.pending.contains_key(r) {
+                let e = self.get(*r);
+                self.assign(out, ind, *r, &e);
+            }
+        }
         let mut args: Vec<String> = Vec::with_capacity(call.args.len());
         for arg in &call.args {
             args.push(match arg {
@@ -1640,8 +1656,13 @@ impl<'c, 'm> Dec<'c, 'm> {
 
     fn flows_on(&self, from: usize, mut flow: RegSet, q: usize) -> bool {
         let code = &self.p.code;
-        for ins in &code[from..] {
-            if (ins.pc != code[from].pc && self.has_label(ins.pc)) || self.is_loop_head(ins.pc) {
+        let mut i = from;
+        // a join the walk came to itself, from a test it went through
+        let mut joined: Option<i32> = None;
+        while i < code.len() {
+            let ins = &code[i];
+            let entered = joined == Some(ins.pc);
+            if (ins.pc != code[from].pc && self.has_label(ins.pc) && !entered) || self.is_loop_head(ins.pc) {
                 return false;
             }
             let (rd, wr, barrier) = effects(ins, self.p.maxstack);
@@ -1652,6 +1673,15 @@ impl<'c, 'm> Dec<'c, 'm> {
                     let read = effects(call, self.p.maxstack).0;
                     (0..self.p.maxstack).any(|r| read.has(r) && flow.has(r))
                 });
+            // a copy of a variable a call may change: as an argument, an item or
+            // a returned value Luau copies the variable in order, before later
+            // calls; as an operand, a key, a stored value or a receiver it
+            // reads the variable where it is used, after them, so the copy
+            // stays a local of its own
+            let snapshot = self.pending.get(&q).is_some_and(|e| e.borrow().local_copy);
+            if rd.has(q) && snapshot && !matches!(ins.op, op::CALL | op::CALLFB | op::SETLIST | op::RETURN) {
+                return false;
+            }
             if rd.has(q) && method_args {
                 return true;
             }
@@ -1664,6 +1694,31 @@ impl<'c, 'm> Dec<'c, 'm> {
                 );
                 return carries && !(binary && c == q && b != q); // `g() + f()` keeps its order
             }
+            // `if f() then a else b`, as a constructor's item: the value its
+            // arms make flows on from where they meet
+            let building = self.pending.get(&q).is_some_and(|e| e.borrow().fields.is_some());
+            if carries && building && matches!(ins.op, op::JUMPIF | op::JUMPIFNOT) {
+                if let Some(join) = self.if_else_join(i) {
+                    let to = self.flow.idx(join).unwrap_or(code.len());
+                    for arm in &code[i + 1..to] {
+                        if arm.pc != ins.pc && self.has_label(arm.pc) && arm.pc != ins.jump_target().unwrap_or(-1) {
+                            return false;
+                        }
+                        let (ard, awr, abarrier) = effects(arm, self.p.maxstack);
+                        if abarrier || ard.has(q) || awr.has(q) {
+                            return false;
+                        }
+                        for r in 0..self.p.maxstack {
+                            if awr.has(r) {
+                                flow.add(r);
+                            }
+                        }
+                    }
+                    joined = Some(join);
+                    i = to;
+                    continue;
+                }
+            }
             let (s, n) = ins.successors();
             if barrier || wr.has(q) || !(n == 1 && s[0] == ins.pc + ins.n) {
                 return false;
@@ -1675,8 +1730,33 @@ impl<'c, 'm> Dec<'c, 'm> {
                     }
                 }
             }
+            i += 1;
         }
         false
+    }
+
+    /// The join of `JUMPIF(NOT) c -> T; A; JUMP -> J; T: B; J:` starting at
+    /// code index i, when no jump in it leaves for anywhere else.
+    fn if_else_join(&self, i: usize) -> Option<i32> {
+        let code = &self.p.code;
+        let test = &code[i];
+        let t = test.jump_target()?;
+        let ti = self.flow.idx(t)?;
+        if ti <= i + 1 {
+            return None;
+        }
+        let jump = &code[ti - 1];
+        if !matches!(jump.op, op::JUMP | op::JUMPX) {
+            return None;
+        }
+        let j = jump.jump_target()?;
+        let ji = self.flow.idx(j)?;
+        if ji <= ti {
+            return None;
+        }
+        let inside = |p: i32| test.pc < p && p <= j;
+        let stays = code[i + 1..ji].iter().all(|c| c.jump_target().is_none_or(inside) && !matches!(c.op, op::RETURN));
+        stays.then_some(j)
     }
 
     /// Give register r the value e. Simple values wait to be inlined.
@@ -4130,6 +4210,7 @@ impl<'c, 'm> Dec<'c, 'm> {
                 if shared {
                     v.borrow_mut().pure_ = false; // a call may change it
                     v.borrow_mut().snapshot = true;
+                    v.borrow_mut().local_copy = true;
                 }
                 self.put(out, ind, a, v, true);
             }
