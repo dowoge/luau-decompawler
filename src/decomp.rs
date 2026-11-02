@@ -4623,6 +4623,25 @@ impl<'c, 'm> Dec<'c, 'm> {
         pc
     }
 
+    /// The test at pc jumping to t over the next instruction, a forward JUMP
+    /// that nothing else lands on: where that JUMP goes.
+    fn over_jump(&self, pc: i32, t: i32) -> Option<i32> {
+        let j = pc + self.insn(pc).n;
+        if !self.valid(j) || self.has_label(j) {
+            return None;
+        }
+        let ji = self.insn(j);
+        if ji.op != op::JUMP || t != j + ji.n {
+            return None;
+        }
+        let to = ji.jump_target().filter(|to| *to > t)?;
+        // `if c then else B end` compiles so too, and is written so: only a
+        // block that ends by jumping over another (an else) is the folded form
+        let last = self.last_insn_before(to)?;
+        let li = self.insn(last);
+        (last >= t && li.op == op::JUMP && li.jump_target().is_some_and(|e| e > to)).then_some(to)
+    }
+
     /// Are both pcs the same return? The compiler copies a function's return
     /// over jumps to it, so one return may stand at several places.
     fn same_return(&self, a: i32, b: i32) -> bool {
@@ -4784,8 +4803,20 @@ impl<'c, 'm> Dec<'c, 'm> {
             }
             None => {
                 let (c, t) = self.cond_expr(pc);
-                cond = c;
-                target = t;
+                // the test jumps over a JUMP nothing else lands on (`c or
+                // false` folds so): `if c then A else B end`, tested the
+                // other way round, when A and B lie inside this block
+                match self.over_jump(pc, t).filter(|to| t < end && *to <= end) {
+                    Some(to) => {
+                        cond = negate(&c);
+                        target = to;
+                        nxt = t;
+                    }
+                    None => {
+                        cond = c;
+                        target = t;
+                    }
+                }
             }
         }
         if let Some(word) = self.jump_word(target) {
