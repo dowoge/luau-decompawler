@@ -258,7 +258,6 @@ pub enum K {
     /// Index into the string table, or none for the empty reference.
     Str(Option<usize>),
     Import(u32),
-    Table,
     Closure(usize),
     Vector([f64; 3]),
     TableK(Vec<(u64, i32)>),
@@ -414,11 +413,13 @@ pub fn parse(data: &[u8], scrambled: bool) -> R<Module> {
                 }
                 4 => K::Import(r.u32()?),
                 5 => {
+                    // keys only: stores after DUPTABLE give each its value
                     let n = r.varint()? as usize;
+                    let mut v = Vec::with_capacity(n.min(1 << 16));
                     for _ in 0..n {
-                        r.varint()?;
+                        v.push((r.varint()?, -1));
                     }
-                    K::Table
+                    K::TableK(v)
                 }
                 6 => K::Closure(r.varint()? as usize),
                 7 => {

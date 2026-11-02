@@ -119,7 +119,7 @@ pub fn kexpr(m: &Module, p: &Proto, i: i64) -> String {
             format!("Vector3.new({}, {}, {})", fmt_number(v[0]), fmt_number(v[1]), fmt_number(v[2]))
         }
         K::Closure(v) => format!("<function {v}>"),
-        K::Table | K::TableK(_) => format!("{{{}}}", template_fields(m, p, i).join(", ")),
+        K::TableK(_) => format!("{{{}}}", template_fields(m, p, i).join(", ")),
         K::Class => format!("K{i}"),
     }
 }
@@ -166,6 +166,8 @@ pub struct Ctx<'m> {
     helpers: RefCell<Vec<(usize, Rc<str>)>>,
     /// Per function: the source lines it spans.
     spans: Vec<(u32, u32)>,
+    /// Per function, which of its upvalues a closure shares by reference.
+    byref_ups: Vec<Vec<bool>>,
     /// Functions no other lists as a child: only ever inlined, like
     /// `(function() ... end)()`, since the compiler adds a child with its closure.
     orphans: Vec<usize>,
@@ -381,8 +383,35 @@ pub fn decompile_lines(m: &Module, noflat: bool) -> Vec<String> {
         }
     }
     defs.values_mut().for_each(|v| v.sort_unstable());
+    // per function, its upvalues some closure creating it shares by reference
+    let mut byref_ups: Vec<Vec<bool>> = m.protos.iter().map(|p| vec![false; p.nups]).collect();
+    for p in &m.protos {
+        for (i, ins) in p.code.iter().enumerate() {
+            let child = match ins.op {
+                op::NEWCLOSURE => {
+                    let d = ins.d();
+                    let k = if d < 0 { p.children.len() as i32 + d } else { d };
+                    p.children.get(k as usize).copied()
+                }
+                op::DUPCLOSURE => match &p.k[kindex(p, ins.d() as i64)] {
+                    K::Closure(c) => Some(*c),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let Some(c) = child.filter(|c| *c < byref_ups.len()) else { continue };
+            for (u, cap) in p.code[i + 1..].iter().take_while(|x| x.op == op::CAPTURE).enumerate() {
+                if cap.a() == 1 {
+                    if let Some(slot) = byref_ups[c].get_mut(u) {
+                        *slot = true;
+                    }
+                }
+            }
+        }
+    }
     let ctx = Ctx {
         m,
+        byref_ups,
         globals: module_globals(m),
         memo: RefCell::new(HashMap::default()),
         helper_names: std::cell::Cell::new(0),
@@ -2283,6 +2312,105 @@ impl<'c, 'm> Dec<'c, 'm> {
         (keyed, listed, last)
     }
 
+    /// The registers the stores into the table made at pc read (but the table).
+    fn store_operands(&self, pc: i32, r: usize) -> RegSet {
+        let code = &self.p.code;
+        let mut regs = RegSet::EMPTY;
+        let Some(mut i) = self.flow.idx(pc).map(|k| k + 1) else { return regs };
+        while i < code.len() {
+            let ins = code[i];
+            let (rd, wr, _) = self.flow.effects[i];
+            let store = matches!(ins.op, op::SETTABLEKS | op::SETTABLE | op::SETTABLEN) && ins.b() == r
+                || ins.op == op::SETLIST && ins.a() == r;
+            if store {
+                for x in rd.iter().filter(|x| *x != r) {
+                    regs.add(x);
+                }
+            } else if rd.has(r) || wr.has(r) {
+                break;
+            }
+            i += 1;
+        }
+        regs
+    }
+
+    /// The last store after the table made at pc that still belongs in its
+    /// constructor for Luau to size the table the same (pc: none does), or
+    /// None if all may. A template holds exactly its constructor's keys. A
+    /// NEWTABLE is sized by its constructor's items, or for `{}` by the fields
+    /// stored after it; when those stores would size it otherwise, the
+    /// constructor takes as many as keep the size.
+    fn constructor_limit(&self, pc: i32, r: usize) -> Option<i32> {
+        let p = self.p;
+        let code = &p.code;
+        let made = self.insn(pc);
+        // the stores into r up to its first other use, as table_fills sees them
+        let mut stores: Vec<Insn> = Vec::new();
+        let mut left = self.template_holes(pc);
+        let mut i = self.flow.idx(pc)? + 1;
+        while i < code.len() {
+            let ins = code[i];
+            if matches!(ins.op, op::SETTABLEKS | op::SETTABLE | op::SETTABLEN) && ins.b() == r && ins.a() != r {
+                stores.push(ins);
+                left = left.saturating_sub(1);
+            } else if ins.op == op::SETLIST && ins.a() == r {
+                return None; // a list: sized by its items, as it is printed
+            } else {
+                let (rd, wr, barrier) = self.flow.effects[i];
+                let joined = self.has_label(ins.pc) && self.first_jump[ins.pc as usize] <= pc;
+                if rd.has(r) || wr.has(r) || (left == 0 && (barrier || joined)) {
+                    break;
+                }
+            }
+            i += 1;
+        }
+        let name_of = |s: &Insn| kstr(self.m, p, s.aux as usize).filter(|k| is_ident(k) && !is_keyword(k));
+        if made.op == op::DUPTABLE {
+            let K::TableK(keys) = &p.k[kindex(p, made.d() as i64)] else { return None };
+            let mut last = pc;
+            for s in &stores {
+                let open = keys.iter().any(|(k, v)| *v < 0 && s.op == op::SETTABLEKS && *k == s.aux as u64);
+                if !open {
+                    return Some(last);
+                }
+                last = s.pc;
+            }
+            return None;
+        }
+        let want = made.b() as u8;
+        if want == 0 || stores.is_empty() {
+            return None;
+        }
+        // `{}` then the stores: sized by the distinct `.name` fields stored
+        let mut names: Vec<&str> = stores.iter().filter(|s| s.op == op::SETTABLEKS).filter_map(name_of).collect();
+        names.sort_unstable();
+        names.dedup();
+        if hash_class(names.len()) == want {
+            return None;
+        }
+        // a constructor: sized by its keyed items, the [1], [2], ... in order
+        // among them going to the array when there is nothing else
+        let (mut records, mut general, mut index) = (0usize, 0usize, 0usize);
+        let mut fits = None;
+        for s in &stores {
+            match s.op {
+                op::SETTABLEKS if name_of(s).is_some() => records += 1,
+                op::SETTABLEN if s.c() as usize == index => {
+                    general += 1;
+                    index += 1;
+                }
+                _ => general += 1,
+            }
+            let hash = if general == index { records } else { records + general };
+            match hash_class(hash).cmp(&want) {
+                std::cmp::Ordering::Equal => fits = Some(s.pc),
+                std::cmp::Ordering::Greater => break,
+                std::cmp::Ordering::Less => {}
+            }
+        }
+        fits
+    }
+
     /// Keys DUPTABLE's template has no value for: the constructor's own, so
     /// what stands between it and their stores are those values, calls included.
     fn template_holes(&self, pc: i32) -> usize {
@@ -2299,7 +2427,7 @@ impl<'c, 'm> Dec<'c, 'm> {
     /// A table set up field by field, then used once (and dead after that
     /// use, on every path): still one value, its constructor.
     fn table_filled_then_read(&self, pc: i32, r: usize) -> bool {
-        if self.shared(pc, r) {
+        if self.shared(pc, r) || self.constructor_limit(pc, r).is_some() {
             return false;
         }
         let code = &self.p.code;
@@ -3733,6 +3861,7 @@ impl<'c, 'm> Dec<'c, 'm> {
                 let v = self.get(b);
                 if shared {
                     v.borrow_mut().pure_ = false; // a call may change it
+                    v.borrow_mut().snapshot = true;
                 }
                 self.put(out, ind, a, v, true);
             }
@@ -3751,7 +3880,9 @@ impl<'c, 'm> Dec<'c, 'm> {
             }
             op::GETUPVAL => {
                 let t = self.upval(b);
-                self.put(out, ind, a, ex(t, 100), true);
+                let e = ex(t, 100);
+                e.borrow_mut().snapshot = self.ctx.byref_ups.get(self.idx).is_some_and(|u| u.get(b).copied().unwrap_or(false));
+                self.put(out, ind, a, e, true);
             }
             op::SETUPVAL => {
                 self.flush(out, ind, &[a]);
@@ -4004,8 +4135,34 @@ impl<'c, 'm> Dec<'c, 'm> {
                 if let Some(w) = self.flow.def_web(pc, a) {
                     self.set_def_key(&table, a, KW + w);
                 }
+                // its items are made after it: a copy of a shared variable
+                // made before, stored into it, was a local (Luau reads a
+                // local key or value where it is stored, after any call)
+                let read_by_stores = self.store_operands(pc, a);
+                let early: Vec<usize> = self
+                    .pending
+                    .iter()
+                    .filter(|(q, e)| **q != a && e.borrow().snapshot && read_by_stores.has(**q))
+                    .map(|(q, _)| *q)
+                    .collect();
+                for q in early {
+                    let e = self.get(q);
+                    self.assign(out, ind, q, &e);
+                }
                 let fills = self.table_fills(pc, a);
-                if o == op::NEWTABLE && fills.0 && !fills.1 {
+                let limit = self.constructor_limit(pc, a);
+                if let Some(last) = limit {
+                    // the stores up to `last` were its constructor's, as its
+                    // size shows; the rest are statements
+                    if last > pc {
+                        table.borrow_mut().build_end = Some(last);
+                        self.ppop(a);
+                        self.pset(a, table);
+                    } else {
+                        let t = table.borrow().render();
+                        self.put(out, ind, a, ex(t, 100), false);
+                    }
+                } else if o == op::NEWTABLE && fills.0 && !fills.1 {
                     // `local t = {}` then `t.k = v`: a constructor with keys
                     // would have compiled to DUPTABLE, so these are statements
                     // (put: what waited in the register, never read, goes first)
@@ -4268,6 +4425,18 @@ fn state_operand_first(ins: &Insn, val: &RegSet, st: &RegSet, prev: Option<Insn>
         }
         _ => true,
     }
+}
+
+/// NEWTABLE's B for a hash part of n keys: the power of two that holds them, as log2 + 1.
+fn hash_class(n: usize) -> u8 {
+    if n == 0 {
+        return 0;
+    }
+    let mut log2 = 0;
+    while (1usize << log2) < n {
+        log2 += 1;
+    }
+    log2 as u8 + 1
 }
 
 fn binop(o: u8) -> (&'static str, i32) {

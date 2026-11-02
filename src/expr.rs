@@ -55,6 +55,10 @@ pub struct X {
     pub uses: HashSet<u64>,
     /// The function this value creates.
     pub closure: Option<usize>,
+    /// A copy of a variable a closure shares: a call may change the variable,
+    /// and Luau reads a local operand where it is used, so the copy is a
+    /// local of its own before any call.
+    pub snapshot: bool,
     /// A table constructor.
     pub constructor: bool,
     /// The names a constructor's fields or a closure's captures read: all a
@@ -91,6 +95,7 @@ pub fn ex(text: impl Into<String>, prec: i32) -> E {
         ifelse: None,
         uses: HashSet::default(),
         closure: None,
+        snapshot: false,
         constructor: false,
         names_read: HashSet::default(),
     }))
