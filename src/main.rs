@@ -267,7 +267,8 @@ fn run_dir(src: &Path, dst: &Path, upstream: bool, noflat: bool) -> i32 {
     let lines_of = |text: &str| -> Vec<String> { text.split('\n').map(String::from).collect() };
 
     if timing {
-        eprintln!("core  {:?}", t0.elapsed());
+        let (text, packed) = core.iter().flatten().map(Packed::sizes).fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+        eprintln!("core  {:?} ({:.1} MB of text kept in {:.1})", t0.elapsed(), text as f64 / 1048576.0, packed as f64 / 1048576.0);
     }
     // Naming sees other scripts only through the call sites of the functions
     // a script defines. So name every script in parallel as if it were alone;

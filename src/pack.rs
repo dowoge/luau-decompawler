@@ -131,6 +131,11 @@ impl Packed {
         Packed { len: text.len(), bytes: pack(text.as_bytes()) }
     }
 
+    /// (unpacked, packed) sizes.
+    pub fn sizes(&self) -> (usize, usize) {
+        (self.len, self.bytes.len())
+    }
+
     /// The text again.
     pub fn text(&self) -> String {
         let bytes = unpack(&self.bytes, self.len).expect("a text packed here unpacks");
