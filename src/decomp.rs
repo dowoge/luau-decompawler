@@ -40,6 +40,153 @@ fn sp(n: usize) -> &'static str {
     &S.get_or_init(|| " ".repeat(1 << 16))[..n]
 }
 
+/// `--info`: a comment above each function on what the bytecode holds for it.
+pub static INFO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `--info`, once names are final: each function's comment above the line it
+/// starts on, the main function's first. Each says the function's number in
+/// the module, its name and line, its parameters, registers and instructions,
+/// the flags the compiler gave it, its upvalues as this text names them, and
+/// its constants.
+pub fn info_comments(lines: Vec<String>, m: &Module) -> Vec<String> {
+    // how each function's creator captures its upvalues
+    let mut kinds: HashMap<usize, Vec<u8>> = HashMap::default();
+    for p in &m.protos {
+        for (i, ins) in p.code.iter().enumerate() {
+            let child = match ins.op {
+                op::NEWCLOSURE => {
+                    let d = ins.d();
+                    p.children.get(if d < 0 { p.children.len() as i32 + d } else { d } as usize).copied()
+                }
+                op::DUPCLOSURE => match p.k.get(kindex(p, ins.d() as i64)) {
+                    Some(K::Closure(c)) => Some(*c),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(c) = child {
+                let caps = p.code[i + 1..].iter().take_while(|c| c.op == op::CAPTURE).map(|c| c.a() as u8);
+                kinds.entry(c).or_insert_with(|| caps.collect());
+            }
+        }
+    }
+    let mut above: HashMap<usize, Vec<String>> = HashMap::default();
+    for (i, l) in lines.iter().enumerate() {
+        let Some(rest) = l.trim_start().strip_prefix(passes::INFO_MARK) else { continue };
+        let mut parts = rest.split('|');
+        let Some(idx) = parts.next().and_then(|n| n.parse::<usize>().ok()).filter(|n| *n < m.protos.len()) else {
+            continue;
+        };
+        let names: Vec<&str> = parts.filter(|n| !n.is_empty()).collect();
+        // the line the function starts on: the nearest one above, but blanks
+        let Some(head) = (0..i).rev().find(|j| !lines[*j].trim().is_empty() && !passes::info_marker(&lines[*j])) else {
+            continue;
+        };
+        let pad = sp(passes::indent_of(&lines[head]));
+        let block = info_block(m, idx, &names, kinds.get(&idx).map_or(&[][..], Vec::as_slice), pad);
+        above.entry(head).or_default().extend(block);
+    }
+    let mut out = info_block(m, m.main, &[], &[], "");
+    out.reserve(lines.len());
+    for (i, l) in lines.into_iter().enumerate() {
+        if let Some(block) = above.remove(&i) {
+            out.extend(block);
+        }
+        if !passes::info_marker(&l) {
+            out.push(l);
+        }
+    }
+    out
+}
+
+/// One function's comment, at indent `pad`.
+fn info_block(m: &Module, idx: usize, names: &[&str], kinds: &[u8], pad: &str) -> Vec<String> {
+    let p = &m.protos[idx];
+    let plural = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    let title = match p.name.as_deref().filter(|n| !n.is_empty()) {
+        _ if idx == m.main => format!("main function (function {idx})"),
+        Some(n) => format!("function {idx}: {n}, line {}", p.linedefined),
+        None => format!("function {idx}: anonymous, line {}", p.linedefined),
+    };
+    let mut props = vec![plural(p.numparams, "parameter", "parameters")];
+    if p.vararg != 0 {
+        props.push("vararg".to_string());
+    }
+    props.push(plural(p.maxstack, "register", "registers"));
+    props.push(plural(p.code.len(), "instruction", "instructions"));
+    if !p.children.is_empty() {
+        props.push(plural(p.children.len(), "nested function", "nested functions"));
+    }
+    for (bit, what) in [(1, "native module"), (2, "cold"), (4, "has native functions"), (8, "inlinable"), (16, "uses export")] {
+        if p.flags & bit != 0 {
+            props.push(what.to_string());
+        }
+    }
+    let mut out = vec![format!("{pad}-- {title}"), format!("{pad}--   {}", props.join(", "))];
+    let ups: Vec<String> = (0..p.nups)
+        .map(|i| {
+            let name = names.get(i).copied().unwrap_or("?");
+            // captured by reference: a variable the creator may still change
+            if kinds.get(i) == Some(&1) {
+                format!("{name} (by reference)")
+            } else {
+                name.to_string()
+            }
+        })
+        .collect();
+    info_list(pad, "upvalues", &ups, &mut out);
+    let ks: Vec<String> = (0..p.k.len()).map(|i| info_constant(m, p, i)).collect();
+    info_list(pad, "constants", &ks, &mut out);
+    out
+}
+
+/// `--   what (n): a, b, c`, continued on further lines past 110 columns.
+fn info_list(pad: &str, what: &str, items: &[String], out: &mut Vec<String>) {
+    if items.is_empty() {
+        out.push(format!("{pad}--   {what}: none"));
+        return;
+    }
+    let mut line = format!("{pad}--   {what} ({}):", items.len());
+    for (i, item) in items.iter().enumerate() {
+        let piece = if i + 1 < items.len() { format!("{item},") } else { item.clone() };
+        if line.len() + 1 + piece.len() > 110 && !line.ends_with(':') {
+            out.push(std::mem::replace(&mut line, format!("{pad}--     {piece}")));
+        } else {
+            line.push(' ');
+            line.push_str(&piece);
+        }
+    }
+    out.push(line);
+}
+
+/// A constant as the comment shows it: as a value, an import by its path, a
+/// template by its keys, a function by its number and name.
+fn info_constant(m: &Module, p: &Proto, i: usize) -> String {
+    match &p.k[i] {
+        K::TableK(v) => {
+            let keys: Vec<String> = v
+                .iter()
+                .filter_map(|(key, val)| {
+                    let name = kstr(m, p, *key as usize)?;
+                    let field = field_text(name);
+                    Some(if *val < 0 { field } else { format!("{field} = {}", kexpr(m, p, *val as i64)) })
+                })
+                .collect();
+            if keys.is_empty() {
+                "{}".to_string()
+            } else {
+                format!("{{ {} }}", keys.join(", "))
+            }
+        }
+        K::Closure(c) => match m.protos.get(*c).and_then(|f| f.name.as_deref()).filter(|n| !n.is_empty()) {
+            Some(n) => format!("<function {c}: {n}>"),
+            None => format!("<function {c}>"),
+        },
+        K::Class => "<class>".to_string(),
+        _ => kexpr(m, p, i as i64),
+    }
+}
+
 pub fn kstr<'a>(m: &'a Module, p: &Proto, i: usize) -> Option<&'a str> {
     match &p.k[i] {
         K::Str(Some(s)) => Some(&m.text[*s]),
@@ -5457,6 +5604,12 @@ impl<'c, 'm> Dec<'c, 'm> {
 
     /// A function's source, written to sit at indent ind.
     fn closure_text(&mut self, child: usize, caps: Vec<Rc<str>>, ind: usize) -> String {
+        // `--info`: the body opens with the function's number and the names its
+        // upvalues have here, for the comment above it once names are final
+        let marker = INFO.load(std::sync::atomic::Ordering::Relaxed).then(|| {
+            let names: Vec<&str> = caps.iter().map(|c| &**c).collect();
+            format!("{}{}{child}|{}|", sp(ind + 4), passes::INFO_MARK, names.join("|"))
+        });
         let key = (child, self.depth + 1, caps, self.ctx.helper_names.get());
         let cached = self.ctx.memo.borrow().get(&key).cloned();
         let result: Body = match cached {
@@ -5483,6 +5636,10 @@ impl<'c, 'm> Dec<'c, 'm> {
             })
             .collect();
         let mut text = format!("function({})\n", shown.join(", "));
+        if let Some(marker) = &marker {
+            text.push_str(marker);
+            text.push('\n');
+        }
         if shift != 0 {
             let mut first = true;
             for chunk in body {

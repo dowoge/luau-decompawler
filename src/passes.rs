@@ -177,10 +177,22 @@ fn alnum_len(s: &str, i: usize) -> usize {
     }
 }
 
+/// `--info`: a function's body opens with this, then the function's number
+/// and its upvalues' names, `N|a|b|`, until the comment above it is written.
+/// Renames reach those names; nothing else counts them as uses.
+pub const INFO_MARK: &str = "--\u{3}";
+
+pub fn info_marker(line: &str) -> bool {
+    line.trim_start().starts_with(INFO_MARK)
+}
+
 /// Identifier tokens of a line, outside strings, not after a `.`/`:`. `{...}`
 /// in backtick strings is code, so backticks are not quotes here. `f` returns
 /// false to stop early.
 fn for_each_word<'a>(s: &'a str, mut f: impl FnMut(&'a str) -> bool) {
+    if info_marker(s) {
+        return;
+    }
     let b = s.as_bytes();
     let code = code_mask(s);
     let mut i = 0;
@@ -344,6 +356,16 @@ fn has_var_word(line: &str, name: &str) -> bool {
 /// Rename identifier `old` (a variable, not a field) outside strings.
 fn replace_token(line: &mut String, old: &str, new: &str) {
     if !line.contains(old) {
+        return;
+    }
+    if info_marker(line) {
+        let mut parts: Vec<&str> = line.split('|').collect();
+        for p in parts.iter_mut().skip(1) {
+            if *p == old {
+                *p = new;
+            }
+        }
+        *line = parts.join("|");
         return;
     }
     let s: &str = line;
@@ -2479,7 +2501,9 @@ fn order_safe(toks: &[Tok], caps: &[String]) -> bool {
 pub fn uninline(lines: Vec<String>) -> Vec<String> {
     let mut lines = lines;
     let (copies, region) = copies_by_line(&lines);
-    let marked: Vec<bool> = lines.iter().map(|l| l.trim_start().starts_with("--@copies ")).collect();
+    let copies_marker = |l: &String| l.trim_start().starts_with("--@copies ");
+    let marked: Vec<bool> = lines.iter().map(|l| copies_marker(l) || info_marker(l)).collect();
+    let dropped: Vec<bool> = lines.iter().map(copies_marker).collect();
     let mut templates = Vec::new();
     for (name, params, b0, b1) in function_bodies(&lines) {
         // the copies marker opening a helper that holds copies itself is no
@@ -2563,8 +2587,8 @@ pub fn uninline(lines: Vec<String>) -> Vec<String> {
         }
     }
     let mut kept = Vec::with_capacity(out.len());
-    for (line, m) in out.into_iter().zip(marked) {
-        if !m {
+    for (line, d) in out.into_iter().zip(dropped) {
+        if !d {
             kept.push(line);
         }
     }
@@ -2949,7 +2973,10 @@ fn sink_declarations(lines: Vec<String>) -> Vec<String> {
     let mut funcs = functions(&out);
     funcs.sort_by_key(|f| -f.0);
     for (fi, fend, _) in funcs {
-        let start = (fi + 1) as usize;
+        let mut start = (fi + 1) as usize;
+        while start < out.len() && info_marker(&out[start]) {
+            start += 1;
+        }
         if start >= out.len() {
             continue;
         }
@@ -3527,7 +3554,10 @@ fn rename_variables(lines: Vec<String>) -> Vec<String> {
     let mut index: Option<(WordIndex, Vec<u32>)> = None;
     for (fi, fend, _) in &funcs {
         let fi = *fi;
-        let lo = (fi + 1) as usize;
+        let mut lo = (fi + 1) as usize;
+        while lo < out.len() && info_marker(&out[lo]) {
+            lo += 1;
+        }
         let hi = (*fend).min(out.len());
         if lo >= hi {
             continue;
@@ -4915,6 +4945,9 @@ fn rename_in(out: &mut [String], lo: usize, hi: usize, old: &str, new: &str) {
 
 /// Does `w` stand as a word anywhere in the raw line, strings included?
 fn raw_word(l: &str, w: &str) -> bool {
+    if info_marker(l) {
+        return false;
+    }
     let b = l.as_bytes();
     let mut from = 0;
     while let Some(p) = l[from..].find(w).map(|x| x + from) {

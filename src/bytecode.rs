@@ -284,6 +284,9 @@ pub struct Proto {
     /// The type the compiler recorded for each parameter (its annotation),
     /// one byte each; empty when none was.
     pub param_types: Vec<u8>,
+    /// Luau's proto flags: 1 native module, 2 cold, 4 has a native function,
+    /// 8 inlinable, 16 uses export.
+    pub flags: u8,
 }
 
 #[derive(Debug)]
@@ -473,9 +476,7 @@ pub fn parse_as(data: &[u8], opcodes: Opcodes) -> R<Module> {
         let head = r.take(4)?;
         let (maxstack, numparams, nups, vararg) =
             (head[0] as usize, head[1] as usize, head[2] as usize, head[3]);
-        if version >= 4 {
-            r.u8()?; // flags
-        }
+        let flags = if version >= 4 { r.u8()? } else { 0 };
         let mut types = Vec::new();
         if tv != 0 {
             let n = r.varint()? as usize;
@@ -634,6 +635,7 @@ pub fn parse_as(data: &[u8], opcodes: Opcodes) -> R<Module> {
             linedefined,
             lines,
             param_types: types,
+            flags,
         });
     }
     let main = r.varint()? as usize;

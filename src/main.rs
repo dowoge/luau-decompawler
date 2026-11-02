@@ -81,6 +81,22 @@ fn name_round(lines: Vec<String>, extra: &Extra) -> Vec<String> {
     passes::final_forms(passes::blank_lines(passes::more_names(passes::role_names(lines), extra)))
 }
 
+/// The finished lines: with `--info` the comments on each function (from m),
+/// and `--!native` first when the module was compiled so.
+fn finish_lines(mut lines: Vec<String>, m: Option<&Module>, native: bool) -> Vec<String> {
+    if let Some(m) = m.filter(|_| decomp::INFO.load(std::sync::atomic::Ordering::Relaxed)) {
+        lines = decomp::info_comments(lines, m);
+    }
+    if native {
+        lines.insert(0, "--!native".to_string());
+    }
+    lines
+}
+
+fn is_native(m: &Module) -> bool {
+    m.protos[m.main].flags & 1 != 0
+}
+
 /// `--tabs`: indent with tabs, one for each four leading spaces.
 static TABS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -205,6 +221,8 @@ struct Core {
     defined: Vec<String>,
     calls: Vec<u8>,
     done: Option<[usize; 5]>,
+    /// compiled with `--!native`
+    native: bool,
 }
 
 impl Core {
@@ -219,6 +237,7 @@ impl Core {
             defined: self.defined.iter().map(|k| k.as_str().to_owned()).collect(),
             calls: self.calls.as_slice().to_vec(),
             done: self.done,
+            native: self.native,
         }
     }
 }
@@ -347,6 +366,16 @@ fn run_dir(src: &Path, dst: &Path, opcodes: Opcodes, noflat: bool) -> i32 {
     };
     let lines_of = |text: &str| -> Vec<String> { text.split('\n').map(String::from).collect() };
     let alone = Extra::default();
+    // the finished text of script i; `--info` reads its bytecode again rather
+    // than keep every script's
+    let finished = |i: usize, lines: Vec<String>, native: bool| -> Result<String, String> {
+        if !decomp::INFO.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(to_text(&finish_lines(lines, None, native)));
+        }
+        let data = fs::read(src.join(&files[i])).map_err(|e| e.to_string())?;
+        let m = load(&data, opcodes)?;
+        Ok(to_text(&finish_lines(lines, Some(&m), native)))
+    };
 
     // Script by script, in parallel: the work that needs no other script, up
     // to naming each as if it were alone. Naming sees other scripts only
@@ -360,15 +389,15 @@ fn run_dir(src: &Path, dst: &Path, opcodes: Opcodes, noflat: bool) -> i32 {
     // at once keeps all cores busy, and more only costs memory
     let budget = std::env::var("LUAU_BUDGET").ok().and_then(|v| v.parse().ok()).unwrap_or(5 << 18);
     let core: Vec<Core> = par_map_sized(&sizes, budget, |i| {
-        let run = || -> Result<String, String> {
+        let run = || -> Result<(String, bool), String> {
             let data = fs::read(src.join(&files[i])).map_err(|e| e.to_string())?;
             let m = load(&data, opcodes)?;
-            Ok(decompile_core(&m, names.get(sids[i]).map(String::as_str), noflat).join("\n"))
+            Ok((decompile_core(&m, names.get(sids[i]).map(String::as_str), noflat).join("\n"), is_native(&m)))
         };
         alloc::job(
             || {
-                let text = match panic::catch_unwind(AssertUnwindSafe(run)).unwrap_or_else(|e| Err(panic_text(e))) {
-                    Ok(text) => text,
+                let (text, native) = match panic::catch_unwind(AssertUnwindSafe(run)).unwrap_or_else(|e| Err(panic_text(e))) {
+                    Ok(done) => done,
                     Err(e) => return Core::done(write_out(i, &Err(e))),
                 };
                 let lines = lines_of(&text);
@@ -384,11 +413,11 @@ fn run_dir(src: &Path, dst: &Path, opcodes: Opcodes, noflat: bool) -> i32 {
                     (named, passes::tally_bytes(&passes::tally(&calls)))
                 }));
                 match (named, kept) {
-                    (Ok((named, calls)), None) => Core { calls, ..Core::done(write_out(i, &Ok(to_text(&named)))) },
-                    (Ok((_, calls)), Some(text)) => Core { text: Some(text), defined, calls, done: None },
+                    (Ok((named, calls)), None) => Core { calls, ..Core::done(write_out(i, &finished(i, named, native))) },
+                    (Ok((_, calls)), Some(text)) => Core { text: Some(text), defined, calls, done: None, native },
                     // named the same way again, it would fail the same way
                     (Err(e), None) => Core::done(write_out(i, &Err(panic_text(e)))),
-                    (Err(_), Some(text)) => Core { text: Some(text), defined, calls: Vec::new(), done: None },
+                    (Err(_), Some(text)) => Core { text: Some(text), defined, calls: Vec::new(), done: None, native },
                 }
             },
             |c| c.copy(),
@@ -414,11 +443,13 @@ fn run_dir(src: &Path, dst: &Path, opcodes: Opcodes, noflat: bool) -> i32 {
     let mut defined: Vec<Vec<String>> = Vec::with_capacity(core.len());
     let mut texts: Vec<Mutex<Option<Packed>>> = Vec::with_capacity(core.len());
     let mut sites: Vec<Tally> = Vec::with_capacity(core.len());
+    let mut natives: Vec<bool> = Vec::with_capacity(core.len());
     for c in core {
         sites.push(passes::tally_from(&c.calls, wanted));
         done.push(c.done);
         defined.push(c.defined);
         texts.push(Mutex::new(c.text));
+        natives.push(c.native);
     }
     // the text a script kept, read in place
     let text_of = |i: usize| -> Option<String> { texts[i].lock().unwrap().as_ref().map(Packed::text) };
@@ -496,7 +527,8 @@ fn run_dir(src: &Path, dst: &Path, opcodes: Opcodes, noflat: bool) -> i32 {
     let finish = |i: usize| -> Result<String, String> {
         let text = &texts[i].lock().unwrap().take().ok_or_else(|| "named twice".to_string())?.text();
         let seen = if defined[i].iter().any(|k| extra.knows(k)) { &extra } else { &alone };
-        panic::catch_unwind(AssertUnwindSafe(|| to_text(&name_round(lines_of(text), seen)))).map_err(panic_text)
+        let named = panic::catch_unwind(AssertUnwindSafe(|| name_round(lines_of(text), seen))).map_err(panic_text)?;
+        panic::catch_unwind(AssertUnwindSafe(|| finished(i, named, natives[i]))).map_err(panic_text)?
     };
     let written: Vec<[usize; 5]> = par_map(files.len(), |i| match done[i] {
         Some(counts) => counts,
@@ -546,7 +578,8 @@ fn run_stream(opcodes: Opcodes, noflat: bool) -> i32 {
     let written = par_map(items.len(), |i| {
         let one = || -> Result<String, String> {
             let m = load(items[i], opcodes)?;
-            Ok(to_text(&name_round(decompile_core(&m, None, noflat), &Extra::default())))
+            let lines = name_round(decompile_core(&m, None, noflat), &Extra::default());
+            Ok(to_text(&finish_lines(lines, Some(&m), is_native(&m))))
         };
         let result = panic::catch_unwind(AssertUnwindSafe(one)).unwrap_or_else(|e| Err(panic_text(e)));
         let (kind, body) = match &result {
@@ -570,6 +603,8 @@ fn usage() -> i32 {
          \x20              (203 for a Roblox client's bytecode); with --dir, .lua, .luau,\n\
          \x20              .txt and .bin files are read too\n\
          \x20 --tabs       indent with tabs\n\
+         \x20 --info       above each function, a comment with its upvalues, constants,\n\
+         \x20              parameters, registers, instructions and flags\n\
          Bytecode saved as text, a `--` line and then base64, is read as such."
     );
     2
@@ -579,6 +614,7 @@ fn run(args: Vec<String>) -> i32 {
     let noflat = std::env::var_os("LUAU_NOFLAT").is_some_and(|v| !v.is_empty());
     let upstream = args.iter().any(|a| a == "--upstream");
     TABS.store(args.iter().any(|a| a == "--tabs"), std::sync::atomic::Ordering::Relaxed);
+    decomp::INFO.store(args.iter().any(|a| a == "--info"), std::sync::atomic::Ordering::Relaxed);
     let key = match args.iter().position(|a| a == "--key") {
         Some(i) => match args.get(i + 1).and_then(|v| v.parse::<u8>().ok()) {
             Some(k) => Some(k),
@@ -591,7 +627,7 @@ fn run(args: Vec<String>) -> i32 {
         None if upstream => Opcodes::Stock,
         None => Opcodes::Wire,
     };
-    let mut args: Vec<String> = args.into_iter().filter(|a| a != "--upstream" && a != "--tabs").collect();
+    let mut args: Vec<String> = args.into_iter().filter(|a| a != "--upstream" && a != "--tabs" && a != "--info").collect();
     if let Some(i) = args.iter().position(|a| a == "--key") {
         args.drain(i..i + 2);
     }
@@ -617,7 +653,10 @@ fn run(args: Vec<String>) -> i32 {
     };
     let text = match load(&data, opcodes) {
         Ok(m) if disasm => decomp::disassemble(&m),
-        Ok(m) => to_text(&name_round(decompile_core(&m, None, noflat), &Extra::default())),
+        Ok(m) => {
+            let lines = name_round(decompile_core(&m, None, noflat), &Extra::default());
+            to_text(&finish_lines(lines, Some(&m), is_native(&m)))
+        }
         Err(e) => {
             eprintln!("{file}: {e}");
             return 1;
