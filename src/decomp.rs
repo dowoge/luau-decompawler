@@ -1442,6 +1442,15 @@ impl<'c, 'm> Dec<'c, 'm> {
                 self.assign(out, ind, *r, &e);
             }
         }
+        // a register passed as more than one argument is read once for each:
+        // what waits in it is a local first
+        let regs: Vec<usize> = call.args.iter().flatten().filter_map(|a| if let Arg::Reg(r, _) = a { Some(*r) } else { None }).collect();
+        for (k, r) in regs.iter().enumerate() {
+            if regs[..k].contains(r) && self.pending.contains_key(r) {
+                let e = self.get(*r);
+                self.assign(out, ind, *r, &e);
+            }
+        }
         let mut args: Vec<String> = Vec::with_capacity(call.args.len());
         for arg in &call.args {
             args.push(match arg {
