@@ -15,7 +15,7 @@
 use std::cell::Cell;
 use crate::hash::{HashMap, HashSet};
 
-use crate::bytecode::{is_for, is_forgprep, op, op_name, Insn, Module, Proto, K};
+use crate::bytecode::{is_forgprep, op, op_name, Insn, Module, Proto, K};
 use crate::decomp::{import_expr, kexpr};
 use crate::analysis::full_effects;
 
@@ -388,6 +388,51 @@ impl Walk<'_> {
         None
     }
 
+    /// `{ name = name }` with name given a constant: the compiler put that
+    /// constant into the copy's template and stores nothing. The keys are the
+    /// same, in order; each key only the copy's template gives a value is
+    /// stored by the helper, from a parameter, before anything but stores
+    /// into the table is done with it: that parameter is the constant. The
+    /// helper's stores the copy has none of, as indices into want.
+    fn template_args(&mut self, want: &[&Insn], k: usize, p: &Insn, c: &Insn) -> Option<Vec<usize>> {
+        let (K::TableK(hk), K::TableK(ck)) = (self.helper.k.get(p.d() as usize)?, self.caller.k.get(c.d() as usize)?) else {
+            return None;
+        };
+        if hk.len() != ck.len() {
+            return None;
+        }
+        let table = p.a();
+        let mut skip = Vec::new();
+        for (&(hkey, hval), &(ckey, cval)) in hk.iter().zip(ck) {
+            let key = kexpr(self.m, self.helper, hkey as i64);
+            if key != kexpr(self.m, self.caller, ckey as i64) {
+                return None;
+            }
+            match (hval >= 0, cval >= 0) {
+                (true, true) => self.same_k(hval as i64, cval as i64)?,
+                (false, false) => {}
+                (true, false) => return None,
+                (false, true) => {
+                    let at = k + 1 + want[k + 1..].iter().position(|w| {
+                        plain(w.op) == op::SETTABLEKS && w.b() == table && kexpr(self.m, self.helper, w.aux as i64) == key
+                    })?;
+                    // the table is still being made up to there
+                    let only_stores = want[k + 1..at].iter().all(|w| {
+                        let store = matches!(plain(w.op), op::SETTABLEKS | op::SETTABLE | op::SETTABLEN) && w.b() == table;
+                        let (reads, writes) = full_effects(w, self.helper.maxstack);
+                        store || (!reads.has(table) && !writes.has(table))
+                    });
+                    if !only_stores || skip.contains(&at) {
+                        return None;
+                    }
+                    self.constant(want[at].a(), kexpr(self.m, self.caller, cval as i64))?;
+                    skip.push(at);
+                }
+            }
+        }
+        (!skip.is_empty()).then_some(skip)
+    }
+
     /// The same function, in both protos?
     fn same_closure(&self, p: &Insn, c: &Insn) -> Option<()> {
         let child = |x: &Proto, i: &Insn| -> Option<usize> {
@@ -726,9 +771,14 @@ fn match_once(m: &Module, caller: &Proto, id: usize, start: usize, assumed: &[Op
     let first = code.get(i)?.pc;
     let mut last = first;
     let mut folded = 0;
+    // the helper's stores into a constructor that the copy's template made
+    let mut skipped: HashSet<usize> = HashSet::default();
     for (k, p) in want.iter().enumerate() {
         if folded > 0 {
             folded -= 1;
+            continue;
+        }
+        if skipped.contains(&k) {
             continue;
         }
         if let Some(t) = dead_until {
@@ -815,9 +865,21 @@ fn match_once(m: &Module, caller: &Proto, id: usize, start: usize, assumed: &[Op
             && p.op != op::GETUPVAL
             && p.op != op::SETUPVAL
         {
-            let Some(text) = walk.load_text(c) else { break };
-            walk.loaded.insert(c.a(), (text, c.pc));
-            walk.written.push(c.a());
+            if let Some(text) = walk.load_text(c) {
+                walk.loaded.insert(c.a(), (text, c.pc));
+                walk.written.push(c.a());
+            } else if c.op == op::MOVE && walk.unread.len() == 1 {
+                // an upvalue the copy reads from a local: moved into its
+                // argument's place only just before the call (the call's
+                // range read then shows it was that)
+                let (&hr, &u) = walk.unread.iter().next()?;
+                walk.upvalue(u, Up::Reg(c.b()))?;
+                walk.unread.remove(&hr);
+                walk.map[hr] = Some(c.a());
+                walk.written.push(c.a());
+            } else {
+                break;
+            }
             last = c.pc;
             i = skip(code, i + 1);
             c = code.get(i)?;
@@ -938,6 +1000,9 @@ fn match_once(m: &Module, caller: &Proto, id: usize, start: usize, assumed: &[Op
                 }
             }
             walk.write(p.a(), c.a())?;
+        } else if p.op == op::DUPTABLE && c.op == op::DUPTABLE && walk.same_k(p.d() as i64, c.d() as i64).is_none() {
+            skipped.extend(walk.template_args(&want, k, p, c)?);
+            walk.write(p.a(), c.a())?;
         } else if plain(p.op) == plain(c.op) || (p.op == op::NEWCLOSURE && c.op == op::DUPCLOSURE) {
             // a literal that captures a parameter is new on every call; in a
             // copy given a function literal it is shared, and loaded as one
@@ -1010,7 +1075,7 @@ fn match_once(m: &Module, caller: &Proto, id: usize, start: usize, assumed: &[Op
             return refuse("a copied return differs");
         }
     }
-    if is_for(after.op) || !(first <= last) {
+    if !(first <= last) {
         return None;
     }
     let results = if result.is_some() { results.max(1) } else { 0 };
