@@ -1992,7 +1992,11 @@ impl<'c, 'm> Dec<'c, 'm> {
     /// for itself and those around it: those hold the line it is defined on.
     /// (A function that is all a copy has only its helper's lines.)
     fn copies_here(&self) -> Vec<&'m str> {
-        let mut lines: Vec<u32> = self.p.lines.clone();
+        // not the closures and captures that make a function where it is
+        // defined, on its first line: those are no copy of it
+        let p = self.p;
+        let made = |op: u8| matches!(op, op::NEWCLOSURE | op::DUPCLOSURE | op::CAPTURE);
+        let mut lines: Vec<u32> = p.code.iter().filter(|c| !made(c.op)).filter_map(|c| p.lines.get(c.pc as usize).copied()).collect();
         lines.sort_unstable();
         lines.dedup();
         let def = self.p.linedefined;
@@ -2005,6 +2009,55 @@ impl<'c, 'm> Dec<'c, 'm> {
             }
             let k = lines.partition_point(|l| *l < from);
             if lines.get(k).is_some_and(|l| *l <= to) {
+                names.push(name);
+            }
+        }
+        names
+    }
+
+    /// copies_here for this function and the functions inside it, whose
+    /// text is part of this one's: a later pass puts the helpers' calls back
+    /// in all of it, so they stay in scope.
+    fn copies_within(&self) -> Vec<&'m str> {
+        let protos = &self.m.protos;
+        let subtree = |root: usize| {
+            let mut all: Vec<usize> = Vec::new();
+            let mut stack = vec![root];
+            while let Some(i) = stack.pop() {
+                all.push(i);
+                stack.extend(protos[i].children.iter().copied());
+            }
+            all
+        };
+        let inside = subtree(self.idx);
+        // per function here, the lines of code that could be a copy: not the
+        // closures and captures that make a function where it is defined
+        let made = |op: u8| matches!(op, op::NEWCLOSURE | op::DUPCLOSURE | op::CAPTURE);
+        let lines: Vec<(usize, Vec<u32>)> = inside
+            .iter()
+            .map(|&i| {
+                let q = &protos[i];
+                let mut l: Vec<u32> = q.code.iter().filter(|c| !made(c.op)).filter_map(|c| q.lines.get(c.pc as usize).copied()).collect();
+                l.sort_unstable();
+                l.dedup();
+                (i, l)
+            })
+            .collect();
+        let def = self.p.linedefined;
+        let mut names: Vec<&'m str> = Vec::new();
+        for (h, proto) in protos.iter().enumerate() {
+            let Some(name) = proto.name.as_deref().filter(|n| !n.is_empty()) else { continue };
+            let (from, to) = self.ctx.spans[h];
+            if h == self.idx || (from <= def && def <= to) || names.contains(&name) {
+                continue;
+            }
+            // its own body is on its lines too
+            let own = if inside.contains(&h) { subtree(h) } else { Vec::new() };
+            let copied = lines.iter().filter(|(i, _)| !own.contains(i)).any(|(_, l)| {
+                let k = l.partition_point(|x| *x < from);
+                l.get(k).is_some_and(|x| *x <= to)
+            });
+            if copied {
                 names.push(name);
             }
         }
@@ -2092,7 +2145,7 @@ impl<'c, 'm> Dec<'c, 'm> {
         // end in blocks of their own as well
         let lines: Vec<String> = body.iter().flat_map(|c| c.split('\n').map(String::from)).collect();
         let base = lines.iter().find(|l| !l.trim().is_empty()).map_or(0, |l| passes::indent_of(l));
-        let deep = scope_nested_deep(&lines, base);
+        let deep = scope_nested_deep(&lines, base, &self.copies_within());
         if fewer(&deep, &lines) {
             (params, deep)
         } else {
@@ -2111,7 +2164,7 @@ impl<'c, 'm> Dec<'c, 'm> {
                 // after it mentions is a block of its own again
                 let lines: Vec<String> = body.iter().flat_map(|c| c.split('\n').map(String::from)).collect();
                 let base = lines.iter().find(|l| !l.trim().is_empty()).map_or(0, |l| passes::indent_of(l));
-                let scoped = scope_nested(&lines, base);
+                let scoped = scope_nested(&lines, base, &self.copies_within());
                 let (before, after) = (peak_lines(&lines), peak_lines(&scoped));
                 if after < before && (peak_locals(&scoped) <= 180 || peak <= 180) {
                     return (params, scoped);
@@ -2137,7 +2190,7 @@ impl<'c, 'm> Dec<'c, 'm> {
                 if self.p.numparams as usize + locals_in_scope(&fbody) > LOCAL_LIMIT {
                     let lines: Vec<String> = fbody.iter().flat_map(|c| c.split('\n').map(String::from)).collect();
                     let base = lines.iter().find(|l| !l.trim().is_empty()).map_or(0, |l| passes::indent_of(l));
-                    let scoped = scope_nested_deep(&lines, base);
+                    let scoped = scope_nested_deep(&lines, base, &self.copies_within());
                     if locals_in_scope(&scoped) < locals_in_scope(&lines) {
                         return (fparams, scoped);
                     }
@@ -5522,21 +5575,23 @@ impl<'a> Mentions<'a> {
 }
 
 /// scope_blocks at every depth: each block's body first, then the
-/// statements at this indentation.
-fn scope_nested(lines: &[String], ind: usize) -> Vec<String> {
+/// statements at this indentation. `keep`: helpers whose copies are here,
+/// called by name only once a later pass puts the calls back, so in use to
+/// the end.
+fn scope_nested(lines: &[String], ind: usize, keep: &[&str]) -> Vec<String> {
     let mentions = Mentions::new(lines);
-    scope_level(lines, 0, ind, &mentions, false)
+    scope_level(lines, 0, ind, &mentions, false, keep)
 }
 
 /// scope_nested, and inside each block it makes the statements after the one
 /// that holds it open are scoped again: deeper blocks, fewer locals at once.
-fn scope_nested_deep(lines: &[String], ind: usize) -> Vec<String> {
+fn scope_nested_deep(lines: &[String], ind: usize, keep: &[&str]) -> Vec<String> {
     let mentions = Mentions::new(lines);
-    scope_level(lines, 0, ind, &mentions, true)
+    scope_level(lines, 0, ind, &mentions, true, keep)
 }
 
 /// One depth of scope_nested: these lines start at line `off` of the function.
-fn scope_level(lines: &[String], off: usize, ind: usize, mentions: &Mentions, deep: bool) -> Vec<String> {
+fn scope_level(lines: &[String], off: usize, ind: usize, mentions: &Mentions, deep: bool, keep: &[&str]) -> Vec<String> {
     let ranges = statements_at(lines, ind);
     let mut chunks: Vec<String> = Vec::with_capacity(ranges.len());
     for &(a, b) in &ranges {
@@ -5553,7 +5608,7 @@ fn scope_level(lines: &[String], off: usize, ind: usize, mentions: &Mentions, de
                 }
                 let inner = &stmt[start..i];
                 let inner_ind = inner.iter().find(|l| !l.trim().is_empty()).map_or(ind + 4, |l| passes::indent_of(l));
-                done.extend(scope_level(inner, off + a + start, inner_ind, mentions, deep));
+                done.extend(scope_level(inner, off + a + start, inner_ind, mentions, deep, keep));
             } else {
                 done.push(stmt[i].clone());
                 i += 1;
@@ -5562,7 +5617,7 @@ fn scope_level(lines: &[String], off: usize, ind: usize, mentions: &Mentions, de
         chunks.push(done.join("\n"));
     }
     let spans: Vec<(usize, usize)> = ranges.iter().map(|&(a, b)| (off + a, off + b)).collect();
-    scope_blocks(&chunks, &spans, mentions, deep)
+    scope_blocks(&chunks, &spans, mentions, deep, keep)
         .into_iter()
         .flat_map(|c| c.split('\n').map(String::from).collect::<Vec<_>>())
         .collect()
@@ -5572,7 +5627,7 @@ fn scope_level(lines: &[String], off: usize, ind: usize, mentions: &Mentions, de
 /// it mentions wrapped in `do ... end`, so they end there as in the source.
 /// A local that lives to the end stays where it is. `spans` are the lines of
 /// the function each statement came from, for `mentions`.
-fn scope_blocks(body: &[String], spans: &[(usize, usize)], mentions: &Mentions, deep: bool) -> Vec<String> {
+fn scope_blocks(body: &[String], spans: &[(usize, usize)], mentions: &Mentions, deep: bool, keep: &[&str]) -> Vec<String> {
     let n = body.len();
     let Some(first) = body.iter().find(|c| !c.trim().is_empty()) else { return body.to_vec() };
     let base = " ".repeat(passes::indent_of(first.split('\n').next().unwrap_or("")));
@@ -5590,6 +5645,9 @@ fn scope_blocks(body: &[String], spans: &[(usize, usize)], mentions: &Mentions, 
     // the last statement mentioning a name, up to one declaring it again
     // (that one included: `local x = x + 1` reads it)
     let last_use = |name: &str, from: usize| -> usize {
+        if keep.contains(&name) {
+            return n - 1; // a helper whose calls come back later: the last statement
+        }
         let again = declares.get(name).and_then(|d| d.iter().find(|j| **j > from).copied());
         let stop = again.map_or(n, |j| j + 1);
         if stop <= from + 1 {
@@ -5625,7 +5683,9 @@ fn scope_blocks(body: &[String], spans: &[(usize, usize)], mentions: &Mentions, 
         // deep: what follows the statement holding the block open may end
         // sooner, in blocks of its own (all of it ends here at the latest)
         let inner: Vec<String> = if deep && end > i + 1 {
-            std::iter::once(body[i].clone()).chain(scope_blocks(&body[i + 1..=end], &spans[i + 1..=end], mentions, true)).collect()
+            std::iter::once(body[i].clone())
+                .chain(scope_blocks(&body[i + 1..=end], &spans[i + 1..=end], mentions, true, keep))
+                .collect()
         } else {
             body[i..=end].to_vec()
         };
