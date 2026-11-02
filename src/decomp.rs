@@ -421,6 +421,10 @@ struct Dec<'c, 'm> {
     /// Past the local limit even so: values wait through the tests on their
     /// way (`if` expressions, comparisons, `and`/`or` choices).
     tight: bool,
+    /// The jumps did not all nest: a value for a variable declared before it
+    /// is an expression after all, assigned (in each arm of an `if` when it
+    /// is an `if` expression), where it would otherwise need a flag.
+    relaxed: bool,
     flat: bool,
     regname: Vec<Option<Rc<str>>>,
     declared: Vec<bool>,
@@ -479,6 +483,24 @@ struct Dec<'c, 'm> {
     /// Computing part of a larger value: what it computes waits for that one.
     in_value: bool,
     value_reg: Option<usize>,
+}
+
+/// What a printed body falls back on for jumps that did not nest: its
+/// dispatchers (`local block = 0`), then its flags (`local jump_<pc> = `).
+fn fallbacks(body: &[String]) -> (usize, usize) {
+    let (mut blocks, mut flags) = (0, 0);
+    for line in body.iter().flat_map(|c| c.split('\n')) {
+        let s = line.trim_start();
+        if s.starts_with("local block = 0") {
+            blocks += 1;
+        } else if let Some(rest) = s.strip_prefix("local jump_") {
+            let d = rest.bytes().take_while(u8::is_ascii_digit).count();
+            if d > 0 && rest[d..].starts_with(" = ") {
+                flags += 1;
+            }
+        }
+    }
+    (blocks, flags)
 }
 
 fn is_generated_v(s: &str, allow_x: bool) -> bool {
@@ -882,6 +904,7 @@ impl<'c, 'm> Dec<'c, 'm> {
             key_pc: None,
             flat_regs: false,
             tight: false,
+            relaxed: false,
             flat: false,
             param_names: Vec::new(),
             once_cache: HashMap::default(),
@@ -1357,6 +1380,36 @@ impl<'c, 'm> Dec<'c, 'm> {
         self.key_pc = None;
         self.assign_key(out, ind, r, key, e);
         self.key_pc = old_key;
+    }
+
+    /// assign(), for a variable declared before its value: an `if` expression
+    /// is the `if` statement the source wrote, the variable set in each arm.
+    fn assign_arms(&mut self, out: &mut Vec<String>, ind: usize, r: usize, e: &E) {
+        let (parts, tail) = {
+            let x = e.borrow();
+            match (&x.ifparts, &x.ifelse) {
+                (Some(p), Some(t)) if !p.is_empty() => (p.clone(), t.clone()),
+                _ => (Vec::new(), e.clone()),
+            }
+        };
+        let mut lines = Vec::new();
+        self.assign(&mut lines, ind, r, e);
+        let pad = sp(ind);
+        let whole = format!(" = {}", e.borrow().text);
+        let name = lines.last().and_then(|l| l.strip_prefix(pad)?.strip_suffix(whole.as_str())).map(str::to_string);
+        let Some(name) = name.filter(|n| !parts.is_empty() && is_ident(n)) else {
+            out.append(&mut lines);
+            return;
+        };
+        lines.pop();
+        out.append(&mut lines); // what waited for the variable
+        for (k, (c, a)) in parts.iter().enumerate() {
+            out.push(format!("{pad}{} {} then", if k == 0 { "if" } else { "elseif" }, c.borrow().text));
+            out.push(format!("{pad}    {name} = {}", a.borrow().text));
+        }
+        out.push(format!("{pad}else"));
+        out.push(format!("{pad}    {name} = {}", tail.borrow().text));
+        out.push(format!("{pad}end"));
     }
 
     fn assign_key(&mut self, out: &mut Vec<String>, ind: usize, r: usize, key: u32, e: &E) {
@@ -2388,7 +2441,21 @@ impl<'c, 'm> Dec<'c, 'm> {
 
     /// The body, in fewer locals than Luau's limit if it can be.
     fn decompile_fitted(&mut self) -> (Vec<String>, Vec<String>) {
-        let (params, body) = self.decompile_once();
+        let (mut params, mut body) = self.decompile_once();
+        if !self.relaxed && !self.label_pcs.is_empty() && fallbacks(&body) != (0, 0) {
+            // jumps that did not nest, and a flag or a dispatcher for them:
+            // printed again relaxed, which is kept when it needs fewer
+            let flow = std::mem::take(&mut self.flow);
+            let mut again = Dec::with_flow(self.ctx, self.idx, self.upvals.clone(), self.depth, Some(flow));
+            again.relaxed = true;
+            again.tight = self.tight;
+            let (rparams, rbody) = again.decompile_once();
+            self.flow = std::mem::take(&mut again.flow);
+            if fallbacks(&rbody) < fallbacks(&body) {
+                self.relaxed = true;
+                (params, body) = (rparams, rbody);
+            }
+        }
         if !self.flat_regs {
             let peak = peak_locals(&body);
             if peak + self.p.numparams as usize > 180 {
@@ -2416,6 +2483,7 @@ impl<'c, 'm> Dec<'c, 'm> {
                 let mut again = Dec::with_flow(self.ctx, self.idx, self.upvals.clone(), self.depth, Some(flow));
                 again.flat_regs = true;
                 again.tight = self.tight;
+                again.relaxed = self.relaxed;
                 let (fparams, fbody) = again.decompile_once();
                 self.flow = std::mem::take(&mut again.flow); // for a retry after this one
                 // still past the limit: its stretches whose locals nothing after
@@ -4130,16 +4198,21 @@ impl<'c, 'm> Dec<'c, 'm> {
             self.region_head = None;
             let got = self.walk_value(pc, j, &before);
             self.in_region = false;
-            if let Err(f) = &got {
-                if self.ctx.why && WHY_ALL.get().copied().unwrap_or(false) {
-                    let within = self.p.name.as_deref().unwrap_or("(anon)");
-                    eprintln!("REGION\t{within}\t{pc}\t{j}\t{}\t{}", f.why, f.line.trim());
+            let tell = self.ctx.why && WHY_ALL.get().copied().unwrap_or(false);
+            let within = self.p.name.as_deref().unwrap_or("(anon)").to_string();
+            let why = |reason: &str, line: &str| {
+                if tell {
+                    eprintln!("REGION\t{within}\t{pc}\t{j}\t{reason}\t{}", line.trim());
                 }
+            };
+            if let Err(f) = &got {
+                why(f.why, &f.line);
             }
             if let Ok((r, expr)) = got {
                 // `local v` came first: each arm assigns it, as a statement
                 let declared = self.region_def(pc, j, r).is_some_and(|w| self.declared[(KW + w) as usize]);
-                if declared {
+                if declared && (!self.relaxed || self.in_value) {
+                    why("its variable was declared before", &expr.borrow().text);
                     self.rollback(saved);
                     continue;
                 }
@@ -4151,6 +4224,7 @@ impl<'c, 'm> Dec<'c, 'm> {
                         && (w[1].op == op::RETURN && w[1].a() == r && w[1].b() == 2)
                 });
                 if self.insn(j).op == op::RETURN && expr.borrow().logic.is_none() && !copied {
+                    why("a guard clause", "");
                     self.rollback(saved);
                     continue;
                 }
@@ -4176,15 +4250,20 @@ impl<'c, 'm> Dec<'c, 'm> {
                         let k = self.flow.def_web(dp, r).map(|w| KW + w).unwrap_or_else(|| self.var_key(r));
                         self.set_def_key(&expr, r, k);
                     }
-                    if self.in_value || self.read_once_from(j, r) {
+                    if !declared && (self.in_value || self.read_once_from(j, r)) {
                         self.pset(r, expr);
                     } else {
-                        // used more than once after the join: a variable
+                        // used more than once after the join, or declared
+                        // before: a variable
                         let mut region_out = Vec::new();
                         self.cur_pc = value_def.unwrap_or(pc);
                         let ind = self.region_ind;
                         self.flush_impure(&mut region_out, ind, r);
-                        self.assign(&mut region_out, ind, r, &expr);
+                        if declared {
+                            self.assign_arms(&mut region_out, ind, r, &expr);
+                        } else {
+                            self.assign(&mut region_out, ind, r, &expr);
+                        }
                         self.region_lines = Some(region_out);
                     }
                     let inside = code[from..]
@@ -4195,6 +4274,7 @@ impl<'c, 'm> Dec<'c, 'm> {
                     self.consume(j, inside as u32);
                     return Some(j);
                 }
+                why(if others { "other values made are read after" } else { "nothing reads the value" }, &expr.borrow().text);
             }
             self.rollback(saved);
         }
