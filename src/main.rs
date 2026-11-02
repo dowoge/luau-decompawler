@@ -76,10 +76,23 @@ fn name_round(lines: Vec<String>, extra: &Extra) -> Vec<String> {
     passes::blank_lines(passes::more_names(passes::role_names(lines), extra))
 }
 
+/// `--tabs`: indent with tabs, one for each four leading spaces.
+static TABS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn to_text(lines: &[String]) -> String {
     let mut text = lines.join("\n");
     text.push('\n');
-    text
+    if !TABS.load(std::sync::atomic::Ordering::Relaxed) {
+        return text;
+    }
+    // strings print newlines escaped: leading spaces are indentation
+    let mut out = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        let n = line.len() - line.trim_start_matches(' ').len();
+        out.extend(std::iter::repeat_n('\t', n / 4));
+        out.push_str(&line[n / 4 * 4..]);
+    }
+    out
 }
 
 fn panic_text(e: Box<dyn std::any::Any + Send>) -> String {
@@ -535,7 +548,8 @@ fn run_stream(upstream: bool, noflat: bool) -> i32 {
 fn usage() -> i32 {
     println!(
         "luau_decompile FILE.wire | --disasm FILE.wire | --dir DIR [--out OUT] | --stream\n\
-         \x20 --upstream   input is stock Luau bytecode (luau_compile output)"
+         \x20 --upstream   input is stock Luau bytecode (luau_compile output)\n\
+         \x20 --tabs       indent with tabs"
     );
     2
 }
@@ -543,7 +557,8 @@ fn usage() -> i32 {
 fn run(args: Vec<String>) -> i32 {
     let noflat = std::env::var_os("LUAU_NOFLAT").is_some_and(|v| !v.is_empty());
     let upstream = args.iter().any(|a| a == "--upstream");
-    let args: Vec<String> = args.into_iter().filter(|a| a != "--upstream").collect();
+    TABS.store(args.iter().any(|a| a == "--tabs"), std::sync::atomic::Ordering::Relaxed);
+    let args: Vec<String> = args.into_iter().filter(|a| a != "--upstream" && a != "--tabs").collect();
     if args.len() >= 2 && args[0] == "--dir" {
         let src = PathBuf::from(&args[1]);
         let dst = match args.iter().position(|a| a == "--out") {
