@@ -162,7 +162,7 @@ impl X {
                         None => x.clone(),
                     })
                     .collect();
-                format!("{{{}}}", shown.join(", "))
+                format!("{{ {} }}", shown.join(", "))
             }
         }
     }

@@ -151,7 +151,14 @@ pub fn kexpr(m: &Module, p: &Proto, i: i64) -> String {
             format!("Vector3.new({}, {}, {})", fmt_number(v[0]), fmt_number(v[1]), fmt_number(v[2]))
         }
         K::Closure(v) => format!("<function {v}>"),
-        K::TableK(_) => format!("{{{}}}", template_fields(m, p, i).join(", ")),
+        K::TableK(_) => {
+            let fields = template_fields(m, p, i);
+            if fields.is_empty() {
+                "{}".into()
+            } else {
+                format!("{{ {} }}", fields.join(", "))
+            }
+        }
         K::Class => format!("K{i}"),
     }
 }
@@ -5278,7 +5285,7 @@ impl<'c, 'm> Dec<'c, 'm> {
                     }
                     if let Some(list) = open_end {
                         let at = aux as u64 + texts.len() as u64;
-                        out.push(format!("{pad}for i_, v_ in {{{list}}} do"));
+                        out.push(format!("{pad}for i_, v_ in {{ {list} }} do"));
                         if at == 1 {
                             out.push(format!("{pad}    {tbl}[i_] = v_"));
                         } else {
