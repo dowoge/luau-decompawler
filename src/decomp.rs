@@ -3388,9 +3388,17 @@ impl<'c, 'm> Dec<'c, 'm> {
         out.push(format!("{pad}local block = 0"));
         out.push(format!("{pad}while true do"));
         let (ind1, ind2) = (base + 4, base + 8);
+        // Luau parses each elseif one level deeper, up to 1000 levels in all:
+        // a long dispatcher is several chains in a row. A block that falls
+        // through has set `block` to the next, which the next chain or the
+        // next round finds.
+        const CHAIN: usize = 150;
         for (i, &s) in starts.iter().enumerate() {
             let e = if i + 1 < starts.len() { starts[i + 1] } else { p.sizecode };
-            out.push(format!("{}{} block == {s} then", sp(ind1), if i == 0 { "if" } else { "elseif" }));
+            if i > 0 && i % CHAIN == 0 {
+                out.push(format!("{}end", sp(ind1)));
+            }
+            out.push(format!("{}{} block == {s} then", sp(ind1), if i % CHAIN == 0 { "if" } else { "elseif" }));
             let mut body = Vec::new();
             let mut pc = s;
             let mut ended = false;
