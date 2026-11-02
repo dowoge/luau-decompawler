@@ -637,6 +637,30 @@ mod tests {
     }
 
     #[test]
+    fn loop_variables_renamed_leave_what_the_loop_reads_first() {
+        // one variable per register: the loops' variables take registers an
+        // outer value had, which their headers still read
+        let lines: Vec<String> = [
+            "local v5 = 3",
+            "for v5, v6 in ipairs(if v5 > 1 then t else u) do",
+            "    print(v5, v6)",
+            "end",
+            "for v5 = v5 + 1, 10 do",
+            "    print(v5)",
+            "end",
+            "print(v5)",
+        ]
+        .iter()
+        .map(|l| l.to_string())
+        .collect();
+        let out = passes::role_names(lines);
+        assert!(out[1].starts_with("for i, ") && out[1].ends_with(" in ipairs(if v5 > 1 then t else u) do"), "{}", out[1]);
+        assert!(out[2].starts_with("    print(i, "), "{}", out[2]);
+        assert!(out[4].ends_with(" = v5 + 1, 10 do") && !out[4].starts_with("for v5 "), "{}", out[4]);
+        assert_eq!(out[7], "print(v5)");
+    }
+
+    #[test]
     fn output_paths_stay_inside_the_output_folder() {
         assert_eq!(sanitize("../../etc/passwd", "7"), "__/__/etc/passwd");
         assert_eq!(sanitize("a/../b", "7"), "a/__/b");

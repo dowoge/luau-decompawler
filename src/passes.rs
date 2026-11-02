@@ -4737,7 +4737,15 @@ fn loop_names(out: &mut [String]) {
                 _ => continue,
             }
             if let Some(new) = cands.into_iter().find(|c| !word_in(out, i, end, c)) {
-                rename_in(out, i, end, var, &new);
+                // on the `for` line, in its list of names only: what follows
+                // ` in ` or ` = ` is read before the loop's variables exist
+                let line = &out[i];
+                let after_for = line.find("for ").map_or(0, |p| p + 4);
+                let list_end = [" in ", " = "].iter().filter_map(|s| line[after_for..].find(s)).min().map_or(line.len(), |p| after_for + p);
+                let (mut head, tail) = (line[..list_end].to_string(), line[list_end..].to_string());
+                replace_token(&mut head, var, &new);
+                out[i] = head + &tail;
+                rename_in(out, i + 1, end, var, &new);
             }
         }
     }
