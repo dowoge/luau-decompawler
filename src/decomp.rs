@@ -3684,7 +3684,17 @@ impl<'c, 'm> Dec<'c, 'm> {
         if let Some(f) = self.bool_value(q, nxt, Some(&mut *scratch), 0, false) {
             return Some(f);
         }
+        self.joined_value = None;
         if let Some(f) = self.and_or_value(q, nxt, end) {
+            // read again after the test: a variable, which no test can
+            // declare, so the statement ends what folds into the test
+            if let Some(r) = self.joined_value.take() {
+                if self.pending.contains_key(&r) && !self.read_once_from(f, r) {
+                    let e = self.get(r);
+                    self.flush_impure(scratch, 0, r);
+                    self.assign(scratch, 0, r, &e);
+                }
+            }
             return Some(f);
         }
         self.region_ind = 0;
