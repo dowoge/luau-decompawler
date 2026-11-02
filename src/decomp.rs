@@ -2738,7 +2738,9 @@ impl<'c, 'm> Dec<'c, 'm> {
     /// and no loop may start there (it would be computed on every pass).
     fn read_once(&mut self, pc: i32, r: usize) -> bool {
         if self.value_reg == Some(r) {
-            return true; // the value being built: the whole gets the variable
+            // the value being built: the whole gets the variable, when what is
+            // built from it reads it once (`x - x` reads a local)
+            return self.read_once_straight(pc, r);
         }
         let join = self.join_ok;
         let key = (pc, r as u32, join.unwrap_or(i32::MIN));
@@ -2857,6 +2859,31 @@ impl<'c, 'm> Dec<'c, 'm> {
         }
         self.once_cache.insert(key, result);
         result
+    }
+
+    /// The straight code after pc reads r at most once before writing it (a
+    /// jump or a join ends the look: as before, once).
+    fn read_once_straight(&self, pc: i32, r: usize) -> bool {
+        let code = &self.p.code;
+        let Some(i) = self.flow.idx(pc) else { return true };
+        let mut reads = 0;
+        for ins in &code[i + 1..] {
+            if ins.jump_target().is_some() || self.has_label(ins.pc) {
+                break;
+            }
+            // a store into the table being built is part of building it
+            let filling = matches!(ins.op, op::SETTABLEKS | op::SETTABLEN) && ins.b() == r && ins.a() != r
+                || ins.op == op::SETTABLE && ins.b() == r && ins.a() != r && ins.c() != r
+                || ins.op == op::SETLIST && ins.a() == r;
+            let (rd, wr) = full_effects(ins, self.p.maxstack);
+            if rd.has(r) && !filling {
+                reads += if twice(ins, r) { 2 } else { 1 };
+            }
+            if wr.has(r) || reads > 1 {
+                break;
+            }
+        }
+        reads <= 1
     }
 
     /// A constructor whose table is used more than once is complete: it
