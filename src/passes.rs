@@ -1324,7 +1324,198 @@ pub fn resolve_gotos(mut lines: Vec<String>) -> Option<Vec<String>> {
         return None;
     }
     copy_small_guards(&mut lines);
+    copy_unless_guards(&mut lines);
     Some(lines)
+}
+
+/// `local F = false  if ... end  if not F then S end`, where every way
+/// through the `if` either sets F as its last act or comes out of the end of
+/// an arm: S goes at each such end (in an `else` added where there is none),
+/// a set becomes nothing, and the flag goes. S is short, and reads no name
+/// the `if` declares.
+fn copy_unless_guards(lines: &mut Vec<String>) {
+    let mut k = 0;
+    while k < lines.len() {
+        let flag = strip(&lines[k])
+            .strip_prefix("local ")
+            .and_then(|r| r.strip_suffix(" = false"))
+            .filter(|f| f.strip_prefix("jump_").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())))
+            .map(str::to_string);
+        match flag {
+            Some(f) if copy_unless(lines, k, &f) => {}
+            _ => k += 1,
+        }
+    }
+}
+
+fn copy_unless(lines: &mut Vec<String>, decl: usize, flag: &str) -> bool {
+    let d = indent_of(&lines[decl]);
+    let set = format!("{flag} = true");
+    // the `if` right after the declaration, the check right after it
+    let Some(first) = (decl + 1..lines.len()).find(|&i| !is_blank(&lines[i])) else { return false };
+    if indent_of(&lines[first]) != d || !strip(&lines[first]).starts_with("if ") || !strip(&lines[first]).ends_with(" then") {
+        return false;
+    }
+    let Some(chain_end) = if_end(lines, first) else { return false };
+    let Some(c) = (chain_end + 1..lines.len()).find(|&i| !is_blank(&lines[i])) else { return false };
+    if indent_of(&lines[c]) != d || strip(&lines[c]) != format!("if not {flag} then") {
+        return false;
+    }
+    let mut e = c + 1;
+    while e < lines.len() && (is_blank(&lines[e]) || indent_of(&lines[e]) > d) {
+        e += 1;
+    }
+    if e >= lines.len() || indent_of(&lines[e]) != d || strip(&lines[e]) != "end" {
+        return false;
+    }
+    // every other mention of the flag is a set inside the `if`
+    let others = (0..lines.len()).filter(|&i| has_word(&lines[i], flag) && i != decl && i != c);
+    let mut sets = 0;
+    for i in others {
+        if !(first < i && i < chain_end && strip(&lines[i]) == set) {
+            return false;
+        }
+        sets += 1;
+    }
+    let body: Vec<String> = lines[c + 1..e].iter().filter(|l| !is_blank(l)).map(|l| l[d + 4..].to_string()).collect();
+    if body.is_empty() || body.len() > 12 || body.iter().any(|l| has_any_goto(l) || parse_label(l).is_some()) {
+        return false;
+    }
+    let mut words = HashSet::default();
+    for l in &body {
+        words_into(&mut words, l);
+    }
+    if declares_any(&lines[first..chain_end], &words) {
+        return false;
+    }
+    let chain: Vec<String> = lines[first..=chain_end].iter().filter(|l| !is_blank(l)).cloned().collect();
+    let mut copies = 0;
+    let Some(new) = unless_chain(&chain, d, flag, &body, &mut copies) else { return false };
+    if sets == 0 || copies == 0 || copies * body.len() > 32 {
+        return false;
+    }
+    lines.splice(decl..=e, new);
+    true
+}
+
+/// Does any of these lines declare (a local, a loop variable, a local
+/// function) one of the names?
+fn declares_any(lines: &[String], names: &HashSet<String>) -> bool {
+    lines.iter().any(|l| {
+        let t = strip(l);
+        let mut declared: Vec<String> = Vec::new();
+        if let Some((list, _)) = parse_local_list(t) {
+            declared.extend(list.split(", ").map(String::from));
+        } else if let Some(r) = t.strip_prefix("for ") {
+            let head = r.split(" in ").next().unwrap_or(r);
+            let head = head.split(" = ").next().unwrap_or(head);
+            declared.extend(head.split(", ").map(|v| v.trim().to_string()));
+        } else if let Some(rest) = t.strip_prefix("local function ") {
+            declared.push(rest.split('(').next().unwrap_or(rest).to_string());
+        }
+        declared.iter().any(|n| names.contains(n))
+    })
+}
+
+/// The statements of a block at indent j: each its first line and those
+/// after it that belong to it (deeper, or its closing lines at j).
+fn statements(body: &[String], j: usize) -> Option<Vec<Vec<String>>> {
+    let mut out: Vec<Vec<String>> = Vec::new();
+    for l in body {
+        let li = indent_of(l);
+        let t = strip(l);
+        let closer = t == "end" || t.starts_with("end)") || t.starts_with("end,") || t == "else" || t.starts_with("elseif ")
+            || t.starts_with("until ") || t.starts_with('}') || t.starts_with(')');
+        if li < j {
+            return None;
+        }
+        if li == j && !closer {
+            out.push(vec![l.clone()]);
+        } else {
+            out.last_mut()?.push(l.clone());
+        }
+    }
+    Some(out)
+}
+
+/// An `if` chain (its lines, at indent j) with S at the end of each arm that
+/// comes out of it, and the sets of the flag gone.
+fn unless_chain(chain: &[String], j: usize, flag: &str, s: &[String], copies: &mut usize) -> Option<Vec<String>> {
+    let pad = spaces(j);
+    if strip(chain.last()?) != "end" || indent_of(chain.last()?) != j {
+        return None;
+    }
+    // arms: (header, body)
+    let mut arms: Vec<(String, Vec<String>)> = Vec::new();
+    for l in &chain[..chain.len() - 1] {
+        let t = strip(l);
+        if indent_of(l) == j && (t.starts_with("if ") || t.starts_with("elseif ") || t == "else") {
+            arms.push((l.clone(), Vec::new()));
+        } else {
+            arms.last_mut()?.1.push(l.clone());
+        }
+    }
+    let first = arms.first()?;
+    if !strip(&first.0).starts_with("if ") || !strip(&first.0).ends_with(" then") {
+        return None;
+    }
+    let has_else = arms.iter().any(|a| strip(&a.0) == "else");
+    let mut new_arms: Vec<(String, Vec<String>)> = Vec::new();
+    for (head, body) in &arms {
+        new_arms.push((head.clone(), unless_body(body, j + 4, flag, s, copies)?));
+    }
+    if !has_else {
+        *copies += 1;
+        new_arms.push((format!("{pad}else"), s.iter().map(|l| format!("{}{l}", spaces(j + 4))).collect()));
+    }
+    // `if c then else B end` is `if not c then B end`
+    if new_arms.len() == 2 && new_arms[0].1.is_empty() && strip(&new_arms[1].0) == "else" {
+        let c = strip(&new_arms[0].0).strip_prefix("if ")?.strip_suffix(" then")?.to_string();
+        let mut out = vec![format!("{pad}if {} then", negated(&c))];
+        out.extend(new_arms[1].1.iter().cloned());
+        out.push(format!("{pad}end"));
+        return Some(out);
+    }
+    let mut out = Vec::new();
+    for (head, body) in new_arms {
+        out.push(head);
+        out.extend(body);
+    }
+    out.push(format!("{pad}end"));
+    Some(out)
+}
+
+/// One arm's body (at indent j): its last statement decides. A set of the
+/// flag goes; an `if` chain takes S in its own arms; a way out (`return`,
+/// `break`, `continue`) needs nothing; anything else is followed by S.
+fn unless_body(body: &[String], j: usize, flag: &str, s: &[String], copies: &mut usize) -> Option<Vec<String>> {
+    let stmts = statements(body, j)?;
+    let copy = |copies: &mut usize| -> Vec<String> {
+        *copies += 1;
+        s.iter().map(|l| format!("{}{l}", spaces(j))).collect()
+    };
+    let Some((last, before)) = stmts.split_last() else { return Some(copy(copies)) };
+    if before.iter().flatten().any(|l| has_word(l, flag)) {
+        return None; // a set that more code follows
+    }
+    let mut out: Vec<String> = before.iter().flatten().cloned().collect();
+    let t = strip(&last[0]);
+    if last.len() == 1 && t == format!("{flag} = true") {
+        return Some(out);
+    }
+    if !last.iter().any(|l| has_word(l, flag)) {
+        out.extend(last.iter().cloned());
+        let leaves = last.len() == 1 && (t == "break" || t == "continue" || t == "return" || t.starts_with("return "));
+        if !leaves {
+            out.extend(copy(copies));
+        }
+        return Some(out);
+    }
+    if t.starts_with("if ") && t.ends_with(" then") {
+        out.extend(unless_chain(last, j, flag, s, copies)?);
+        return Some(out);
+    }
+    None
 }
 
 /// `local jump_N = false ... if jump_N then S end`, S a line or two, every
