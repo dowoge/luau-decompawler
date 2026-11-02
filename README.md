@@ -21,17 +21,18 @@ The test harness also needs `luau_check` and `luau_run`, two small programs in
     cmake --build build --config Release --target luau_check luau_run
 
 They are looked for in `build/Release`; set `LUAU_BIN` if they are elsewhere.
-Both take `--stdin` (paths, one per line) and work through their files on every
-core, as does `luau_decompile --each`: the harness starts one process per step,
-whatever the number of files. Rebuild them when they change, as the harness
-expects them to match.
+With `--stream` they, like `luau_decompile --stream`, take their programs as
+records on stdin (`<length> <name>` and the bytes, see `tools/records.h`), send
+results back the same way, and use every core: the harness runs one process per
+step and writes no files. Rebuild them when they change, as the harness expects
+them to match.
 
 ## Use
 
     target/release/luau_decompile --dir DUMPS --out OUTPUT    # every .wire in a folder
     target/release/luau_decompile FILE.wire                   # one script to stdout
     target/release/luau_decompile --disasm FILE.wire          # bytecode with source lines
-    target/release/luau_decompile --each OUT FILE... [--stdin] # many, each as if alone
+    target/release/luau_decompile --stream                    # records on stdin, each as if alone
 
 `--upstream` reads stock Luau bytecode instead of wire format. Environment:
 `LUAU_NOFLAT` prints raw gotos, `LUAU_WHY` lists each flag with what was refused,

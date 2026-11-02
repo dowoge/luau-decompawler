@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::gen;
-use crate::luau::{decompile_many, module, par_map, percent, read_text, Args, Temp, Tools, USUAL_BUDGET};
+use crate::luau::{decompile_many, module, par_map, percent, Args, Item, Tools, USUAL_BUDGET};
 use crate::shape::{pair, shape};
 
 const DECOMPILE_LIMIT: u64 = 300;
@@ -48,14 +48,6 @@ pub fn main(args: &Args) -> u8 {
     }
 }
 
-fn base(path: &str) -> &str {
-    Path::new(path).file_name().and_then(|f| f.to_str()).unwrap_or(path)
-}
-
-fn stem(path: &str) -> &str {
-    base(path).strip_suffix(".luau").unwrap_or(base(path))
-}
-
 fn has_flag(text: &str) -> bool {
     text.match_indices("local jump_").any(|(at, m)| {
         let rest = &text[at + m.len()..];
@@ -65,46 +57,43 @@ fn has_flag(text: &str) -> bool {
 }
 
 pub fn run(tools: &Tools, o: &Options) -> Outcome {
-    let tmp = Temp::new("dt");
     let seeds: Vec<u64> = (o.seed..o.seed + o.count).collect();
-    let srcs: Vec<String> = par_map(&seeds, |seed| {
-        let path = tmp.path(&format!("g{seed}.luau"));
-        std::fs::write(&path, gen::program(*seed, o.size)).expect("a generated program");
-        path
-    });
+    let srcs: Vec<Item> = par_map(&seeds, |seed| Item::new(format!("g{seed}.luau"), gen::program(*seed, o.size)));
     let mut detail = Vec::new();
-    let source = tools.compile(&srcs, &tmp.path("bc"));
-    if !source.failed.is_empty() {
-        let first: Vec<&(String, String)> = source.failed.iter().take(3).collect();
-        detail.push(format!("generator wrote invalid programs: {first:?}"));
+    let code = tools.compile(&srcs);
+    let invalid: Vec<(&str, &String)> =
+        srcs.iter().zip(&code).filter_map(|(s, c)| Some((s.name.as_str(), c.as_ref().err()?))).take(3).collect();
+    if !invalid.is_empty() {
+        detail.push(format!("generator wrote invalid programs: {invalid:?}"));
     }
-    let mapping = source.bytecode;
-    let compiled: Vec<&String> = srcs.iter().filter(|s| mapping.contains_key(*s)).collect();
-    let code: Vec<String> = compiled.iter().map(|s| mapping[*s].clone()).collect();
-    let done = decompile_many(&o.binary, &code, &tmp.path("dec"), DECOMPILE_LIMIT);
+    let compiled: Vec<usize> = (0..srcs.len()).filter(|i| code[*i].is_ok()).collect();
+    let bytecode: Vec<Vec<u8>> = compiled.iter().map(|i| code[*i].clone().unwrap_or_default()).collect();
+    let done = decompile_many(&o.binary, &bytecode, DECOMPILE_LIMIT);
 
-    let mut decs: Vec<(String, String)> = Vec::new();
-    let mut crashed: Vec<(String, String)> = Vec::new();
-    for (s, text) in compiled.iter().zip(done) {
+    // (source, its decompiled program)
+    let mut decs: Vec<(usize, Item)> = Vec::new();
+    let mut crashed: Vec<(usize, String)> = Vec::new();
+    for (i, text) in compiled.iter().zip(done) {
         match text {
-            Ok(path) => decs.push(((*s).clone(), path)),
-            Err(why) => crashed.push(((*s).clone(), why)),
+            Ok(text) => decs.push((*i, Item::new(format!("g{}.dec.luau", seeds[*i]), text))),
+            Err(why) => crashed.push((*i, why)),
         }
     }
-    let dec_paths: Vec<String> = decs.iter().map(|d| d.1.clone()).collect();
-    let back = tools.compile(&dec_paths, &tmp.path("dbc"));
-    let compile_fail: Vec<String> = back.failed.iter().map(|f| f.0.clone()).collect();
+    let dec_items: Vec<Item> = decs.iter().map(|d| d.1.clone()).collect();
+    let back = tools.compile(&dec_items);
+    let compile_fail = back.iter().filter(|b| b.is_err()).count();
 
-    let all: Vec<String> = srcs.iter().chain(&dec_paths).cloned().collect();
+    let all: Vec<Item> = srcs.iter().chain(&dec_items).cloned().collect();
     let out = tools.outputs(&all, RUN_LIMIT, USUAL_BUDGET);
     let (mut same, mut differ, mut skipped) = (0, 0, 0);
-    let mut failures: Vec<(String, String, &str)> = Vec::new();
-    for (s, d) in &decs {
-        if compile_fail.contains(d) {
-            failures.push((s.clone(), d.clone(), "decompiled program does not compile"));
+    // (source, decompiled, why)
+    let mut failures: Vec<(usize, usize, &str)> = Vec::new();
+    for (k, (i, d)) in decs.iter().enumerate() {
+        if back[k].is_err() {
+            failures.push((*i, k, "decompiled program does not compile"));
             continue;
         }
-        let (a, b) = (out.get(s), out.get(d));
+        let (a, b) = (out.get(&srcs[*i].name), out.get(&d.name));
         if a.is_some_and(|x| x.ends_with("budget exceeded")) {
             skipped += 1; // the original itself does not finish
             continue;
@@ -113,15 +102,15 @@ pub fn run(tools: &Tools, o: &Options) -> Outcome {
             same += 1;
         } else {
             differ += 1;
-            failures.push((s.clone(), d.clone(), "output differs"));
+            failures.push((*i, k, "output differs"));
         }
     }
 
     // how many functions recompile to the original instruction sequence
-    let dmap = back.bytecode;
-    let counted = par_map(&decs, |(s, d)| {
-        let Some(back) = dmap.get(d) else { return (0, 0) };
-        let (a, b) = (module(&mapping[s]), module(back));
+    let pairs: Vec<(usize, usize)> = decs.iter().enumerate().map(|(k, d)| (d.0, k)).collect();
+    let counted = par_map(&pairs, |(i, k)| {
+        let (Ok(orig), Ok(back)) = (&code[*i], &back[*k]) else { return (0, 0) };
+        let (a, b) = (module(orig), module(back));
         let paired = pair(&a, &b);
         let same = |(i, p): (usize, &crate::bytecode::Proto)| {
             paired[i].is_some_and(|j| shape(&a, p) == shape(&b, &b.protos[j]))
@@ -133,44 +122,44 @@ pub fn run(tools: &Tools, o: &Options) -> Outcome {
 
     let summary = format!(
         "{} programs ({skipped} skipped: never finish): {same} behave identically, {differ} differ, \
-         {} decompiled programs do not compile, {} decompiler crashes",
+         {compile_fail} decompiled programs do not compile, {} decompiler crashes",
         o.count,
-        compile_fail.len(),
         crashed.len()
     );
     detail.push(format!("{funcs} functions: {ident} recompile instruction-for-instruction ({})", percent(ident, funcs)));
-    let texts: Vec<String> = dec_paths.iter().map(|d| read_text(d)).collect();
+    let texts: Vec<String> = dec_items.iter().map(|d| String::from_utf8_lossy(&d.data).into_owned()).collect();
     let flags = texts.iter().filter(|t| has_flag(t)).count();
     let blocks = texts.iter().filter(|t| t.contains("local block = 0")).count();
     detail.push(format!("fallbacks: {flags} programs with jump flags, {blocks} with a dispatcher"));
-    for (s, e) in crashed.iter().take(5) {
-        detail.push(format!("  crash: {} {e}", base(s)));
+    for (i, e) in crashed.iter().take(5) {
+        detail.push(format!("  crash: {} {e}", srcs[*i].name));
     }
     if let Some(keep) = o.keep.as_ref().filter(|_| !failures.is_empty() || !crashed.is_empty()) {
         std::fs::create_dir_all(keep).expect("a folder for failures");
-        for (s, d, why) in &failures {
-            keep_failure(keep, s, Some(d), why, &out);
+        for (i, k, why) in &failures {
+            keep_failure(keep, &srcs[*i], Some(&dec_items[*k]), why, &out);
         }
-        for (s, e) in &crashed {
-            keep_failure(keep, s, None, &format!("decompiler crash: {e}"), &out);
+        for (i, e) in &crashed {
+            keep_failure(keep, &srcs[*i], None, &format!("decompiler crash: {e}"), &out);
         }
         detail.push(format!("  failing cases written to {keep}"));
     }
-    for (s, _, why) in failures.iter().take(8) {
-        detail.push(format!("  {}: {why}", base(s)));
+    for (i, _, why) in failures.iter().take(8) {
+        detail.push(format!("  {}: {why}", srcs[*i].name));
     }
     Outcome { clean: failures.is_empty() && crashed.is_empty(), summary, detail }
 }
 
-fn keep_failure(keep: &str, s: &str, d: Option<&String>, why: &str, out: &HashMap<String, String>) {
-    let at = Path::new(keep).join(stem(s));
+fn keep_failure(keep: &str, src: &Item, dec: Option<&Item>, why: &str, out: &HashMap<String, String>) {
+    let stem = src.name.strip_suffix(".luau").unwrap_or(&src.name);
+    let at = Path::new(keep).join(stem);
     let at = at.to_string_lossy();
-    let _ = std::fs::copy(s, format!("{at}.src.luau"));
+    let _ = std::fs::write(format!("{at}.src.luau"), &src.data);
     let mut note = format!("{why}\n");
-    if let Some(d) = d {
-        let _ = std::fs::copy(d, format!("{at}.dec.luau"));
-        let shown = |p: &String| out.get(p).map_or("None", String::as_str).to_string();
-        note += &format!("--- original output\n{}\n--- decompiled output\n{}\n", shown(&s.to_string()), shown(d));
+    if let Some(dec) = dec {
+        let _ = std::fs::write(format!("{at}.dec.luau"), &dec.data);
+        let shown = |name: &String| out.get(name).map_or("None", String::as_str).to_string();
+        note += &format!("--- original output\n{}\n--- decompiled output\n{}\n", shown(&src.name), shown(&dec.name));
     }
     let _ = std::fs::write(format!("{at}.why.txt"), note);
 }

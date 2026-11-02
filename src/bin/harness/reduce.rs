@@ -13,7 +13,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::luau::{decompile_many, module, par_map, read_text, workers, Args, Temp, Tools};
+use crate::luau::{decompile_many, module, par_map, read_text, workers, Args, Item, Temp, Tools};
 use crate::shape::shape;
 
 type Lines = Vec<String>;
@@ -36,58 +36,51 @@ struct Probe<'a> {
 impl Probe<'_> {
     /// What goes wrong with each program, None when nothing does.
     fn kinds(&self, programs: &[Lines]) -> Vec<Option<&'static str>> {
-        let dir = Temp::new("rd");
-        let sources: Vec<String> = programs
-            .iter()
-            .enumerate()
-            .map(|(i, lines)| {
-                let path = dir.path(&format!("{i}.luau"));
-                std::fs::write(&path, lines.join("\n") + "\n").expect("a candidate");
-                path
-            })
-            .collect();
-        let code = self.tools.compile(&sources, &dir.path("a")).bytecode;
-        let compiled: Vec<usize> = (0..programs.len()).filter(|i| code.contains_key(&sources[*i])).collect();
-        let files: Vec<String> = compiled.iter().map(|i| code[&sources[*i]].clone()).collect();
-        let texts = decompile_many(&self.binary, &files, &dir.path("d"), DECOMPILE_LIMIT);
+        let sources: Vec<Item> =
+            programs.iter().enumerate().map(|(i, lines)| Item::new(format!("c{i}.luau"), lines.join("\n") + "\n")).collect();
+        let code = self.tools.compile(&sources);
+        let compiled: Vec<usize> = (0..programs.len()).filter(|i| code[*i].is_ok()).collect();
+        let bytecode: Vec<Vec<u8>> = compiled.iter().map(|i| code[*i].clone().unwrap_or_default()).collect();
+        let texts = decompile_many(&self.binary, &bytecode, DECOMPILE_LIMIT);
 
         let mut kinds = vec![None; programs.len()];
-        let mut decompiled: Vec<(usize, String)> = Vec::new();
+        let mut decompiled: Vec<(usize, Item)> = Vec::new();
         for (i, text) in compiled.iter().zip(texts) {
             match text {
-                Ok(path) => decompiled.push((*i, path)),
+                Ok(text) => decompiled.push((*i, Item::new(format!("c{i}.dec.luau"), text))),
                 Err(_) => kinds[*i] = Some("crash"),
             }
         }
-        let paths: Vec<String> = decompiled.iter().map(|d| d.1.clone()).collect();
-        let back = self.tools.compile(&paths, &dir.path("b")).bytecode;
-        let mut good: Vec<(usize, String)> = Vec::with_capacity(decompiled.len());
-        for (i, path) in decompiled {
-            if back.contains_key(&path) {
-                good.push((i, path));
-            } else {
-                kinds[i] = Some("no-compile");
+        let dec_items: Vec<Item> = decompiled.iter().map(|d| d.1.clone()).collect();
+        let back = self.tools.compile(&dec_items);
+        // (program, its decompiled text, that recompiled)
+        let mut good: Vec<(usize, &Item, &Vec<u8>)> = Vec::with_capacity(decompiled.len());
+        for ((i, dec), b) in decompiled.iter().zip(&back) {
+            match b {
+                Ok(b) => good.push((*i, dec, b)),
+                Err(_) => kinds[*i] = Some("no-compile"),
             }
         }
         if self.shape {
-            let verdicts = par_map(&good, |(i, path)| {
-                let (a, b) = (module(&code[&sources[*i]]), module(&back[path]));
+            let verdicts = par_map(&good, |(i, _, b)| {
+                let Ok(orig) = &code[*i] else { return true };
+                let (a, b) = (module(orig), module(b));
                 let differs = |(k, p): (usize, &crate::bytecode::Proto)| {
                     k >= b.protos.len() || shape(&a, p) != shape(&b, &b.protos[k])
                 };
                 a.protos.iter().enumerate().any(differs)
             });
-            for ((i, _), differs) in good.iter().zip(verdicts) {
+            for ((i, _, _), differs) in good.iter().zip(verdicts) {
                 kinds[*i] = differs.then_some("shape");
             }
             return kinds;
         }
         // the time limit is for what the budget misses: it counts calls and
         // loops, and one huge string.rep is neither
-        let all: Vec<String> = good.iter().flat_map(|(i, p)| [sources[*i].clone(), p.clone()]).collect();
+        let all: Vec<Item> = good.iter().flat_map(|(i, d, _)| [sources[*i].clone(), (*d).clone()]).collect();
         let out = self.tools.outputs(&all, RUN_LIMIT, self.budget);
-        for (i, path) in &good {
-            let (x, y) = (out.get(&sources[*i]), out.get(path));
+        for (i, dec, _) in &good {
+            let (x, y) = (out.get(&sources[*i].name), out.get(&dec.name));
             // a program that now fails on its own is a different problem: without
             // this the search drifts to undefined names and error message wording
             if x.is_some_and(|x| x.ends_with("=== ok")) && x != y {

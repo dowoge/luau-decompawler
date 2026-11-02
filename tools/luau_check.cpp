@@ -8,14 +8,15 @@
 //   luau_check --emit DIR FILE...   also write each file's bytecode, compiled
 //                                   the way Roblox compiles game scripts
 //                                   (-O2), to DIR/<n>.bc, and print "n path"
-//                                   (the harness compares them with the
-//                                   original bytecode)
-//   --stdin                         the paths come from standard input too,
-//                                   one per line
+//   luau_check --stream             sources come as records on stdin (see
+//                                   records.h) and are compiled as --emit
+//                                   does; each result goes back as a record,
+//                                   its bytecode or the compiler's message
 //
-// Files go through on every core; what they report comes out in file order.
+// Files go through on every core, or LUAU_THREADS of them.
 #include "Luau/Common.h"
 #include "luacode.h"
+#include "records.h"
 
 #include <algorithm>
 #include <atomic>
@@ -23,8 +24,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
-#include <iostream>
 #include <iterator>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -40,73 +41,80 @@ static const char* const kMutableGlobals[] = {
     "Game", "Workspace", "game", "plugin", "script", "shared", "workspace", nullptr,
 };
 
+static size_t worker_count(size_t files) {
+    size_t n = std::max(std::thread::hardware_concurrency(), 1u);
+    if (const char* v = std::getenv("LUAU_THREADS"))
+        n = std::max(std::atoi(v), 1);
+    return std::min(n, files);
+}
+
 int main(int argc, char** argv) {
     const char* emit = nullptr;
-    bool from_stdin = false;
-    std::vector<std::string> paths;
+    bool stream = false;
+    std::vector<Record> files;  // from the command line: names only, read below
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--emit") == 0 && i + 1 < argc)
             emit = argv[++i];
-        else if (std::strcmp(argv[i], "--stdin") == 0)
-            from_stdin = true;
+        else if (std::strcmp(argv[i], "--stream") == 0)
+            stream = true;
         else
-            paths.push_back(argv[i]);
+            files.push_back({argv[i], {}});
     }
-    for (std::string line; from_stdin && std::getline(std::cin, line);) {
-        if (!line.empty() && line.back() == '\r')
-            line.pop_back();
-        if (paths.empty() && line.rfind("\xEF\xBB\xBF", 0) == 0)
-            line.erase(0, 3);  // a byte order mark, as PowerShell pipes
-        if (!line.empty())
-            paths.push_back(line);
+    const size_t named = files.size();
+    if (stream) {
+        binary_stdio();
+        for (Record& r : read_records())
+            files.push_back(std::move(r));
     }
-    const int count = int(paths.size());
     lua_CompileOptions opts = {};
-    opts.optimizationLevel = emit ? 2 : 1;
+    opts.optimizationLevel = emit || stream ? 2 : 1;
     opts.debugLevel = 1;
     opts.vectorLib = "Vector3";
     opts.vectorCtor = "new";
     opts.vectorType = "Vector3";
-    if (emit) {
+    if (emit || stream) {
         opts.mutableGlobals = kMutableGlobals;
         for (Luau::FValue<bool>* f = Luau::FValue<bool>::list; f; f = f->next)
             for (const char* name : kFlags)
                 if (std::strcmp(f->name, name) == 0)
                     f->value = true;
     }
-    std::atomic<int> next{0}, ok{0}, bad{0};
-    std::vector<std::string> said(count);
+    std::atomic<size_t> next{0};
+    std::atomic<int> ok{0}, bad{0};
+    std::mutex out;
+    std::vector<std::string> said(files.size());  // printed in order, at the end
     const auto work = [&] {
-        for (int i = next++; i < count; i = next++) {
-            const std::string& path = paths[i];
-            std::ifstream f(path, std::ios::binary);
-            if (!f) {
-                std::fprintf(stderr, "%s: cannot open\n", path.c_str());
-                ++bad;
-                continue;
-            }
-            const std::string src((std::istreambuf_iterator<char>(f)),
-                                  std::istreambuf_iterator<char>());
-            size_t size = 0;
-            char* bc = luau_compile(src.data(), src.size(), &opts, &size);
-            std::string& line = said[i];
-            // A failed compile returns version byte 0 followed by the message.
-            if (size > 0 && bc[0] == 0) {
-                line = path + ": " + std::string(bc + 1, size - 1) + "\n";
-                ++bad;
-            } else {
-                ++ok;
-                if (emit) {
-                    const std::string n = std::to_string(i);
-                    std::ofstream o(std::string(emit) + "/" + n + ".bc", std::ios::binary);
-                    o.write(bc, std::streamsize(size));
-                    line = n + " " + path + "\n";
+        for (size_t i = next++; i < files.size(); i = next++) {
+            Record& file = files[i];
+            if (i < named) {
+                std::ifstream f(file.name, std::ios::binary);
+                if (!f) {
+                    std::fprintf(stderr, "%s: cannot open\n", file.name.c_str());
+                    ++bad;
+                    continue;
                 }
+                file.data.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+            }
+            size_t size = 0;
+            char* bc = luau_compile(file.data.data(), file.data.size(), &opts, &size);
+            // A failed compile returns version byte 0 followed by the message.
+            const bool good = !(size > 0 && bc[0] == 0);
+            ++(good ? ok : bad);
+            if (stream && i >= named) {
+                std::lock_guard<std::mutex> hold(out);
+                write_result(i - named, good, good ? bc : bc + 1, good ? size : size - 1);
+            } else if (!good) {
+                said[i] = file.name + ": " + std::string(bc + 1, size - 1) + "\n";
+            } else if (emit) {
+                const std::string n = std::to_string(i);
+                std::ofstream o(std::string(emit) + "/" + n + ".bc", std::ios::binary);
+                o.write(bc, std::streamsize(size));
+                said[i] = n + " " + file.name + "\n";
             }
             std::free(bc);
         }
     };
-    size_t workers = std::min<size_t>(std::max(std::thread::hardware_concurrency(), 1u), said.size());
+    size_t workers = worker_count(files.size());
     std::vector<std::thread> others;
     while (workers-- > 1)
         others.emplace_back(work);

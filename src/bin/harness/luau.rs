@@ -1,6 +1,11 @@
 //! Running things: the real Luau compiler and VM, the decompiler, in parallel.
+//!
+//! Each tool runs as a process of its own, so that a crash or a hang can be
+//! seen and survived, but one process does a whole step on every core, and the
+//! programs go there and back through its standard input and output: written
+//! to files, they cost more than the work done on them.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -74,8 +79,7 @@ impl Temp {
     }
 }
 
-/// Folders on their way out. Deleting thousands of files takes a quarter of the
-/// time of making and using them, and nothing has to wait for it.
+/// Folders on their way out: nothing has to wait for them to go.
 static LEAVING: Mutex<Vec<thread::JoinHandle<()>>> = Mutex::new(Vec::new());
 
 impl Drop for Temp {
@@ -119,6 +123,19 @@ pub fn read_text(path: &str) -> String {
     text_of(&std::fs::read(path).unwrap_or_default())
 }
 
+/// A program or its bytecode, in memory, and the name results come back under.
+#[derive(Clone)]
+pub struct Item {
+    pub name: String,
+    pub data: Vec<u8>,
+}
+
+impl Item {
+    pub fn new(name: String, data: impl Into<Vec<u8>>) -> Item {
+        Item { name, data: data.into() }
+    }
+}
+
 /// What a process said. No status if it was still running after the limit:
 /// it was killed, and this is what it had said by then.
 pub struct Ran {
@@ -128,13 +145,13 @@ pub struct Ran {
 }
 
 /// With `input` for its standard input, which it may read while it writes.
-pub fn run_limited(cmd: &mut Command, input: Option<String>, seconds: u64) -> Ran {
+pub fn run_limited(cmd: &mut Command, input: Option<Vec<u8>>, seconds: u64) -> Ran {
     let stdin = if input.is_some() { Stdio::piped() } else { Stdio::null() };
     let mut child = cmd.stdin(stdin).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().expect("a tool to run");
-    if let Some(text) = input {
+    if let Some(bytes) = input {
         let mut pipe = child.stdin.take().expect("piped");
-        // closed when done: that is the end of the list
-        thread::spawn(move || pipe.write_all(text.as_bytes()));
+        // closed when done: that is the end of the input
+        thread::spawn(move || pipe.write_all(&bytes));
     }
     let read_all = |mut pipe: Box<dyn Read + Send>, ended: Option<mpsc::Sender<()>>| {
         thread::spawn(move || {
@@ -158,6 +175,40 @@ pub fn run_limited(cmd: &mut Command, input: Option<String>, seconds: u64) -> Ra
     Ran { status, stdout: out.join().unwrap_or_default(), stderr: err.join().unwrap_or_default() }
 }
 
+/// Items for a tool's standard input: `<length> <name>` and the bytes, each.
+fn records<'a>(items: impl IntoIterator<Item = (&'a str, &'a [u8])>) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (name, data) in items {
+        out.extend_from_slice(format!("{} {name}\n", data.len()).as_bytes());
+        out.extend_from_slice(data);
+    }
+    out
+}
+
+/// What a tool sent back, by index: `<index> ok <length>` and the result, or
+/// `<index> error <length>` and why, in whatever order they were done. None
+/// where nothing came.
+fn results(out: &[u8], count: usize) -> Vec<Option<Result<Vec<u8>, String>>> {
+    let mut found = vec![None; count];
+    let mut at = 0;
+    while let Some(eol) = out[at..].iter().position(|b| *b == b'\n').map(|p| at + p) {
+        let head = String::from_utf8_lossy(&out[at..eol]).into_owned();
+        let parts: Vec<&str> = head.split(' ').collect();
+        let [index, kind, size] = parts[..] else { break };
+        let (Ok(index), Ok(size)) = (index.parse::<usize>(), size.parse::<usize>()) else { break };
+        let Some(body) = out.get(eol + 1..eol + 1 + size) else { break };
+        if let Some(slot) = found.get_mut(index) {
+            *slot = Some(if kind == "ok" { Ok(body.to_vec()) } else { Err(text_of(body)) });
+        }
+        at = eol + 1 + size;
+    }
+    found
+}
+
+fn outdated(tool: &str) -> ! {
+    panic!("{tool} is older than this harness: rebuild the tools (see CMakeLists.txt)")
+}
+
 pub struct Tools {
     pub check: String,
     pub run: String,
@@ -176,79 +227,52 @@ impl Tools {
         }
     }
 
-    /// Compiles at -O2 like Roblox, in one process on every core.
-    pub fn compile(&self, files: &[String], outdir: &str) -> Compiled {
-        let mut all = Compiled { bytecode: HashMap::new(), failed: Vec::new() };
-        if files.is_empty() {
-            return all;
+    /// Compiles each source at -O2 like Roblox: its bytecode, or why there is none.
+    pub fn compile(&self, sources: &[Item]) -> Vec<Result<Vec<u8>, String>> {
+        if sources.is_empty() {
+            return Vec::new();
         }
-        let wanted: HashSet<&str> = files.iter().map(String::as_str).collect();
-        std::fs::create_dir_all(outdir).expect("a folder for bytecode");
         let mut check = command(&self.check);
-        check.arg("--emit").arg(outdir).arg("--stdin");
-        let ran = run_limited(&mut check, Some(list(files)), COMPILE_LIMIT);
-        if text_of(&ran.stderr).contains("--stdin: cannot open") {
-            panic!("{} is older than this harness: rebuild the tools (CMakeLists.txt)", self.check);
+        check.arg("--stream");
+        let input = records(sources.iter().map(|s| (s.name.as_str(), s.data.as_slice())));
+        let ran = run_limited(&mut check, Some(input), COMPILE_LIMIT);
+        if text_of(&ran.stderr).contains("--stream: cannot open") {
+            outdated(&self.check);
         }
-        for line in text_of(&ran.stdout).lines() {
-            match line.split_once(' ') {
-                Some((n, path)) if n.bytes().all(|c| c.is_ascii_digit()) && wanted.contains(path) => {
-                    let bc = Path::new(outdir).join(format!("{n}.bc")).to_string_lossy().into_owned();
-                    all.bytecode.insert(path.to_string(), bc);
-                }
-                _ => {
-                    if let Some((path, why)) = line.split_once(": ").filter(|p| wanted.contains(p.0)) {
-                        all.failed.push((path.to_string(), why.to_string()));
-                    }
-                }
-            }
-        }
-        all
+        let found = results(&ran.stdout, sources.len());
+        found.into_iter().map(|r| r.unwrap_or_else(|| Err("the compiler gave no answer".to_string()))).collect()
     }
 
-    /// What each file prints, ending with its result line, from one process on
-    /// every core. A file still going after `seconds` has none: luau_run leaves
-    /// it behind and finishes the rest.
-    pub fn outputs(&self, files: &[String], seconds: u64, budget: u64) -> HashMap<String, String> {
-        if files.is_empty() {
+    /// What each program prints, ending with its result line, under its name. A
+    /// program still going after `seconds` has none: luau_run leaves it behind
+    /// and finishes the rest.
+    pub fn outputs(&self, programs: &[Item], seconds: u64, budget: u64) -> HashMap<String, String> {
+        if programs.is_empty() {
             return HashMap::new();
         }
-        let run = |part: &[String]| {
+        let run = |part: &[Item]| {
             let mut cmd = command(&self.run);
-            cmd.arg("--budget").arg(budget.to_string()).arg("--seconds").arg(seconds.to_string()).arg("--stdin");
-            run_limited(&mut cmd, Some(list(part)), seconds * 4 + 60)
+            cmd.arg("--budget").arg(budget.to_string()).arg("--seconds").arg(seconds.to_string()).arg("--stream");
+            let input = records(part.iter().map(|p| (p.name.as_str(), p.data.as_slice())));
+            run_limited(&mut cmd, Some(input), seconds * 4 + 60)
         };
-        let ran = run(files);
+        let ran = run(programs);
         let mut found = parse_outputs(&text_of(&ran.stdout));
-        if found.contains_key("--stdin") {
+        if found.contains_key("--stream") {
             // it would have every program never finish, and tests pass
-            panic!("{} is older than this harness: rebuild the tools (CMakeLists.txt)", self.run);
+            outdated(&self.run);
         }
         if !ran.status.is_some_and(|s| s.success()) {
-            // a crash took every unfinished file with it: each goes again by itself
-            let rest: Vec<String> = files.iter().filter(|f| !found.contains_key(*f)).cloned().collect();
-            let again = par_map(&rest, |f| parse_outputs(&text_of(&run(std::slice::from_ref(f)).stdout)));
+            // a crash took every unfinished program with it: each goes again by itself
+            let rest: Vec<&Item> = programs.iter().filter(|p| !found.contains_key(&p.name)).collect();
+            let again = par_map(&rest, |p| parse_outputs(&text_of(&run(std::slice::from_ref(*p)).stdout)));
             found.extend(again.into_iter().flatten());
         }
         found
     }
 }
 
-/// Paths one per line, for a tool reading them from its standard input.
-fn list(files: &[String]) -> String {
-    let mut text = files.join("\n");
-    text.push('\n');
-    text
-}
-
-pub struct Compiled {
-    /// {source path: bytecode path}.
-    pub bytecode: HashMap<String, String>,
-    /// (source path, error).
-    pub failed: Vec<(String, String)>,
-}
-
-/// `=== FILE`, what it printed, then `=== ok` or `=== error: MESSAGE`.
+/// `=== NAME`, what it printed, then `=== ok` or `=== error: MESSAGE`.
 pub fn parse_outputs(text: &str) -> HashMap<String, String> {
     let mut res = HashMap::new();
     let mut cur: Option<String> = None;
@@ -283,39 +307,38 @@ fn decompile(binary: &str, bc: &str, seconds: u64) -> Result<String, String> {
     Ok(text_of(&run.stdout))
 }
 
-/// Decompiles many bytecode files in one process: for each, the path of its
-/// text, or why there is none. A process that hung or crashed took its
-/// unfinished files with it, and what it wrote may be cut short, so then they
-/// all go through again one at a time; so do any it left no word about. A
-/// binary under test may predate the list on stdin: it would take `--stdin`
-/// for a file, so only one that says how many it read is believed.
-pub fn decompile_many(binary: &str, files: &[String], dir: &str, seconds: u64) -> Vec<Result<String, String>> {
-    if files.is_empty() {
+/// Decompiles each bytecode by itself, in one process: its text, or why there
+/// is none. What that process finished stands even if it later hung or
+/// crashed; what it did not goes again one file at a time, and so does all of
+/// it for a binary under test that predates --stream.
+pub fn decompile_many(binary: &str, bytecode: &[Vec<u8>], seconds: u64) -> Vec<Result<String, String>> {
+    if bytecode.is_empty() {
         return Vec::new();
     }
-    let mut each = command(binary);
-    each.arg("--upstream").arg("--each").arg(dir).arg("--stdin");
-    let ran = run_limited(&mut each, Some(list(files)), seconds);
-    let read = format!("{} files", files.len());
-    let clean = ran.status.is_some_and(|s| s.success()) && text_of(&ran.stdout).lines().last() == Some(read.as_str());
-    let alone = |bc: &String, text: String| {
-        let _ = std::fs::create_dir_all(dir);
-        decompile(binary, bc, seconds).and_then(|t| std::fs::write(&text, t).map(|_| text).map_err(|e| e.to_string()))
-    };
-    let results = files.iter().enumerate().map(|(i, bc)| {
-        let text = format!("{dir}/{i}.lua");
-        match std::fs::read_to_string(format!("{dir}/{i}.error")) {
-            Ok(why) if clean => Err(why),
-            _ if clean && Path::new(&text).exists() => Ok(text),
-            _ => alone(bc, text),
+    let names: Vec<String> = (0..bytecode.len()).map(|i| i.to_string()).collect();
+    let input = records(names.iter().map(String::as_str).zip(bytecode.iter().map(Vec::as_slice)));
+    let mut stream = command(binary);
+    stream.arg("--upstream").arg("--stream");
+    let ran = run_limited(&mut stream, Some(input), seconds);
+    let mut found = results(&ran.stdout, bytecode.len());
+    let missing: Vec<usize> = (0..bytecode.len()).filter(|i| found[*i].is_none()).collect();
+    if !missing.is_empty() {
+        let tmp = Temp::new("dc");
+        let again = par_map(&missing, |i| {
+            let path = tmp.path(&format!("{i}.bc"));
+            std::fs::write(&path, &bytecode[*i]).map_err(|e| e.to_string())?;
+            decompile(binary, &path, seconds).map(String::into_bytes)
+        });
+        for (i, result) in missing.iter().zip(again) {
+            found[*i] = Some(result);
         }
-    });
-    results.collect()
+    }
+    found.into_iter().map(|r| r.expect("an answer for each").map(|text| text_of(&text))).collect()
 }
 
 /// Parses bytecode the compiler just wrote.
-pub fn module(bc: &str) -> crate::bytecode::Module {
-    crate::bytecode::parse(&std::fs::read(bc).expect("bytecode"), false).expect("the compiler's own bytecode parses")
+pub fn module(bc: &[u8]) -> crate::bytecode::Module {
+    crate::bytecode::parse(bc, false).expect("the compiler's own bytecode parses")
 }
 
 pub fn percent(part: usize, whole: usize) -> String {

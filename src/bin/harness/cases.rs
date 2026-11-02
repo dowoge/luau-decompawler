@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::luau::{clip, decompile_many, module, percent, read_text, repo, Args, Temp, Tools, USUAL_BUDGET};
+use crate::luau::{clip, decompile_many, module, percent, repo, text_of, Args, Item, Tools, USUAL_BUDGET};
 use crate::shape::{exact, pair, shape};
 
 struct Row {
@@ -47,24 +47,37 @@ pub fn run(args: &Args, loud: bool) -> usize {
         .map(|p| p.to_string_lossy().into_owned())
         .collect();
     srcs.sort();
-    let tmp = Temp::new("cs");
-    let bc = tools.compile(&srcs, &tmp.path("a")).bytecode;
-    let mut decs: HashMap<String, String> = HashMap::new();
+    let sources: Vec<Item> =
+        srcs.iter().map(|s| Item::new(s.clone(), std::fs::read(s).expect("a case to read"))).collect();
+    let code = tools.compile(&sources);
+    let mut decs: HashMap<String, Item> = HashMap::new();
     let mut crashed: HashMap<String, String> = HashMap::new();
-    let compiled: Vec<&String> = srcs.iter().filter(|s| bc.contains_key(*s)).collect();
-    let code: Vec<String> = compiled.iter().map(|s| bc[*s].clone()).collect();
-    for s in srcs.iter().filter(|s| !bc.contains_key(*s)) {
-        crashed.insert(s.clone(), "the case itself does not compile".to_string());
+    let compiled: Vec<usize> = (0..srcs.len()).filter(|i| code[*i].is_ok()).collect();
+    let bytecode: Vec<Vec<u8>> = compiled.iter().map(|i| code[*i].clone().unwrap_or_default()).collect();
+    for (s, c) in srcs.iter().zip(&code) {
+        if c.is_err() {
+            crashed.insert(s.clone(), "the case itself does not compile".to_string());
+        }
     }
-    for (s, text) in compiled.iter().zip(decompile_many(&binary, &code, &tmp.path("d"), 300)) {
+    for (i, text) in compiled.iter().zip(decompile_many(&binary, &bytecode, 300)) {
+        let s = &srcs[*i];
         match text {
-            Ok(path) => decs.insert((*s).clone(), path),
-            Err(why) => crashed.insert((*s).clone(), why),
-        };
+            Ok(text) => {
+                decs.insert(s.clone(), Item::new(format!("{s}.dec"), text));
+            }
+            Err(why) => {
+                crashed.insert(s.clone(), why);
+            }
+        }
     }
-    let dec_paths: Vec<String> = srcs.iter().filter_map(|s| decs.get(s).cloned()).collect();
-    let back = tools.compile(&dec_paths, &tmp.path("b")).bytecode;
-    let all: Vec<String> = srcs.iter().chain(&dec_paths).cloned().collect();
+    let dec_items: Vec<Item> = srcs.iter().filter_map(|s| decs.get(s).cloned()).collect();
+    let back: HashMap<String, Vec<u8>> = dec_items
+        .iter()
+        .zip(tools.compile(&dec_items))
+        .filter_map(|(d, b)| Some((d.name.clone(), b.ok()?)))
+        .collect();
+    let bc: HashMap<&String, &Vec<u8>> = srcs.iter().zip(&code).filter_map(|(s, c)| Some((s, c.as_ref().ok()?))).collect();
+    let all: Vec<Item> = sources.iter().chain(&dec_items).cloned().collect();
     let out = tools.outputs(&all, 60, USUAL_BUDGET);
     let mut totals = [0usize; 3];
     let mut bad_run = 0;
@@ -76,14 +89,14 @@ pub fn run(args: &Args, loud: bool) -> usize {
             bad_run += 1;
             continue;
         };
-        let Some(recompiled) = back.get(d) else {
+        let Some(recompiled) = back.get(&d.name) else {
             print_row(loud, true, format!("{name:<24} decompiled text does not compile"));
             bad_run += 1;
             continue;
         };
-        let same = out.get(s) == out.get(d) && out.get(s).is_some_and(|x| x.ends_with("=== ok"));
+        let same = out.get(s) == out.get(&d.name) && out.get(s).is_some_and(|x| x.ends_with("=== ok"));
         bad_run += usize::from(!same);
-        let (a, b) = (module(&bc[s]), module(recompiled));
+        let (a, b) = (module(bc[s]), module(recompiled));
         let paired = pair(&a, &b);
         let (mut n, mut shp, mut ex) = (0, 0, 0);
         let mut rows = Vec::new();
@@ -115,9 +128,9 @@ pub fn run(args: &Args, loud: bool) -> usize {
         if show.is_some_and(|w| name.contains(w)) {
             if !same {
                 let shown = |p: &String| out.get(p).map_or("None", String::as_str).to_string();
-                println!("--- original output\n{}\n--- decompiled output\n{}", shown(s), shown(d));
+                println!("--- original output\n{}\n--- decompiled output\n{}", shown(s), shown(&d.name));
             }
-            print_rows(&rows, &read_text(d));
+            print_rows(&rows, &text_of(&d.data));
         }
     }
     let [n, shp, ex] = totals;

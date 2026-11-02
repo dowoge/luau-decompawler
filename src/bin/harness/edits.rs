@@ -1,4 +1,4 @@
-//! Which real functions differ, and how. For each function that does not come
+﻿//! Which real functions differ, and how. For each function that does not come
 //! back instruction for instruction, the opcode diff reduced to one key:
 //! `+[LOADNIL]` means adding that is ALL that separates it from the original.
 //! --save stores the set of differing functions; --since prints those that differ
@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use crate::bytecode::{parse, Module};
 use crate::diff::{Matcher, Tag};
-use crate::luau::{clip, module, par_map, read_text, repo, walk, Args, Temp, Tools};
+use crate::luau::{clip, module, par_map, read_text, repo, walk, Args, Item, Tools};
 use crate::shape::{pair, shape};
 
 type Shape = Vec<&'static str>;
@@ -86,11 +86,12 @@ pub fn compare_place(tools: &Tools, dumps: &Path, output: &Path, place: &str) ->
     let wire = dumps.join(place);
     let files = scripts(&output.join(place));
     let paths: Vec<String> = files.keys().cloned().collect();
-    let tmp = Temp::new("ed");
-    let done = tools.compile(&paths, &tmp.path("bc")).bytecode;
-    let parts = par_map(&paths, |path| {
-        let Some(bc) = done.get(path) else { return (Vec::new(), 0) };
-        let script = &files[path];
+    let texts: Vec<Item> = par_map(&paths, |p| Item::new(p.clone(), std::fs::read(p).unwrap_or_default()));
+    let done = tools.compile(&texts);
+    let both: Vec<(&String, &Result<Vec<u8>, String>)> = paths.iter().zip(&done).collect();
+    let parts = par_map(&both, |(path, bc)| {
+        let Ok(bc) = bc else { return (Vec::new(), 0) };
+        let script = &files[*path];
         let data = std::fs::read(wire.join(format!("{script}.wire"))).expect("the original script");
         let orig: Module = parse(&data, true).expect("the original script parses");
         let back = module(bc);
@@ -99,7 +100,7 @@ pub fn compare_place(tools: &Tools, dumps: &Path, output: &Path, place: &str) ->
         for (i, pa) in orig.protos.iter().enumerate() {
             let row = |a: Shape, b: Shape| Row {
                 place: place.to_string(),
-                path: path.clone(),
+                path: (*path).clone(),
                 script: script.clone(),
                 proto: i,
                 name: pa.name.clone(),

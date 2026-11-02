@@ -8,10 +8,13 @@
 //!   --upstream                            input is stock Luau bytecode
 //!   luau_decompile --dir DIR [--out OUT]  every *.wire in DIR (index.tsv
 //!                                         paths name the outputs)
-//!   luau_decompile --each OUT FILE...     each file by itself, as if run alone:
-//!                                         OUT/<n>.lua, or OUT/<n>.error; with
-//!                                         --stdin, paths from stdin as well.
-//!                                         Ends saying how many files it read.
+//!   luau_decompile --stream               bytecode as records on stdin, each
+//!                                         by itself as if run alone; results
+//!                                         go out as records, and last a line
+//!                                         saying how many came in
+//!
+//! A record is a line `<length> <name>` and that many bytes; a result is
+//! `<index> ok <length>` and the text, or `<index> error <length>` and why.
 //!
 //! Output is Luau that compiles. `harness difftest` is the ground-truth test:
 //! generated programs must behave the same after a trip through here.
@@ -30,7 +33,7 @@ mod inline;
 mod passes;
 
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -344,33 +347,53 @@ fn run_dir(src: &Path, dst: &Path, upstream: bool, noflat: bool) -> i32 {
     }
 }
 
+/// Records on stdin: `<length> <name>` and that many bytes, until one does not parse.
+fn read_records(all: &[u8]) -> Vec<&[u8]> {
+    let mut found = Vec::new();
+    let mut at = 0;
+    while let Some(eol) = all[at..].iter().position(|b| *b == b'\n').map(|p| at + p) {
+        let head = String::from_utf8_lossy(&all[at..eol]);
+        let Some(size) = head.split(' ').next().and_then(|n| n.parse::<usize>().ok()) else { break };
+        let Some(data) = all.get(eol + 1..eol + 1 + size) else { break };
+        found.push(data);
+        at = eol + 1 + size;
+    }
+    found
+}
+
 /// Starting a process costs far more than decompiling a small program, so
-/// many can share one. Nothing here depends on the others.
-fn run_each(out: &Path, files: &[String], upstream: bool, noflat: bool) -> i32 {
-    if let Err(e) = fs::create_dir_all(out) {
-        eprintln!("{}: {e}", out.display());
+/// many can share one, and files would only carry them there and back. Each
+/// result goes out as soon as it is ready: a crash later keeps what was done.
+fn run_stream(upstream: bool, noflat: bool) -> i32 {
+    let mut all = Vec::new();
+    if let Err(e) = std::io::stdin().read_to_end(&mut all) {
+        eprintln!("stdin: {e}");
         return 2;
     }
-    let written = par_map(files.len(), |i| {
+    let items = read_records(&all);
+    let out = Mutex::new(std::io::stdout());
+    let written = par_map(items.len(), |i| {
         let one = || -> Result<String, String> {
-            let data = fs::read(&files[i]).map_err(|e| e.to_string())?;
-            let m = parse(&data, !upstream)?;
+            let m = parse(items[i], !upstream)?;
             Ok(to_text(&name_round(decompile_core(&m, None, noflat), &Extra::default())))
         };
-        match panic::catch_unwind(AssertUnwindSafe(one)).unwrap_or_else(|e| Err(panic_text(e))) {
-            Ok(text) => fs::write(out.join(format!("{i}.lua")), text),
-            Err(why) => fs::write(out.join(format!("{i}.error")), why),
-        }
-        .is_ok()
+        let result = panic::catch_unwind(AssertUnwindSafe(one)).unwrap_or_else(|e| Err(panic_text(e)));
+        let (kind, body) = match &result {
+            Ok(text) => ("ok", text),
+            Err(why) => ("error", why),
+        };
+        let mut o = out.lock().unwrap();
+        let head = format!("{i} {kind} {}\n", body.len());
+        o.write_all(head.as_bytes()).and_then(|_| o.write_all(body.as_bytes())).and_then(|_| o.flush()).is_ok()
     });
-    // what tells a caller this binary understood the list it was given
-    println!("{} files", files.len());
+    // what tells a caller this binary understood what it was given
+    println!("{} files", items.len());
     i32::from(written.contains(&false))
 }
 
 fn usage() -> i32 {
     println!(
-        "luau_decompile FILE.wire | --disasm FILE.wire | --dir DIR [--out OUT] | --each OUT FILE...\n\
+        "luau_decompile FILE.wire | --disasm FILE.wire | --dir DIR [--out OUT] | --stream\n\
          \x20 --upstream   input is stock Luau bytecode (luau_compile output)"
     );
     2
@@ -388,14 +411,8 @@ fn run(args: Vec<String>) -> i32 {
         };
         return run_dir(&src, &dst, upstream, noflat);
     }
-    if args.len() >= 2 && args[0] == "--each" {
-        let mut files: Vec<String> = args[2..].iter().filter(|a| *a != "--stdin").cloned().collect();
-        if args[2..].iter().any(|a| a == "--stdin") {
-            let lines = std::io::stdin().lines().map_while(Result::ok);
-            // a byte order mark first, as PowerShell pipes
-            files.extend(lines.map(|l| l.trim_start_matches('\u{feff}').to_string()).filter(|l| !l.is_empty()));
-        }
-        return run_each(Path::new(&args[1]), &files, upstream, noflat);
+    if args.first().is_some_and(|a| a == "--stream") {
+        return run_stream(upstream, noflat);
     }
     let disasm = args.iter().any(|a| a == "--disasm");
     let Some(file) = args.iter().find(|a| !a.starts_with("--")) else { return usage() };

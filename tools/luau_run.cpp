@@ -5,11 +5,11 @@
 // VM (standard libraries, sandboxed), compiled at -O2 like Roblox game
 // scripts, with an instruction budget so a broken program cannot hang.
 //
-//   luau_run [--budget N] [--seconds S] [--stdin] FILE...
+//   luau_run [--budget N] [--seconds S] [--stream] FILE...
 // prints, per file:  "=== FILE" then its output, then "=== ok" or
 // "=== error: MESSAGE" (chunk names and line numbers stripped, since they
-// differ between a program and its decompiled form). With --stdin the paths
-// come from standard input too, one per line.
+// differ between a program and its decompiled form). With --stream, programs
+// come as records on stdin too (see records.h), each called by its name.
 //
 // Files run on every core, and each one's lines come out together when it
 // ends, in no particular order. The budget counts calls and loop passes, so a
@@ -19,6 +19,7 @@
 #include "lua.h"
 #include "lualib.h"
 #include "luacode.h"
+#include "records.h"
 
 #include <algorithm>
 #include <atomic>
@@ -28,7 +29,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
-#include <iostream>
 #include <iterator>
 #include <memory>
 #include <mutex>
@@ -79,13 +79,17 @@ static std::string strip_location(std::string msg) {
     return msg;
 }
 
-// Everything one file prints, its result line last.
-static std::string run_file(const std::string& path, long budget, lua_CompileOptions opts) {
-    std::string out = "=== " + path + "\n";
-    std::ifstream f(path, std::ios::binary);
-    if (!f)
-        return out + "=== error: cannot open\n";
-    const std::string src((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+// Everything one program prints, its result line last. A program from the
+// command line is read here; a record brings its own.
+static std::string run_file(Record& file, bool named, long budget, lua_CompileOptions opts) {
+    std::string out = "=== " + file.name + "\n";
+    if (named) {
+        std::ifstream f(file.name, std::ios::binary);
+        if (!f)
+            return out + "=== error: cannot open\n";
+        file.data.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    }
+    const std::string& src = file.data;
     size_t size = 0;
     char* bc = luau_compile(src.data(), src.size(), &opts, &size);
     lua_State* L = luaL_newstate();
@@ -119,34 +123,40 @@ struct Worker {
     bool abandoned = false;           // under the lock
 };
 
+// Workers: one per core, or LUAU_THREADS of them.
+static size_t worker_count(size_t files) {
+    size_t n = std::max(std::thread::hardware_concurrency(), 1u);
+    if (const char* v = std::getenv("LUAU_THREADS"))
+        n = std::max(std::atoi(v), 1);
+    return std::min(n, files);
+}
+
 int main(int argc, char** argv) {
     lua_CompileOptions opts = {};
     opts.optimizationLevel = 2;
     opts.debugLevel = 1;
     long budget = 20000000;
     double seconds = 0;
-    bool from_stdin = false;
-    std::vector<std::string> paths;
+    bool stream = false;
+    std::vector<Record> files;  // from the command line: names only
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--budget") == 0 && i + 1 < argc)
             budget = std::atol(argv[++i]);
         else if (std::strcmp(argv[i], "--seconds") == 0 && i + 1 < argc)
             seconds = std::atof(argv[++i]);
-        else if (std::strcmp(argv[i], "--stdin") == 0)
-            from_stdin = true;
+        else if (std::strcmp(argv[i], "--stream") == 0)
+            stream = true;
         else
-            paths.push_back(argv[i]);
+            files.push_back({argv[i], {}});
     }
-    for (std::string line; from_stdin && std::getline(std::cin, line);) {
-        if (!line.empty() && line.back() == '\r')
-            line.pop_back();
-        if (paths.empty() && line.rfind("\xEF\xBB\xBF", 0) == 0)
-            line.erase(0, 3);  // a byte order mark, as PowerShell pipes
-        if (!line.empty())
-            paths.push_back(line);
+    const size_t named = files.size();
+    if (stream) {
+        binary_stdio();
+        for (Record& r : read_records())
+            files.push_back(std::move(r));
     }
 
-    const int count = int(paths.size());
+    const int count = int(files.size());
     const auto start = std::chrono::steady_clock::now();
     const auto now_ms = [&] {
         return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start)
@@ -160,7 +170,7 @@ int main(int argc, char** argv) {
         for (int i = next++; i < count; i = next++) {
             w->since = now_ms();
             w->file = i;
-            const std::string said = run_file(paths[i], budget, opts);
+            const std::string said = run_file(files[i], size_t(i) < named, budget, opts);
             std::lock_guard<std::mutex> hold(lock);
             if (w->abandoned)
                 return;  // too late: it was counted as never ending
@@ -178,8 +188,7 @@ int main(int argc, char** argv) {
         workers.push_back(std::make_unique<Worker>());
         threads.emplace_back(work, workers.back().get());
     };
-    const size_t cores = std::max(std::thread::hardware_concurrency(), 1u);
-    for (size_t k = 0; k < std::min<size_t>(cores, paths.size()); ++k)
+    for (size_t k = 0, n = worker_count(files.size()); k < n; ++k)
         add_worker();
     if (seconds <= 0) {
         for (std::thread& t : threads)
