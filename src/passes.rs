@@ -2032,8 +2032,13 @@ fn copy_unless_at(lines: &mut Vec<String>, decl: usize, flag: &str, c: usize) ->
     // begun, in between
     let enclosing = (decl + 1..first).rev().find(|&p| strip(&lines[p]) == check && indent_of(&lines[p]) < d && arm_end(lines, p) > c);
     let from = enclosing.unwrap_or(decl);
-    let between = &lines[from + 1..first];
-    if between.iter().any(|l| loop_open(l) || strip(l).contains("function") || has_word(l, flag)) {
+    // a loop or function closed before the `if` (in an arm before it) does
+    // not matter; one around it would
+    let around = |p: usize| {
+        let l = &lines[p];
+        (loop_open(l) || strip(l).contains("function")) && arm_end(lines, p) > first
+    };
+    if (from + 1..first).any(|p| around(p) || has_word(&lines[p], flag)) {
         return false;
     }
     let mut e = c + 1;
@@ -2062,7 +2067,7 @@ fn copy_unless_at(lines: &mut Vec<String>, decl: usize, flag: &str, c: usize) ->
     if (e + 1..lines.len()).any(|i| has_word(&lines[i], flag)) {
         return false;
     }
-    if body.is_empty() || body.len() > 12 || body.iter().any(|l| has_any_goto(l) || parse_label(l).is_some()) {
+    if body.is_empty() || body.len() > 16 || body.iter().any(|l| has_any_goto(l) || parse_label(l).is_some()) {
         return false;
     }
     let mut words = HashSet::default();
@@ -2075,7 +2080,7 @@ fn copy_unless_at(lines: &mut Vec<String>, decl: usize, flag: &str, c: usize) ->
     let chain: Vec<String> = lines[first..=chain_end].iter().filter(|l| !is_blank(l)).cloned().collect();
     let mut copies = 0;
     let Some(new) = unless_chain(&chain, d, flag, &body, &mut copies) else { return false };
-    if sets == 0 || copies == 0 || copies * body.len() > 32 || new.iter().any(|l| has_word(l, flag)) {
+    if sets == 0 || copies == 0 || copies * body.len() > 40 || new.iter().any(|l| has_word(l, flag)) {
         return false;
     }
     // a name the `if` reads would be the lifted local's
@@ -2248,11 +2253,11 @@ fn copy_guard(lines: &mut Vec<String>, decl: usize, flag: &str) -> bool {
         let t = strip(l);
         indent_of(l) >= d + 4 && !t.starts_with("::") && !t.contains("function") && !has_any_goto(t)
     };
-    if body.is_empty() || body.len() > 6 || !body.iter().all(fits) {
+    if body.is_empty() || body.len() > 12 || !body.iter().all(fits) {
         return false;
     }
     let sets: Vec<usize> = uses.iter().copied().filter(|&i| strip(&lines[i]) == set).collect();
-    if sets.is_empty() || sets.iter().any(|&i| i < decl || i > c) || body.len() * sets.len() > 12 {
+    if sets.is_empty() || sets.iter().any(|&i| i < decl || i > c) || body.len() * sets.len() > 28 {
         return false;
     }
     // the copies read nothing the code between declares for itself
