@@ -1534,9 +1534,11 @@ fn follow_flag(lines: &mut Vec<String>, decl: usize, flag: &str) -> bool {
     let mut budget = (8 * body.len() + 1000) as isize;
     FOLLOW_WHY.with(|c| c.set(""));
     let got = follow(&stmts, d, flag, false, &mut budget, None);
+    // the copies may come to as much again as the block, or 80 lines
+    let growth = FOLLOW_GROWTH.max(body.len());
     let why = match &got {
         None => FOLLOW_WHY.with(|c| c.get()),
-        Some((new, _)) if new.len() > body.len() + FOLLOW_GROWTH => "too many lines copied",
+        Some((new, _)) if new.len() > body.len() + growth => "too many lines copied",
         Some((new, _)) if new.iter().any(|l| has_word(l, flag)) => "still read",
         Some(_) => "",
     };
