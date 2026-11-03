@@ -18,12 +18,15 @@ use crate::hash::{HashMap, HashSet};
 use crate::bytecode::{is_forgprep, op, op_name, Insn, Module, Proto, K};
 use crate::decomp::{import_expr, kexpr};
 use crate::analysis::full_effects;
+use crate::expr::{fmt_number, lua_string};
 
 thread_local! {
     /// How far the last walk got: (instructions matched, of, helper's op, caller's op).
     static REACHED: Cell<(usize, usize, u8, u8)> = const { Cell::new((0, 0, 0, 0)) };
     /// The final check that refused, if the walk itself got through.
     static CHECK: Cell<&'static str> = const { Cell::new("") };
+    /// Parameters the last walk had seen no value of, where it stopped.
+    static UNSEEN: Cell<usize> = const { Cell::new(0) };
 }
 
 fn refuse<T>(why: &'static str) -> Option<T> {
@@ -139,10 +142,10 @@ struct Walk<'a> {
     need: Option<usize>,
     /// Caller locals written in place of the helper's upvalue stores.
     upval_writes: Vec<usize>,
-    /// Helper registers holding a number Luau folded: arithmetic on numbers
-    /// the call gave. The copy has no code for them; what reads one reads
-    /// that number, loaded.
-    known: HashMap<usize, f64>,
+    /// Helper registers holding a value Luau folded: worked out from
+    /// constants the call gave (or the helper's own). The copy has no code for
+    /// them; what reads one reads that value, loaded.
+    known: HashMap<usize, Val>,
 }
 
 /// A number written as source text (a constant, or a LOADN's operand).
@@ -164,6 +167,273 @@ fn falsy(text: &str) -> bool {
     text == "nil" || text == "false"
 }
 
+/// A value Luau's constant folding knows, as the walk follows it.
+#[derive(Clone, Debug)]
+enum Val {
+    Nil,
+    Bool(bool),
+    Num(f64),
+    Str(Vec<u8>),
+}
+
+impl Val {
+    fn truthy(&self) -> bool {
+        !matches!(self, Val::Nil | Val::Bool(false))
+    }
+
+    fn num(&self) -> Option<f64> {
+        match self {
+            Val::Num(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    /// Luau's `==` on two constants (what a test folds to: -0 == 0).
+    fn same(&self, o: &Val) -> bool {
+        match (self, o) {
+            (Val::Nil, Val::Nil) => true,
+            (Val::Bool(a), Val::Bool(b)) => a == b,
+            (Val::Num(a), Val::Num(b)) => a == b,
+            (Val::Str(a), Val::Str(b)) => a == b,
+            _ => false,
+        }
+    }
+
+    /// The very same constant: what a load must give to be this value
+    /// (-0 is not 0, which prints and divides otherwise).
+    fn identical(&self, o: &Val) -> bool {
+        match (self, o) {
+            (Val::Num(a), Val::Num(b)) => a.to_bits() == b.to_bits(),
+            _ => self.same(o),
+        }
+    }
+
+    /// As the decompiler writes it.
+    fn text(&self) -> String {
+        match self {
+            Val::Nil => "nil".to_string(),
+            Val::Bool(b) => b.to_string(),
+            Val::Num(v) => fmt_number(*v),
+            Val::Str(s) => lua_string(s),
+        }
+    }
+
+    /// The constant a text of the decompiler's stands for.
+    fn parse(t: &str) -> Option<Val> {
+        let pi = std::f64::consts::PI;
+        Some(match t {
+            "nil" => Val::Nil,
+            "true" => Val::Bool(true),
+            "false" => Val::Bool(false),
+            "math.pi" => Val::Num(pi),
+            "-math.pi" => Val::Num(-pi),
+            "math.huge" | "1e999" => Val::Num(f64::INFINITY),
+            "-math.huge" | "-1e999" => Val::Num(f64::NEG_INFINITY),
+            "0/0" | "-(0/0)" => Val::Num(f64::NAN),
+            _ if t.starts_with('"') => Val::Str(unquote(t)?),
+            _ => Val::Num(number(t)?),
+        })
+    }
+
+    fn of_k(p: &Proto, m: &Module, i: usize) -> Option<Val> {
+        Some(match p.k.get(i)? {
+            K::Nil => Val::Nil,
+            K::Bool(b) => Val::Bool(*b),
+            K::Number(v) => Val::Num(*v),
+            K::Str(Some(s)) => Val::Str(m.strings.get(*s)?.to_vec()),
+            K::Str(None) => Val::Str(Vec::new()),
+            _ => return None,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strings_read_back_as_written() {
+        for b in [&b"plain"[..], &[7, b'1', 0, 255, b'"', b'\\', b'\n', 200, b'9'], &[]] {
+            assert_eq!(unquote(&lua_string(b)).as_deref(), Some(b));
+        }
+    }
+
+    #[test]
+    fn builtins_fold_as_luau_does() {
+        let n = |v: f64| Val::Num(v);
+        let num = |v: Option<Val>| v.and_then(|v| v.num());
+        assert_eq!(num(builtin("math.abs", &[n(-3.0)])), Some(3.0));
+        assert_eq!(num(builtin("math.max", &[n(1.0), n(5.0), n(2.0)])), Some(5.0));
+        assert_eq!(num(builtin("math.clamp", &[n(9.0), n(0.0), n(4.0)])), Some(4.0));
+        assert!(builtin("math.clamp", &[n(1.0), n(4.0), n(0.0)]).is_none());
+        assert_eq!(num(builtin("string.len", &[Val::Str(b"abc".to_vec())])), Some(3.0));
+        assert_eq!(num(builtin("bit32.arshift", &[n(-8.0), n(1.0)])), Some(f64::from(0xFFFF_FFFCu32)));
+        assert!(matches!(builtin("type", &[Val::Nil]), Some(Val::Str(s)) if s == b"nil"));
+        assert!(matches!(builtin("string.sub", &[Val::Str(b"hello".to_vec()), n(2.0), n(-2.0)]), Some(Val::Str(s)) if s == b"ell"));
+        // not exact in every C library: left to the compiler
+        assert!(builtin("math.sin", &[n(1.0)]).is_none());
+    }
+
+    #[test]
+    fn negative_zero_is_its_own_constant() {
+        assert!(Val::Num(0.0).same(&Val::Num(-0.0)));
+        assert!(!Val::Num(0.0).identical(&Val::Num(-0.0)));
+    }
+}
+
+/// The bytes of a string as lua_string writes it.
+fn unquote(t: &str) -> Option<Vec<u8>> {
+    let b = t.strip_prefix('"')?.strip_suffix('"')?.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'\\' {
+            out.push(b[i]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        match *b.get(i)? {
+            b'\\' => out.push(b'\\'),
+            b'"' => out.push(b'"'),
+            b'n' => out.push(b'\n'),
+            b'r' => out.push(b'\r'),
+            b't' => out.push(b'\t'),
+            d if d.is_ascii_digit() => {
+                // up to three digits, as Lua reads them
+                let mut v: u32 = 0;
+                let mut n = 0;
+                while n < 3 && b.get(i).is_some_and(u8::is_ascii_digit) {
+                    v = v * 10 + u32::from(b[i] - b'0');
+                    i += 1;
+                    n += 1;
+                }
+                out.push(u8::try_from(v).ok()?);
+                continue;
+            }
+            _ => return None,
+        }
+        i += 1;
+    }
+    Some(out)
+}
+
+/// What Luau's builtin folding makes of a call on constants (BuiltinFolding):
+/// only the functions it folds whose result is exact, so that this is the
+/// very number the compiler computed. None where it would not fold.
+fn builtin(name: &str, args: &[Val]) -> Option<Val> {
+    let n = |i: usize| args.get(i).and_then(Val::num);
+    let nums = || args.iter().map(Val::num).collect::<Option<Vec<f64>>>();
+    let bits = |v: f64| (v as i64) as u32;
+    let rad_deg = std::f64::consts::PI / 180.0;
+    let str_arg = |i: usize| match args.get(i) {
+        Some(Val::Str(s)) => Some(s),
+        _ => None,
+    };
+    let num = |v: f64| Some(Val::Num(v));
+    let count = args.len();
+    match name {
+        "math.abs" if count == 1 => num(n(0)?.abs()),
+        "math.ceil" if count == 1 => num(n(0)?.ceil()),
+        "math.floor" if count == 1 => num(n(0)?.floor()),
+        "math.sqrt" if count == 1 => num(n(0)?.sqrt()),
+        "math.fmod" if count == 2 => num(n(0)? % n(1)?),
+        "math.deg" if count == 1 => num(n(0)? / rad_deg),
+        "math.rad" if count == 1 => num(n(0)? * rad_deg),
+        "math.round" if count == 1 => num(n(0)?.round()),
+        "math.sign" if count == 1 => {
+            let v = n(0)?;
+            num(if v > 0.0 { 1.0 } else if v < 0.0 { -1.0 } else { 0.0 })
+        }
+        "math.max" | "math.min" if count >= 1 => {
+            let v = nums()?;
+            let max = name == "math.max";
+            num(v[1..].iter().fold(v[0], |r, &a| if (max && a > r) || (!max && a < r) { a } else { r }))
+        }
+        "math.clamp" if count == 3 => {
+            let (v, lo, hi) = (n(0)?, n(1)?, n(2)?);
+            if !(lo <= hi) {
+                return None;
+            }
+            let v = if v < lo { lo } else { v };
+            num(if v > hi { hi } else { v })
+        }
+        "bit32.band" | "bit32.bor" | "bit32.bxor" | "bit32.btest" if count >= 1 => {
+            let v = nums()?;
+            let r = v[1..].iter().fold(bits(v[0]), |r, &a| match name {
+                "bit32.bor" => r | bits(a),
+                "bit32.bxor" => r ^ bits(a),
+                _ => r & bits(a),
+            });
+            if name == "bit32.btest" {
+                Some(Val::Bool(r != 0))
+            } else {
+                num(f64::from(r))
+            }
+        }
+        "bit32.bnot" if count == 1 => num(f64::from(!bits(n(0)?))),
+        "bit32.lshift" | "bit32.rshift" | "bit32.arshift" if count == 2 => {
+            let (u, s) = (bits(n(0)?), n(1)? as i32);
+            if !(0..32).contains(&s) {
+                return None;
+            }
+            num(f64::from(match name {
+                "bit32.lshift" => u << s,
+                "bit32.rshift" => u >> s,
+                _ => ((u as i32) >> s) as u32,
+            }))
+        }
+        "bit32.lrotate" | "bit32.rrotate" if count == 2 => {
+            let (u, s) = (bits(n(0)?), n(1)? as i32);
+            let s = (s & 31) as u32;
+            num(f64::from(if name == "bit32.lrotate" { u.rotate_left(s) } else { u.rotate_right(s) }))
+        }
+        "type" | "typeof" if count == 1 => Some(Val::Str(
+            match &args[0] {
+                Val::Nil => "nil",
+                Val::Bool(_) => "boolean",
+                Val::Num(_) => "number",
+                Val::Str(_) => "string",
+            }
+            .as_bytes()
+            .to_vec(),
+        )),
+        "string.len" if count == 1 => num(str_arg(0)?.len() as f64),
+        "string.byte" if count == 1 => num(f64::from(*str_arg(0)?.first()?)),
+        "string.byte" if count == 2 => {
+            let (s, i) = (str_arg(0)?, n(1)? as i32);
+            if i < 1 || i as usize > s.len() {
+                return None;
+            }
+            num(f64::from(s[i as usize - 1]))
+        }
+        "string.sub" if count == 2 || count == 3 => {
+            let s = str_arg(0)?;
+            let len = s.len() as i32;
+            let mut start = n(1)? as i32;
+            let mut end = if count == 3 { n(2)? as i32 } else { len };
+            if start < 0 {
+                start += len + 1;
+            }
+            if end < 0 {
+                end += len + 1;
+            }
+            if end < 1 {
+                return Some(Val::Str(Vec::new()));
+            }
+            let start = start.max(1);
+            let end = end.min(len);
+            Some(Val::Str(if start <= end { s[start as usize - 1..end as usize].to_vec() } else { Vec::new() }))
+        }
+        "string.char" if count < 128 => {
+            let v = nums()?;
+            let bytes: Option<Vec<u8>> = v.iter().map(|&c| u8::try_from(c as i32).ok().filter(|b| f64::from(*b) == c.trunc())).collect();
+            Some(Val::Str(bytes?))
+        }
+        _ => None,
+    }
+}
+
 impl Walk<'_> {
     /// The constant in caller register c, if it was loaded where a call
     /// given it for parameter p would load it: before the read at pc with no
@@ -183,9 +453,9 @@ impl Walk<'_> {
     }
 
     fn read(&mut self, p: usize, c: usize, pc: i32) -> Option<()> {
-        if let Some(v) = self.known.get(&p).copied() {
-            // a folded number: the caller loaded it where it is read
-            return self.loaded.get(&c).and_then(|l| number(&l.0)).is_some_and(|x| x == v).then_some(());
+        if let Some(v) = self.known.get(&p) {
+            // a folded value: the caller loaded it where it is read
+            return self.loaded.get(&c).and_then(|l| Val::parse(&l.0)).is_some_and(|x| x.identical(v)).then_some(());
         }
         if let Some(Some(Arg::Const(text))) = self.args.get(p) {
             return (self.loaded.get(&c).map(|l| &l.0) == Some(text)).then_some(());
@@ -220,8 +490,8 @@ impl Walk<'_> {
 
     /// Parameter p is this constant, wherever it is read.
     fn constant(&mut self, p: usize, text: String) -> Option<()> {
-        if let Some(v) = self.known.get(&p).copied() {
-            return (number(&text) == Some(v)).then_some(()); // the K form of a folded number
+        if let Some(v) = self.known.get(&p) {
+            return Val::parse(&text).is_some_and(|x| x.identical(v)).then_some(()); // the K form of a folded value
         }
         if self.map.get(p)?.is_some() || p >= self.helper.numparams {
             return None;
@@ -239,9 +509,17 @@ impl Walk<'_> {
         }
     }
 
+    /// What was in caller register c is gone: no helper register is there.
+    fn clobber(&mut self, c: usize) {
+        for m in self.map.iter_mut().filter(|m| **m == Some(c)) {
+            *m = None;
+        }
+    }
+
     fn write(&mut self, p: usize, c: usize) -> Option<()> {
         self.unread.remove(&p);
         self.known.remove(&p);
+        self.clobber(c);
         *self.map.get_mut(p)? = Some(c);
         self.loaded.remove(&c);
         self.written.push(c);
@@ -297,27 +575,67 @@ impl Walk<'_> {
         }
     }
 
-    /// The number helper register r holds as Luau saw it at compile time: a
-    /// folded value, or a parameter given a number and never assigned.
-    fn value(&self, r: usize) -> Option<f64> {
+    /// The value helper register r holds as Luau saw it at compile time: a
+    /// folded one, or a parameter given a constant and never assigned.
+    fn val(&self, r: usize) -> Option<Val> {
         if let Some(v) = self.known.get(&r) {
-            return Some(*v);
+            return Some(v.clone());
         }
         if r < self.helper.numparams && !self.assigned[r] && self.map[r].is_none() {
             if let Some(Some(Arg::Const(t))) = self.args.get(r) {
-                return number(t);
+                return Val::parse(t);
             }
         }
         None
     }
 
-    /// p's result when all it reads are known numbers: what Luau's constant
-    /// folding makes of it.
-    fn fold(&self, p: &Insn) -> Option<f64> {
-        let k = |i: i64| number(&kexpr(self.m, self.helper, i));
+    fn value(&self, r: usize) -> Option<f64> {
+        self.val(r)?.num()
+    }
+
+    fn helper_k(&self, i: i64) -> Option<Val> {
+        Val::of_k(self.helper, self.m, usize::try_from(i).ok()?)
+    }
+
+    /// p's result when all it reads are known: what Luau's constant folding
+    /// makes of it. A load is known too: the copy has none of it when what
+    /// reads it was folded.
+    fn fold(&self, p: &Insn) -> Option<Val> {
+        let k = |i: i64| self.helper_k(i)?.num();
         let o = plain(p.op);
-        if o == op::MINUS {
-            return Some(-self.value(p.b())?);
+        match o {
+            op::MINUS => return Some(Val::Num(-self.value(p.b())?)),
+            op::NOT => return Some(Val::Bool(!self.val(p.b())?.truthy())),
+            op::LENGTH => {
+                return match self.val(p.b())? {
+                    Val::Str(s) => Some(Val::Num(s.len() as f64)),
+                    _ => None,
+                };
+            }
+            op::MOVE => return self.val(p.b()),
+            op::LOADN => return Some(Val::Num(f64::from(p.d()))),
+            op::LOADK => return self.helper_k(if p.op == op::LOADKX { i64::from(p.aux) } else { i64::from(p.d()) }),
+            op::LOADNIL => return Some(Val::Nil),
+            op::LOADB if p.c() == 0 => return Some(Val::Bool(p.b() != 0)),
+            op::AND | op::OR => {
+                let a = self.val(p.b())?;
+                return if a.truthy() == (o == op::AND) { self.val(p.c()) } else { Some(a) };
+            }
+            op::ANDK | op::ORK => {
+                let a = self.val(p.b())?;
+                return if a.truthy() == (o == op::ANDK) { self.helper_k(p.c() as i64) } else { Some(a) };
+            }
+            op::CONCAT => {
+                let mut s = Vec::new();
+                for r in p.b()..=p.c() {
+                    match self.val(r)? {
+                        Val::Str(x) => s.extend_from_slice(&x),
+                        _ => return None,
+                    }
+                }
+                return (s.len() <= 4096).then_some(Val::Str(s));
+            }
+            _ => {}
         }
         let (a, b) = match o {
             op::ADD | op::SUB | op::MUL | op::DIV | op::MOD | op::POW | op::IDIV => (self.value(p.b())?, self.value(p.c())?),
@@ -325,7 +643,7 @@ impl Walk<'_> {
             op::SUBRK | op::DIVRK => (k(p.b() as i64)?, self.value(p.c())?),
             _ => return None,
         };
-        Some(match o {
+        Some(Val::Num(match o {
             op::ADD | op::ADDK => a + b,
             op::SUB | op::SUBK | op::SUBRK => a - b,
             op::MUL | op::MULK => a * b,
@@ -333,30 +651,33 @@ impl Walk<'_> {
             op::MOD | op::MODK => a - (a / b).floor() * b,
             op::POW | op::POWK => a.powf(b),
             _ => (a / b).floor(), // IDIV, IDIVK
-        })
+        }))
     }
 
-    /// A test of known numbers, folded: Some(true) if it jumps.
+    /// A test of known values, folded: Some(true) if it jumps.
     fn known_test(&self, p: &Insn) -> Option<bool> {
         let o = plain(p.op);
+        let not = p.aux >> 31 != 0;
         match o {
-            // a number is true
-            op::JUMPIF | op::JUMPIFNOT => self.known.contains_key(&p.a()).then_some(o == op::JUMPIF),
+            op::JUMPIF | op::JUMPIFNOT => Some(self.known.get(&p.a())?.truthy() == (o == op::JUMPIF)),
             op::JUMPIFEQ | op::JUMPIFNOTEQ | op::JUMPIFLT | op::JUMPIFNOTLT | op::JUMPIFLE | op::JUMPIFNOTLE => {
-                // (parameters given numbers, never assigned, are constants
+                // (parameters given constants, never assigned, are constants
                 // to the compiler too: `p > p` of `f(1)` is folded)
-                let (x, y) = (self.value(p.a())?, self.value((p.aux & 0xFF) as usize)?);
+                let (x, y) = (self.val(p.a())?, self.val((p.aux & 0xFF) as usize)?);
                 let holds = match o {
-                    op::JUMPIFEQ | op::JUMPIFNOTEQ => x == y,
-                    op::JUMPIFLT | op::JUMPIFNOTLT => x < y,
-                    _ => x <= y,
+                    op::JUMPIFEQ | op::JUMPIFNOTEQ => x.same(&y),
+                    // only numbers are ordered at compile time
+                    op::JUMPIFLT | op::JUMPIFNOTLT => x.num()? < y.num()?,
+                    _ => x.num()? <= y.num()?,
                 };
                 Some(holds != matches!(o, op::JUMPIFNOTEQ | op::JUMPIFNOTLT | op::JUMPIFNOTLE))
             }
-            op::JUMPXEQKN => {
-                let x = *self.known.get(&p.a())?;
-                let k = number(&kexpr(self.m, self.helper, (p.aux & 0xFFFFFF) as i64))?;
-                Some((x == k) != (p.aux >> 31 != 0))
+            op::JUMPXEQKNIL => Some(matches!(self.known.get(&p.a())?, Val::Nil) != not),
+            op::JUMPXEQKB => Some(matches!(self.known.get(&p.a())?, Val::Bool(b) if *b == (p.aux & 1 != 0)) != not),
+            op::JUMPXEQKN | op::JUMPXEQKS => {
+                let x = self.known.get(&p.a())?;
+                let k = self.helper_k(i64::from(p.aux & 0xFFFFFF))?;
+                Some(x.same(&k) != not)
             }
             _ => None,
         }
@@ -807,13 +1128,264 @@ impl Inlined {
 
 /// Is the code of `helper` inlined at index `start` of the caller's code?
 /// A copy given constants has the tests on them folded: a parameter tested
-/// before the copy shows what it is is tried as false, then as true.
+/// before the copy shows what it is is tried as false, then as true. One
+/// whose every use was folded left no trace: see `solve`.
 pub fn match_call(m: &Module, caller: &Proto, id: usize, start: usize) -> Option<Inlined> {
+    let none = vec![None; m.protos[id].numparams];
+    if let Some(found) = match_given(m, caller, id, start, &none) {
+        return Some(found);
+    }
+    let saved = (REACHED.with(Cell::get), CHECK.with(Cell::get));
+    let unseen = UNSEEN.with(Cell::get);
+    let found = solve(m, caller, id, start, saved.0 .0, unseen);
+    if found.is_none() {
+        // what LUAU_WHY reports is the plain walk's refusal
+        REACHED.with(|r| r.set(saved.0));
+        CHECK.with(|c| c.set(saved.1));
+    }
+    found
+}
+
+/// Arguments the copy left no trace of, every use of them folded
+/// (`frames(13)` is the constant 13 / 60; in `f(1, 1)` a test on both is
+/// gone). Each parameter the helper does not assign is tried with the
+/// constants the copy holds, a few plain ones, and, where the helper's result
+/// is its arithmetic on one parameter and the copy one constant, the number
+/// that comes to it. The walk checks the whole copy against what the helper
+/// makes of those: any set that gets through is a call compiling to this
+/// very code, provided it is all the copy: given made-up constants nearly
+/// all of a helper folds, and a few instructions would match, so what
+/// follows has to be off the helper's lines. Tried only where the plain walk
+/// got into the copy with a parameter it saw no value of, or that number
+/// exists; at most 200 walks.
+fn solve(m: &Module, caller: &Proto, id: usize, start: usize, reached: usize, unseen: usize) -> Option<Inlined> {
+    let helper = &m.protos[id];
+    let n = helper.numparams;
+    let want = helper.code.iter().filter(|i| !ignored(i.op)).count();
+    if n == 0 || n > 3 || want > 64 {
+        return None;
+    }
+    if !fresh(m, caller, id, start, 4) {
+        return None;
+    }
+    let whole = |found: Inlined| -> Option<Inlined> {
+        let next = caller.code.get(caller.code.partition_point(|c| c.pc < found.end));
+        next.is_none_or(|c| outside(helper, caller, c.pc)).then_some(found)
+    };
+    let code = &caller.code;
+    let mut cands: Vec<Val> = Vec::new();
+    let add = |v: Val, cands: &mut Vec<Val>| {
+        if !matches!(v, Val::Num(x) if x.is_nan()) && !cands.iter().any(|c| c.identical(&v)) {
+            cands.push(v);
+        }
+    };
+    if let Some(found) = folded_whole(m, caller, id, start) {
+        return Some(found);
+    }
+    if reached == 0 || unseen == 0 {
+        return None;
+    }
+    let none = vec![None; n];
+    for c in code[start..].iter().filter(|c| !ignored(c.op)).take(want + 8) {
+        for v in consts_of(m, caller, c) {
+            add(v, &mut cands);
+        }
+    }
+    for v in [Val::Num(0.0), Val::Num(1.0), Val::Num(-1.0), Val::Num(2.0), Val::Bool(true), Val::Bool(false), Val::Nil] {
+        add(v, &mut cands);
+    }
+    cands.truncate(12);
+    let assigned = |r: usize| helper.code.iter().any(|i| !ignored(i.op) && full_effects(i, helper.maxstack).1.has(r));
+    let free: Vec<usize> = (0..n).filter(|r| !assigned(*r)).collect();
+    let mut tries = 0;
+    // one parameter given, then two, then three; each a choice of candidates
+    for size in 1..=free.len() {
+        let mut pick: Vec<usize> = (0..size).collect();
+        loop {
+            let mut which = vec![0usize; size];
+            loop {
+                tries += 1;
+                if tries > 200 {
+                    return None;
+                }
+                let mut preset = vec![None; n];
+                for (j, &p) in pick.iter().enumerate() {
+                    preset[free[p]] = Some(cands[which[j]].clone());
+                }
+                let mut need = None;
+                if let Some(found) = match_once(m, caller, id, start, &none, &preset, &mut need).and_then(whole) {
+                    return Some(found);
+                }
+                // the next choice of candidates
+                let mut j = size;
+                while j > 0 && which[j - 1] + 1 == cands.len() {
+                    which[j - 1] = 0;
+                    j -= 1;
+                }
+                if j == 0 {
+                    break;
+                }
+                which[j - 1] += 1;
+            }
+            // the next choice of parameters
+            let mut j = size;
+            while j > 0 && pick[j - 1] == free.len() - size + j - 1 {
+                j -= 1;
+            }
+            if j == 0 {
+                break;
+            }
+            pick[j - 1] += 1;
+            for q in j..size {
+                pick[q] = pick[q - 1] + 1;
+            }
+        }
+    }
+    None
+}
+
+/// The copy folded whole: one constant, the helper's arithmetic on one
+/// parameter, and the number that comes to it (rounder ones first). Its
+/// copy given a register starts with arithmetic, never a load, so a match of
+/// just that load is all of a copy.
+fn folded_whole(m: &Module, caller: &Proto, id: usize, start: usize) -> Option<Inlined> {
+    let helper = &m.protos[id];
+    let code = &caller.code;
+    let at = skip(code, start);
+    let (r, a, b) = linear_return(m, helper)?;
+    let Val::Num(k) = load_val(m, caller, code.get(at)?)? else { return None };
+    let x = (k - b) / a;
+    if !x.is_finite() {
+        return None;
+    }
+    let after = code.get(at + 1).map_or(i32::MAX, |c| c.pc);
+    let none = vec![None; helper.numparams];
+    for v in [x.round(), (x * 10.0).round() / 10.0, (x * 100.0).round() / 100.0, (x * 1000.0).round() / 1000.0, x] {
+        let mut preset = vec![None; helper.numparams];
+        preset[r] = Some(Val::Num(v));
+        let mut need = None;
+        if let Some(found) = match_once(m, caller, id, start, &none, &preset, &mut need).filter(|f| f.end == after) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Do the helper's lines begin at instruction i? Luau gives what it compiles
+/// the line it last set: a constant just after a copy has the copy's line,
+/// and looks like a copy folded to it. The code of a copy starts a line of
+/// the helper's, so the instruction before is on other lines, or is itself
+/// a whole folded copy of the helper (`f(1), f(2)`).
+fn fresh(m: &Module, caller: &Proto, id: usize, i: usize, depth: usize) -> bool {
+    let helper = &m.protos[id];
+    let code = &caller.code;
+    let Some(prev) = (0..i.min(code.len())).rev().find(|&j| !ignored(code[j].op)) else { return true };
+    if outside(helper, caller, code[prev].pc) {
+        return true;
+    }
+    depth > 0
+        && load_val(m, caller, &code[prev]).is_some()
+        && fresh(m, caller, id, prev, depth - 1)
+        && folded_whole(m, caller, id, prev).is_some()
+}
+
+/// The value a caller's load of a constant gives.
+fn load_val(m: &Module, caller: &Proto, c: &Insn) -> Option<Val> {
+    match c.op {
+        op::LOADN => Some(Val::Num(f64::from(c.d()))),
+        op::LOADK => Val::of_k(caller, m, usize::try_from(c.d()).ok()?),
+        op::LOADKX => Val::of_k(caller, m, c.aux as usize),
+        op::LOADNIL => Some(Val::Nil),
+        op::LOADB if c.c() == 0 => Some(Val::Bool(c.b() != 0)),
+        _ => None,
+    }
+}
+
+/// The constants a caller's instruction holds: what it loads, or its K.
+fn consts_of(m: &Module, caller: &Proto, c: &Insn) -> Vec<Val> {
+    let k = |i: usize| Val::of_k(caller, m, i);
+    let one = match plain(c.op) {
+        op::LOADN | op::LOADK | op::LOADNIL | op::LOADB => load_val(m, caller, c),
+        op::ADDK | op::SUBK | op::MULK | op::DIVK | op::MODK | op::POWK | op::IDIVK | op::ANDK | op::ORK => k(c.c()),
+        op::SUBRK | op::DIVRK => k(c.b()),
+        op::JUMPXEQKN | op::JUMPXEQKS => k((c.aux & 0xFFFFFF) as usize),
+        op::JUMPXEQKB => Some(Val::Bool(c.aux & 1 != 0)),
+        op::JUMPXEQKNIL => Some(Val::Nil),
+        op::GETTABLEN | op::SETTABLEN => Some(Val::Num((c.c() + 1) as f64)),
+        _ => None,
+    };
+    one.into_iter().collect()
+}
+
+/// The helper's result when it is straight arithmetic on one parameter and
+/// constants: that parameter, with a and b of `a * p + b`.
+fn linear_return(m: &Module, helper: &Proto) -> Option<(usize, f64, f64)> {
+    // a constant, or a * parameter + b
+    #[derive(Clone, Copy)]
+    enum L {
+        K(f64),
+        X(usize, f64, f64),
+    }
+    let k = |i: usize| Val::of_k(helper, m, i)?.num();
+    let bin = |o: u8, x: L, y: L| -> Option<L> {
+        use L::{K as C, X};
+        Some(match (o, x, y) {
+            (_, C(a), C(b)) => C(match o {
+                op::ADD => a + b,
+                op::SUB => a - b,
+                op::MUL => a * b,
+                _ => a / b,
+            }),
+            (op::ADD, X(r, a, b), C(c)) | (op::ADD, C(c), X(r, a, b)) => X(r, a, b + c),
+            (op::SUB, X(r, a, b), C(c)) => X(r, a, b - c),
+            (op::SUB, C(c), X(r, a, b)) => X(r, -a, c - b),
+            (op::MUL, X(r, a, b), C(c)) | (op::MUL, C(c), X(r, a, b)) => X(r, a * c, b * c),
+            (op::DIV, X(r, a, b), C(c)) if c != 0.0 => X(r, a / c, b / c),
+            _ => return None,
+        })
+    };
+    let mut regs: HashMap<usize, L> = HashMap::default();
+    for r in 0..helper.numparams {
+        regs.insert(r, L::X(r, 1.0, 0.0));
+    }
+    for ins in helper.code.iter().filter(|i| !ignored(i.op)) {
+        let get = |r: usize| regs.get(&r).copied();
+        let arith = |o: u8| match o {
+            op::ADD | op::ADDK => Some(op::ADD),
+            op::SUB | op::SUBK | op::SUBRK => Some(op::SUB),
+            op::MUL | op::MULK => Some(op::MUL),
+            op::DIV | op::DIVK | op::DIVRK => Some(op::DIV),
+            _ => None,
+        };
+        let o = plain(ins.op);
+        let v = match o {
+            op::LOADN => L::K(f64::from(ins.d())),
+            op::LOADK => L::K(k(usize::try_from(ins.d()).ok()?)?),
+            op::MOVE => get(ins.b())?,
+            op::MINUS => bin(op::MUL, get(ins.b())?, L::K(-1.0))?,
+            op::ADD | op::SUB | op::MUL | op::DIV => bin(arith(o)?, get(ins.b())?, get(ins.c())?)?,
+            op::ADDK | op::SUBK | op::MULK | op::DIVK => bin(arith(o)?, get(ins.b())?, L::K(k(ins.c())?))?,
+            op::SUBRK | op::DIVRK => bin(arith(o)?, L::K(k(ins.b())?), get(ins.c())?)?,
+            op::RETURN if ins.b() == 2 => {
+                return match get(ins.a())? {
+                    L::X(r, a, b) if a != 0.0 => Some((r, a, b)),
+                    _ => None,
+                };
+            }
+            _ => return None,
+        };
+        regs.insert(ins.a(), v);
+    }
+    None
+}
+
+/// match_call's walks, the truth of untold parameters assumed in turn.
+fn match_given(m: &Module, caller: &Proto, id: usize, start: usize, preset: &[Option<Val>]) -> Option<Inlined> {
     let mut assumed = vec![None; m.protos[id].numparams];
     // the parameters assumed, in the order tests needed them
     let mut taken: Vec<usize> = Vec::new();
     for _ in 0..16 {
-        let (found, need) = match_assuming(m, caller, id, start, &assumed);
+        let (found, need) = match_assuming(m, caller, id, start, &assumed, preset);
         if found.is_some() {
             return found;
         }
@@ -837,13 +1409,28 @@ pub fn match_call(m: &Module, caller: &Proto, id: usize, start: usize) -> Option
     None
 }
 
-fn match_assuming(m: &Module, caller: &Proto, id: usize, start: usize, assumed: &[Option<bool>]) -> (Option<Inlined>, Option<usize>) {
+fn match_assuming(
+    m: &Module,
+    caller: &Proto,
+    id: usize,
+    start: usize,
+    assumed: &[Option<bool>],
+    preset: &[Option<Val>],
+) -> (Option<Inlined>, Option<usize>) {
     let mut need = None;
-    let found = match_once(m, caller, id, start, assumed, &mut need);
+    let found = match_once(m, caller, id, start, assumed, preset, &mut need);
     (found, need)
 }
 
-fn match_once(m: &Module, caller: &Proto, id: usize, start: usize, assumed: &[Option<bool>], need: &mut Option<usize>) -> Option<Inlined> {
+fn match_once(
+    m: &Module,
+    caller: &Proto,
+    id: usize,
+    start: usize,
+    assumed: &[Option<bool>],
+    preset: &[Option<Val>],
+    need: &mut Option<usize>,
+) -> Option<Inlined> {
     let helper = &m.protos[id];
     CHECK.with(|c| c.set(""));
     let want: Vec<&Insn> = helper.code.iter().filter(|i| !ignored(i.op)).collect();
@@ -872,6 +1459,12 @@ fn match_once(m: &Module, caller: &Proto, id: usize, start: usize, assumed: &[Op
             .collect(),
         omitted: vec![false; helper.numparams],
     };
+    // constants the call is taken to have given (see solve)
+    for (r, v) in preset.iter().enumerate() {
+        if let Some(v) = v {
+            walk.args[r] = Some(Arg::Const(v.text()));
+        }
+    }
     // helper code a folded test left out of the copy: up to this pc
     let mut dead_until: Option<i32> = None;
     // the caller register a CLOSEUPVALS put after the result's moves closes
@@ -959,11 +1552,54 @@ fn match_once(m: &Module, caller: &Proto, id: usize, start: usize, assumed: &[Op
                 continue;
             }
         }
-        // arithmetic on numbers the call gave: folded, nothing of it in the
-        // copy, and what reads the result reads that number
+        // a builtin called on constants (`math.abs(p)` of `f(-1)`): folded,
+        // neither the import nor the call is in the copy
+        if p.op == op::GETIMPORT {
+            let call = want.get(k + 1).copied().filter(|n| plain(n.op) == op::CALL && n.a() == p.a() && n.b() >= 1 && n.c() == 2);
+            let c = code.get(i)?;
+            let name = import_expr(m, helper, p.aux);
+            let in_copy = c.op == op::GETIMPORT && import_expr(m, caller, c.aux) == name;
+            if let Some(n) = call.filter(|_| !in_copy) {
+                let given: Option<Vec<Val>> = (1..n.b()).map(|j| walk.val(p.a() + j)).collect();
+                if let Some(v) = given.and_then(|a| builtin(&name, &a)) {
+                    walk.known.insert(p.a(), v);
+                    walk.map[p.a()] = None;
+                    landing.entry(p.pc).or_insert(c.pc);
+                    landing.entry(n.pc).or_insert(c.pc);
+                    skipped.insert(k + 1);
+                    continue;
+                }
+            }
+        }
+        // `a < b` as a value, the test folded: `LOADB r 0 +1; LOADB r 1` is
+        // one load in the copy, or none when what reads it was folded too
+        if plain(p.op) == op::LOADB && p.c() != 0 {
+            let c = code.get(i)?;
+            if c.op != op::LOADB || c.c() == 0 {
+                if c.op == op::LOADB && c.b() == p.b() {
+                    walk.write(p.a(), c.a())?;
+                    landing.insert(p.pc, c.pc);
+                    last = c.pc;
+                    i = skip(code, i + 1);
+                } else {
+                    walk.known.insert(p.a(), Val::Bool(p.b() != 0));
+                    walk.map[p.a()] = None;
+                    landing.entry(p.pc).or_insert(c.pc);
+                }
+                dead_until = Some(p.pc + 1 + p.c() as i32);
+                continue;
+            }
+        }
+        // a value worked out from constants: folded, nothing of it in the
+        // copy, and what reads the result reads that value. (A move the copy
+        // has as a load of that very value, both going on alike, is the K form
+        // of the move; going on otherwise, the load is of something folded
+        // after it: `math.abs(p)` of `f(3)`, loaded for a test.)
         if let Some(v) = walk.fold(p) {
             let c = code.get(i)?;
-            if plain(c.op) != plain(p.op) {
+            let alike = want.get(k + 1).zip(code.get(skip(code, i + 1))).is_none_or(|(w, d)| plain(w.op) == plain(d.op));
+            let loads_it = p.op == op::MOVE && alike && walk.load_text(c).and_then(|t| Val::parse(&t)).is_some_and(|x| x.identical(&v));
+            if plain(c.op) != plain(p.op) && !loads_it {
                 walk.known.insert(p.a(), v);
                 walk.map[p.a()] = None;
                 landing.entry(p.pc).or_insert(c.pc);
@@ -972,6 +1608,7 @@ fn match_once(m: &Module, caller: &Proto, id: usize, start: usize, assumed: &[Op
         }
         let mut c = code.get(i)?;
         REACHED.with(|r| r.set((k, want.len(), p.op, c.op)));
+        UNSEEN.with(|u| u.set(walk.args.iter().filter(|a| a.is_none()).count()));
         landing.insert(p.pc, c.pc);
         // `return a, b` of locals a closure captured: the copy moves the
         // results out first and closes the locals after
@@ -1017,6 +1654,8 @@ fn match_once(m: &Module, caller: &Proto, id: usize, start: usize, assumed: &[Op
             && p.op != op::SETUPVAL
         {
             if let Some(text) = walk.load_text(c) {
+                // a load over a helper value is not one for the helper to read
+                walk.clobber(c.a());
                 walk.loaded.insert(c.a(), (text, c.pc));
                 walk.written.push(c.a());
             } else if c.op == op::MOVE && walk.unread.len() == 1 {
@@ -1046,9 +1685,9 @@ fn match_once(m: &Module, caller: &Proto, id: usize, start: usize, assumed: &[Op
                         i = skip(code, i + 1);
                     }
                 }
-                // `return x * 2` folded to a number: the copy loads it where
+                // `return x * 2` folded to a value: the copy loads it where
                 // the result goes
-                2 if walk.known.get(&p.a()).is_some_and(|v| walk.load_text(c).and_then(|t| number(&t)) == Some(*v))
+                2 if walk.known.get(&p.a()).is_some_and(|v| walk.load_text(c).and_then(|t| Val::parse(&t)).is_some_and(|x| x.identical(v)))
                     && result.is_none_or(|r| r == c.a()) =>
                 {
                     result = Some(c.a());
