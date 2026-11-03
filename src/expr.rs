@@ -110,7 +110,8 @@ pub fn ex(text: impl Into<String>, prec: i32) -> E {
 
 /// How tightly a constant's text binds: `0/0` is a division, `-4` a negation.
 pub fn const_prec(t: &str) -> i32 {
-    if t == "0/0" {
+    // `0/0`, and a fraction `7 / 60` (`-7 / 60` too: its minus binds first)
+    if t == "0/0" || t.contains(" / ") {
         7
     } else if t.starts_with('-') {
         8
@@ -661,10 +662,38 @@ thread_local! {
     /// or setfenv: Luau folds `math.pi` to its value there, so that value
     /// prints as `math.pi` again.
     static LIBRARY_CONSTANTS: Cell<bool> = const { Cell::new(false) };
+    /// The module was compiled to fold constants (-O1 and up: it shows a
+    /// FASTCALL or a DUPCLOSURE), so `7 / 60` compiles to the very constant.
+    static FOLDS: Cell<bool> = const { Cell::new(false) };
 }
 
 pub fn set_library_constants(on: bool) {
     LIBRARY_CONSTANTS.with(|c| c.set(on));
+}
+
+pub fn set_folding(on: bool) {
+    FOLDS.with(|c| c.set(on));
+}
+
+/// `p / q` for v, q at most 1000 (the least one), where its decimals run on
+/// (`0.016666666666666666`): Luau folds the division to exactly v.
+fn fraction(v: f64, dec: &str) -> Option<String> {
+    let digits = dec.split_once('.').map_or(0, |(_, f)| f.len());
+    if digits < 12 || dec.contains('e') {
+        return None;
+    }
+    let gcd = |mut a: u64, mut b: u64| {
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        a
+    };
+    (2..=1000u32).find_map(|q| {
+        let p = (v * q as f64).round();
+        let fits = p.abs() < 1e9 && p / q as f64 == v && gcd(p.abs() as u64, q as u64) == 1;
+        let text = format!("{} / {q}", p as i64);
+        (fits && text.len() < dec.len()).then_some(text)
+    })
 }
 
 pub fn fmt_number(v: f64) -> String {
@@ -680,12 +709,21 @@ pub fn fmt_number(v: f64) -> String {
         return "-0".to_string(); // negative zero prints differently
     }
     if v.is_infinite() {
-        return if v > 0.0 { "math.huge".to_string() } else { "-math.huge".to_string() };
+        // `math.huge` only where Luau folds it back; `1e999` is the constant
+        // at every level, whatever a script does to `math`
+        let name = if LIBRARY_CONSTANTS.with(Cell::get) { "math.huge" } else { "1e999" };
+        return if v > 0.0 { name.to_string() } else { format!("-{name}") };
     }
     if v == v.trunc() && v.abs() < 1e15 {
         return (v as i64).to_string();
     }
-    float_repr(v)
+    let dec = float_repr(v);
+    if FOLDS.with(Cell::get) {
+        if let Some(f) = fraction(v, &dec) {
+            return f;
+        }
+    }
+    dec
 }
 
 #[cfg(test)]

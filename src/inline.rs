@@ -148,6 +148,10 @@ struct Walk<'a> {
 /// A number written as source text (a constant, or a LOADN's operand).
 fn number(text: &str) -> Option<f64> {
     let t = text.trim();
+    // a fraction the printer writes (`7 / 60`)
+    if let Some((p, q)) = t.split_once(" / ") {
+        return Some(number(p)? / number(q)?);
+    }
     let digit = t.trim_start_matches('-').starts_with(|c: char| c.is_ascii_digit() || c == '.');
     if digit {
         t.parse::<f64>().ok()

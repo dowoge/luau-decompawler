@@ -55,8 +55,9 @@ pub static INFO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::
 /// the flags the compiler gave it, its upvalues as this text names them, and
 /// its constants.
 pub fn info_comments(lines: Vec<String>, m: &Module) -> Vec<String> {
-    // constants as the bytecode holds them: π as a number
+    // constants as the bytecode holds them: π as a number, no fractions
     set_library_constants(false);
+    set_folding(false);
     // how each function's creator captures its upvalues
     let mut kinds: HashMap<usize, Vec<u8>> = HashMap::default();
     for p in &m.protos {
@@ -298,7 +299,8 @@ pub fn kexpr(m: &Module, p: &Proto, i: i64) -> String {
         K::Nil => "nil".into(),
         K::Bool(b) => if *b { "true" } else { "false" }.into(),
         K::Number(v) => fmt_number(*v),
-        K::Integer(v) => v.to_string(),
+        // an integer, not a number: Luau spells it with `i`
+        K::Integer(v) => format!("{v}i"),
         K::Str(Some(s)) => lua_string(&m.strings[*s]),
         K::Str(None) => "\"\"".into(),
         K::Import(v) => import_expr(m, p, *v),
@@ -794,8 +796,20 @@ fn library_constants_fold(m: &Module) -> bool {
     })
 }
 
+/// The module was compiled at -O1 or more: it shows a FASTCALL or a
+/// DUPCLOSURE, which only those levels write. Constants fold there.
+fn module_folds(m: &Module) -> bool {
+    m.protos.iter().any(|p| {
+        p.code.iter().any(|i| matches!(i.op, op::FASTCALL | op::FASTCALL1 | op::FASTCALL2 | op::FASTCALL2K | op::FASTCALL3 | op::DUPCLOSURE))
+    })
+}
+
 pub fn decompile_lines(m: &Module, noflat: bool) -> Vec<String> {
-    set_library_constants(library_constants_fold(m));
+    // spelled as the source most likely was where Luau folds it back to the
+    // same constant: `7 / 60` from -O1, `math.pi` at -O2 (taken together)
+    let folds = module_folds(m);
+    set_folding(folds);
+    set_library_constants(folds && library_constants_fold(m));
     let spans = m
         .protos
         .iter()

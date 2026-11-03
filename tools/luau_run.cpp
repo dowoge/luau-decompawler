@@ -17,6 +17,7 @@
 // program stuck inside one library call (a pattern that backtracks without
 // end) gets past it: with --seconds, one still running after S seconds is left
 // behind. It prints nothing, and the others go on without it.
+#include "Luau/Common.h"
 #include "lua.h"
 #include "lualib.h"
 #include "luacode.h"
@@ -142,6 +143,10 @@ static size_t worker_count(size_t files) {
 }
 
 int main(int argc, char** argv) {
+    // integer literals (`5i`), as luau_check takes them
+    for (Luau::FValue<bool>* f = Luau::FValue<bool>::list; f; f = f->next)
+        if (std::strcmp(f->name, "LuauIntegerType2") == 0)
+            f->value = true;
     lua_CompileOptions opts = {};
     opts.optimizationLevel = 2;
     opts.debugLevel = 1;

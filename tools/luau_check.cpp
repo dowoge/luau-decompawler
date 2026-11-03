@@ -38,6 +38,17 @@ static const char* const kFlags[] = {
     "LuauCompileLoopUnrollZero", "LuauCompileCleanBlockDeadClose",
 };
 
+// Language the bytecode can hold and the source must then say, always on:
+// integer literals (`5i`), for a module compiled with integer constants.
+static const char* const kLanguage[] = {"LuauIntegerType2"};
+
+static void enable_flags(const char* const* names, size_t count) {
+    for (Luau::FValue<bool>* f = Luau::FValue<bool>::list; f; f = f->next)
+        for (size_t i = 0; i < count; ++i)
+            if (std::strcmp(f->name, names[i]) == 0)
+                f->value = true;
+}
+
 // Globals a game may replace, so `script.Parent` must not become an import.
 static const char* const kMutableGlobals[] = {
     "Game", "Workspace", "game", "plugin", "script", "shared", "workspace", nullptr,
@@ -78,12 +89,10 @@ int main(int argc, char** argv) {
     opts.vectorLib = "Vector3";
     opts.vectorCtor = "new";
     opts.vectorType = "Vector3";
+    enable_flags(kLanguage, std::size(kLanguage));
     if (emit || stream) {
         opts.mutableGlobals = kMutableGlobals;
-        for (Luau::FValue<bool>* f = Luau::FValue<bool>::list; f; f = f->next)
-            for (const char* name : kFlags)
-                if (std::strcmp(f->name, name) == 0)
-                    f->value = true;
+        enable_flags(kFlags, std::size(kFlags));
     }
     std::atomic<size_t> next{0};
     std::atomic<int> ok{0}, bad{0};
