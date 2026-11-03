@@ -203,6 +203,10 @@ pub fn main(args: &Args) -> u8 {
     }
     let seeds: &[(u64, usize, u64)] = if args.flag("--full") { &FULL } else { &QUICK };
     ok = random_sets(&tools, seeds) && ok;
+    if args.flag("--full") {
+        // damaged bytecode is refused or decompiled, never a crash or a hang
+        ok = crate::damage::run(&tools, &tools.decompiler, 60, 1, 25, 10) && ok;
+    }
     if let Ok(dumps) = std::env::var("LUAU_RUN") {
         ok = real_scripts(&tools, &dumps) && ok;
     }
