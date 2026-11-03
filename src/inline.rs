@@ -343,10 +343,9 @@ impl Walk<'_> {
             // a number is true
             op::JUMPIF | op::JUMPIFNOT => self.known.contains_key(&p.a()).then_some(o == op::JUMPIF),
             op::JUMPIFEQ | op::JUMPIFNOTEQ | op::JUMPIFLT | op::JUMPIFNOTLT | op::JUMPIFLE | op::JUMPIFNOTLE => {
+                // (parameters given numbers, never assigned, are constants
+                // to the compiler too: `p > p` of `f(1)` is folded)
                 let (x, y) = (self.value(p.a())?, self.value((p.aux & 0xFF) as usize)?);
-                if !self.known.contains_key(&p.a()) && !self.known.contains_key(&((p.aux & 0xFF) as usize)) {
-                    return None; // two parameters: the tests on those are another matter
-                }
                 let holds = match o {
                     op::JUMPIFEQ | op::JUMPIFNOTEQ => x == y,
                     op::JUMPIFLT | op::JUMPIFNOTLT => x < y,
