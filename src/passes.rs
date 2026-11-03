@@ -1533,7 +1533,7 @@ fn follow_flag(lines: &mut Vec<String>, decl: usize, flag: &str) -> bool {
     // bounded; the lines added in the end are what decide
     let mut budget = (8 * body.len() + 1000) as isize;
     FOLLOW_WHY.with(|c| c.set(""));
-    let got = follow(&stmts, d, flag, false, &mut budget);
+    let got = follow(&stmts, d, flag, false, &mut budget, None);
     let why = match &got {
         None => FOLLOW_WHY.with(|c| c.get()),
         Some((new, _)) if new.len() > body.len() + FOLLOW_GROWTH => "too many lines copied",
@@ -1551,13 +1551,95 @@ fn follow_flag(lines: &mut Vec<String>, decl: usize, flag: &str) -> bool {
     true
 }
 
-/// Statements of a block at indent j followed with F known to be v.
-fn follow(stmts: &[Vec<String>], j: usize, flag: &str, mut v: bool, budget: &mut isize) -> Option<(Vec<String>, End)> {
+/// Inside a `repeat ... until true` being followed: F's value at each of its
+/// own ways out (`break`, and `continue`, which goes to `until true`), and
+/// the statements that go in before each, written at indent `ind`.
+struct Exits<'a> {
+    values: Vec<Option<bool>>,
+    moved: &'a [Vec<String>],
+    ind: usize,
+}
+
+/// A way out of the `repeat` at indent `at`, F being v: the moved
+/// statements, followed there; and whether the `break` still comes after
+/// them (not when they leave by themselves).
+fn exit_with(ex: &mut Exits, at: usize, flag: &str, v: bool, budget: &mut isize) -> Option<(Vec<String>, bool)> {
+    ex.values.push(Some(v));
+    if ex.moved.is_empty() {
+        return Some((Vec::new(), true));
+    }
+    *budget -= ex.moved.iter().map(Vec::len).sum::<usize>() as isize;
+    if *budget < 0 {
+        return follow_stop("copies over budget");
+    }
+    let pad = spaces(at - ex.ind);
+    let lines: Vec<String> = ex.moved.iter().flatten().map(|l| format!("{pad}{l}")).collect();
+    let (out, end) = follow(&statements(&lines, at)?, at, flag, v, budget, None)?;
+    Some((out, end != End::Leaves))
+}
+
+/// `if c then break end` (or `continue`): c and the word.
+fn one_line_exit(t: &str) -> Option<(&str, &str)> {
+    let r = t.strip_prefix("if ")?;
+    for w in ["break", "continue"] {
+        if let Some(c) = r.strip_suffix(&format!(" then {w} end") as &str) {
+            return Some((c, w));
+        }
+    }
+    None
+}
+
+/// Statements of a block at indent j followed with F known to be v; inside
+/// a `repeat ... until true`, `exits` takes its ways out.
+fn follow(stmts: &[Vec<String>], j: usize, flag: &str, mut v: bool, budget: &mut isize, mut exits: Option<&mut Exits>) -> Option<(Vec<String>, End)> {
     let set = format!("{flag} = true");
     let mut out: Vec<String> = Vec::new();
     for (k, s) in stmts.iter().enumerate() {
         let head = strip(&s[0]);
-        if !s.iter().any(|l| has_word(l, flag)) {
+        let reads = s.iter().any(|l| has_word(l, flag));
+        if let Some(ex) = exits.as_deref_mut() {
+            // a way out of the `repeat`
+            if s.len() == 1 && (head == "break" || head == "continue") {
+                let (lines, keep) = exit_with(ex, j, flag, v, budget)?;
+                out.extend(lines);
+                if keep {
+                    out.push(s[0].clone());
+                }
+                return Some((out, End::Leaves));
+            }
+            if let Some((c, word)) = one_line_exit(head).filter(|_| s.len() == 1 && !reads) {
+                if ex.moved.is_empty() {
+                    ex.values.push(Some(v));
+                    out.push(s[0].clone());
+                } else {
+                    out.push(format!("{}if {c} then", spaces(j)));
+                    let (lines, keep) = exit_with(ex, j + 4, flag, v, budget)?;
+                    out.extend(lines);
+                    if keep {
+                        out.push(format!("{}{word}", spaces(j + 4)));
+                    }
+                    out.push(format!("{}end", spaces(j)));
+                }
+                continue;
+            }
+            // an `if` with ways out of the `repeat` in it
+            let exits_in = s.iter().any(|l| has_exit_word(strip(l)));
+            if !reads && s.len() > 1 && head.starts_with("if ") && head.ends_with(" then") && exits_in {
+                let (chain, ends) = follow_chain(s, j, flag, v, &[], &HashSet::default(), budget, Some(ex))?;
+                out.extend(chain);
+                if ends == End::Leaves {
+                    return Some((out, End::Leaves));
+                }
+                continue;
+            }
+            // ways out in anything else but a loop or a function of its own
+            // (`do break end`) are not followed: F unknown there
+            let own = head.starts_with("for ") || head.starts_with("while ") || head == "repeat" || head.contains("function");
+            if !reads && exits_in && !own {
+                ex.values.push(None);
+            }
+        }
+        if !reads {
             out.extend(s.iter().cloned());
             let t = head;
             if s.len() == 1 && (t == "break" || t == "continue" || t == "return" || t.starts_with("return ")) {
@@ -1574,18 +1656,38 @@ fn follow(stmts: &[Vec<String>], j: usize, flag: &str, mut v: bool, budget: &mut
             out.extend(l);
             continue;
         }
+        let rest = &stmts[k + 1..];
+        let read_after = rest.iter().flatten().any(|l| has_word(l, flag));
+        if head == "repeat" && s.last().is_some_and(|l| strip(l) == "until true" && indent_of(l) == j) {
+            let (lines, end, used) = follow_repeat(s, j, flag, v, rest, budget)?;
+            out.extend(lines);
+            match end {
+                End::Falls(Some(w)) if used == 0 => {
+                    v = w;
+                    continue;
+                }
+                _ => {
+                    // F not known after it: what is left must not read it
+                    let rest = &rest[used..];
+                    if rest.iter().flatten().any(|l| has_word(l, flag)) {
+                        return follow_stop("read after a repeat it leaves different ways");
+                    }
+                    unknown_exits(exits.as_deref_mut(), rest);
+                    out.extend(rest.iter().flatten().cloned());
+                    return Some((out, if end == End::Leaves { End::Leaves } else { End::Falls(None) }));
+                }
+            }
+        }
         if !(head.starts_with("if ") && head.ends_with(" then")) {
             return follow_stop("a loop or a function reads it");
         }
-        let rest = &stmts[k + 1..];
-        let read_after = rest.iter().flatten().any(|l| has_word(l, flag));
         let mut after = HashSet::default();
         for l in rest.iter().flatten() {
             words_into(&mut after, l);
         }
         // the arms alone: if their ends agree, F is known after
         let mut trial = *budget;
-        let (chain, ends) = follow_chain(s, j, flag, v, &[], &after, &mut trial)?;
+        let (chain, ends) = follow_chain(s, j, flag, v, &[], &after, &mut trial, exits.as_deref_mut())?;
         match ends {
             End::Falls(Some(w)) => {
                 *budget = trial;
@@ -1596,6 +1698,7 @@ fn follow(stmts: &[Vec<String>], j: usize, flag: &str, mut v: bool, budget: &mut
             End::Falls(None) if !read_after => {
                 *budget = trial;
                 out.extend(chain);
+                unknown_exits(exits.as_deref_mut(), rest);
                 out.extend(rest.iter().flatten().cloned());
                 return Some((out, End::Falls(None)));
             }
@@ -1608,26 +1711,99 @@ fn follow(stmts: &[Vec<String>], j: usize, flag: &str, mut v: bool, budget: &mut
             End::Falls(None) => {}
         }
         // they disagree, and F is read after: what follows, up to its last
-        // read, goes into each; the rest stays after, unless it reads a name
-        // that part declares
-        let last = rest.iter().rposition(|x| x.iter().any(|l| has_word(l, flag)))?;
-        let (moved, kept) = rest.split_at(last + 1);
-        let mut later = HashSet::default();
-        for l in kept.iter().flatten() {
-            words_into(&mut later, l);
-        }
-        let top: Vec<String> = moved.iter().map(|x| x[0].clone()).collect();
-        let (moved, kept) = if declares_any(&top, &later) { (rest, &[][..]) } else { (moved, kept) };
-        let (chain, ends) = follow_chain(s, j, flag, v, moved, &later, budget)?;
+        // read, goes into each; the rest stays after
+        let (moved, kept, later) = split_at_last_read(rest, flag);
+        let (chain, ends) = follow_chain(s, j, flag, v, moved, &later, budget, exits.as_deref_mut())?;
         out.extend(chain);
         if kept.is_empty() {
             return Some((out, ends));
         }
-        let (tail, tail_end) = follow(kept, j, flag, false, budget)?;
+        // F is not known there, but nothing reads it
+        unknown_exits(exits.as_deref_mut(), kept);
+        let (tail, tail_end) = follow(kept, j, flag, false, budget, None)?;
         out.extend(tail);
         return Some((out, if tail_end == End::Leaves { End::Leaves } else { ends }));
     }
     Some((out, End::Falls(Some(v))))
+}
+
+/// The statements of `rest` up to the last that reads F, those after, and
+/// the words of those after; all of them when those after read a name the
+/// first part declares.
+fn split_at_last_read<'a>(rest: &'a [Vec<String>], flag: &str) -> (&'a [Vec<String>], &'a [Vec<String>], HashSet<String>) {
+    let last = rest.iter().rposition(|x| x.iter().any(|l| has_word(l, flag))).map_or(0, |k| k + 1);
+    let (moved, kept) = rest.split_at(last);
+    let mut later = HashSet::default();
+    for l in kept.iter().flatten() {
+        words_into(&mut later, l);
+    }
+    let top: Vec<String> = moved.iter().map(|x| x[0].clone()).collect();
+    if declares_any(&top, &later) {
+        return (rest, &[], HashSet::default());
+    }
+    (moved, kept, later)
+}
+
+/// Statements copied as they are inside a `repeat` being followed, F not
+/// known: a way out among them leaves F unknown.
+fn unknown_exits(exits: Option<&mut Exits>, stmts: &[Vec<String>]) {
+    if let Some(ex) = exits {
+        if stmts.iter().flatten().any(|l| has_exit_word(strip(l))) {
+            ex.values.push(None);
+        }
+    }
+}
+
+/// A `repeat ... until true` (its lines, at indent j) that reads F, F being
+/// v on the way in, `rest` after it: its body followed, its ways out taken.
+/// When they leave F different ways and `rest` reads it, the statements of
+/// `rest` up to that read go in before each way out and at the body's end;
+/// how many of them is the third value.
+fn follow_repeat(s: &[String], j: usize, flag: &str, v: bool, rest: &[Vec<String>], budget: &mut isize) -> Option<(Vec<String>, End, usize)> {
+    let inner = statements(&s[1..s.len() - 1], j + 4)?;
+    let wrap = |b: Vec<String>| -> Vec<String> {
+        let mut o = vec![s[0].clone()];
+        o.extend(b);
+        o.push(s[s.len() - 1].clone());
+        o
+    };
+    let mut trial = *budget;
+    let mut ex = Exits { values: Vec::new(), moved: &[], ind: j };
+    let (body, end) = follow(&inner, j + 4, flag, v, &mut trial, Some(&mut ex))?;
+    let mut vals = ex.values;
+    if let End::Falls(x) = end {
+        vals.push(x);
+    }
+    let agreed = match vals.first() {
+        Some(Some(w)) if vals.iter().all(|x| *x == Some(*w)) => Some(*w),
+        _ => None,
+    };
+    if agreed.is_some() || !rest.iter().flatten().any(|l| has_word(l, flag)) {
+        *budget = trial;
+        let e = match agreed {
+            Some(w) => End::Falls(Some(w)),
+            None if vals.is_empty() => End::Leaves,
+            None => End::Falls(None),
+        };
+        return Some((wrap(body), e, 0));
+    }
+    let (moved, _, _) = split_at_last_read(rest, flag);
+    // inside the `repeat`, a way out of theirs would be its
+    if moved.iter().flatten().any(|l| has_exit_word(strip(l)) || flag_declared(l).is_some()) {
+        return follow_stop("what would go into a repeat leaves it");
+    }
+    let mut ex = Exits { values: Vec::new(), moved, ind: j };
+    let (mut body, end) = follow(&inner, j + 4, flag, v, budget, Some(&mut ex))?;
+    if let End::Falls(x) = end {
+        // falling out at `until true` is a way out too
+        let Some(w) = x else { return follow_stop("a repeat's end leaves it unknown") };
+        let (tail, _) = exit_with(&mut ex, j + 4, flag, w, budget)?;
+        body.extend(tail);
+    }
+    if ex.values.iter().any(Option::is_none) {
+        return follow_stop("a way out of a repeat leaves it unknown");
+    }
+    Some((wrap(body), End::Falls(None), moved.len()))
 }
 
 /// A one-line statement reading F, F being v: `if <test> then x end`, or a
@@ -1697,6 +1873,7 @@ fn top_level_word(s: &str, word: &str) -> Option<usize> {
 /// An `if` chain (its lines, at indent j) followed with F known to be v,
 /// `rest` going into each arm after its own statements; `after` holds the
 /// words of what still follows it.
+#[allow(clippy::too_many_arguments)]
 fn follow_chain(
     chain: &[String],
     j: usize,
@@ -1705,6 +1882,7 @@ fn follow_chain(
     rest: &[Vec<String>],
     after: &HashSet<String>,
     budget: &mut isize,
+    mut exits: Option<&mut Exits>,
 ) -> Option<(Vec<String>, End)> {
     if strip(chain.last()?) != "end" || indent_of(chain.last()?) != j {
         return None;
@@ -1758,7 +1936,7 @@ fn follow_chain(
             lines.extend(moved.iter().cloned());
         }
         let Some(stmts) = statements(&lines, j + 4) else { return follow_stop("an arm's statements") };
-        let (new_body, end) = follow(&stmts, j + 4, flag, v, budget)?;
+        let (new_body, end) = follow(&stmts, j + 4, flag, v, budget, exits.as_deref_mut())?;
         new_arms.push((c, new_body));
         ends.push(end);
         if last {
