@@ -898,6 +898,11 @@ impl<'c, 'm> Dec<'c, 'm> {
     fn with_flow(ctx: &'c Ctx<'m>, idx: usize, upvals: Vec<Rc<str>>, depth: i32, flow: Option<Flow>) -> Self {
         let m = ctx.m;
         let p = &m.protos[idx];
+        // functions inside functions, past what Luau parses: a copy of a
+        // function found inside itself through damaged line info
+        if depth > 400 {
+            panic!("functions nested deeper than any source");
+        }
         let upvals: Vec<Rc<str>> = if upvals.is_empty() {
             (0..p.nups).map(|i| Rc::from(format!("upval{i}"))).collect()
         } else {
@@ -2719,6 +2724,11 @@ impl<'c, 'm> Dec<'c, 'm> {
         loop_head: Option<i32>,
         exit: Option<i32>,
     ) {
+        // Luau parses no deeper than about 200 levels: damaged jumps that
+        // keep opening blocks are refused (the job's panic is caught)
+        if self.ranges.len() > 2000 {
+            panic!("blocks nested deeper than any source");
+        }
         self.exits.push(exit.unwrap_or(end));
         self.ranges.push((start, end));
         let mark = self.decl_log.len();

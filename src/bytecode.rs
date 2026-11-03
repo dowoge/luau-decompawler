@@ -646,3 +646,81 @@ pub fn parse_as(data: &[u8], opcodes: Opcodes) -> R<Module> {
     }
     Ok(Module { strings, text, protos, main, userdata })
 }
+
+/// What no compiler makes, refused before anything is analysed (a damaged
+/// file otherwise sends the analyses round jumps that go nowhere): unknown
+/// opcodes, an instruction cut off, a jump outside the code or into an
+/// instruction, code that runs off its end, a register at or past maxstack,
+/// constants, upvalues and children out of range or of the wrong kind, and
+/// a child that does not come before its parent (Luau writes children
+/// first, so a cycle is damage). `regs_fit` says whether an instruction's
+/// registers all lie below maxstack (the analyses know which it reads and
+/// writes; the harness reads bytecode without them).
+pub fn validate(m: &Module, regs_fit: impl Fn(&Insn, usize) -> bool) -> R<()> {
+    let np = m.protos.len();
+    if m.main >= np {
+        return Err("the main proto is out of range".into());
+    }
+    for (pi, p) in m.protos.iter().enumerate() {
+        let bad = |what: &str, pc: i32| -> R<()> { Err(format!("proto {pi}, pc {pc}: {what}")) };
+        if p.numparams > p.maxstack {
+            return bad("more parameters than registers", -1);
+        }
+        if p.children.iter().any(|&c| c >= pi) {
+            return bad("a child that does not come before it", -1);
+        }
+        let Some(last) = p.code.last() else { return bad("no code", 0) };
+        if !matches!(last.op, op::RETURN | op::JUMP | op::JUMPBACK | op::JUMPX) {
+            return bad("the code runs off its end", last.pc);
+        }
+        let starts: Vec<i32> = p.code.iter().map(|i| i.pc).collect();
+        let nk = p.k.len();
+        let k_of = |i: i64| (0..nk as i64).contains(&i).then(|| &p.k[i as usize]);
+        for ins in &p.code {
+            let pc = ins.pc;
+            if ins.op as usize >= OPNAMES.len() {
+                return bad("an unknown opcode", pc);
+            }
+            if ins.n == 2 && pc + 1 >= p.sizecode {
+                return bad("an instruction cut off", pc);
+            }
+            if let Some(t) = ins.jump_target() {
+                if starts.binary_search(&t).is_err() {
+                    return bad("a jump that lands outside the code", pc);
+                }
+            }
+            if !regs_fit(ins, p.maxstack) {
+                return bad("a register past maxstack", pc);
+            }
+            let k_index: Option<i64> = match ins.op {
+                op::LOADK | op::GETIMPORT => Some(ins.d() as i64),
+                op::LOADKX | op::GETGLOBAL | op::SETGLOBAL | op::GETTABLEKS | op::SETTABLEKS | op::NAMECALL
+                | op::FASTCALL2K => Some(ins.aux as i64),
+                op::JUMPXEQKN | op::JUMPXEQKS => Some((ins.aux & 0xFF_FFFF) as i64),
+                39..=44 | 47 | 48 | op::IDIVK => Some(ins.c() as i64),
+                op::SUBRK | op::DIVRK => Some(ins.b() as i64),
+                _ => None,
+            };
+            if k_index.is_some_and(|i| k_of(i).is_none()) {
+                return bad("a constant out of range", pc);
+            }
+            let fits = match ins.op {
+                op::GETUPVAL | op::SETUPVAL => ins.b() < p.nups,
+                op::NEWCLOSURE => (0..p.children.len() as i32).contains(&ins.d()),
+                op::DUPCLOSURE => matches!(k_of(ins.d() as i64), Some(K::Closure(c)) if *c < np),
+                op::DUPTABLE => matches!(k_of(ins.d() as i64), Some(K::TableK(_))),
+                op::GETIMPORT => {
+                    // its path: up to three names, ten bits each
+                    let count = (ins.aux >> 30) as i64;
+                    (0..count).all(|j| matches!(k_of(((ins.aux >> (20 - 10 * j)) & 1023) as i64), Some(K::Str(_))))
+                }
+                op::CAPTURE => ins.a() <= 2,
+                _ => true,
+            };
+            if !fits {
+                return bad("an operand of the wrong kind", pc);
+            }
+        }
+    }
+    Ok(())
+}

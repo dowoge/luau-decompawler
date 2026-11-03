@@ -323,10 +323,16 @@ fn read_index(src: &Path) -> HashMap<String, String> {
     names
 }
 
-/// A bytecode file's module: bytecode itself, or saved as text.
+/// A bytecode file's module: bytecode itself, or saved as text. What no
+/// compiler makes is refused here (bytecode::validate).
 fn load(data: &[u8], opcodes: Opcodes) -> Result<Module, String> {
     let text = bytecode::saved_text(data);
-    bytecode::parse_as(text.as_deref().unwrap_or(data), opcodes)
+    let m = bytecode::parse_as(text.as_deref().unwrap_or(data), opcodes)?;
+    bytecode::validate(&m, |ins, maxstack| {
+        let (rd, wr) = analysis::full_effects(ins, maxstack);
+        !(maxstack..256).any(|r| rd.has(r) || wr.has(r))
+    })?;
+    Ok(m)
 }
 
 fn run_dir(src: &Path, dst: &Path, opcodes: Opcodes, noflat: bool, cache_dir: Option<&Path>) -> i32 {
