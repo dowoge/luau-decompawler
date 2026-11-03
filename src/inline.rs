@@ -886,6 +886,9 @@ fn match_once(m: &Module, caller: &Proto, id: usize, start: usize, assumed: &[Op
     let mut stores: HashMap<i32, (i32, usize)> = HashMap::default();
     // the caller's way out of each return in the middle of the helper
     let mut exits: HashSet<i32> = HashSet::default();
+    // a return the compiler made of a jump to another: where the copy jumps
+    // instead, the helper register returned, and the copy's register for it
+    let mut twin_returns: Vec<(i32, usize, usize)> = Vec::new();
     let mut result: Option<usize> = None;
     let mut results = 0;
     let mut unused = false;
@@ -996,7 +999,10 @@ fn match_once(m: &Module, caller: &Proto, id: usize, start: usize, assumed: &[Op
         // made the value in that local, and has no store of its own
         if p.op == op::SETUPVAL {
             let src = walk.map[p.a()];
-            let stored = c.op == op::SETUPVAL || (c.op == op::MOVE && Some(c.b()) == src);
+            // a move of the value into another register is no store into the
+            // local (`n += 1 return n`: the move is the return's)
+            let into_local = walk.upvals.get(p.b()).and_then(|u| u.as_ref()).is_none_or(|u| *u == Up::Reg(c.a()));
+            let stored = c.op == op::SETUPVAL || (c.op == op::MOVE && Some(c.b()) == src && into_local);
             if let Some(r) = src.filter(|r| !stored && walk.written.contains(r)) {
                 walk.upvalue(p.b(), Up::Reg(r))?;
                 walk.upval_writes.push(r);
@@ -1087,6 +1093,20 @@ fn match_once(m: &Module, caller: &Proto, id: usize, start: usize, assumed: &[Op
                         return refuse("returns a value the copy never made");
                     };
                     let inside = walk.written.contains(&value);
+                    // `if a or true then return v end`: the helper's jump to
+                    // `return v` became a second `return v`, the copy's is a
+                    // jump to its store of the first
+                    let twin = want.iter().enumerate().any(|(j, w)| j != k && w.op == op::RETURN && (w.a(), w.b()) == (p.a(), p.b()));
+                    let to_store = c.jump_target().filter(|t| {
+                        let s = code.get(code.partition_point(|e| e.pc < *t));
+                        s.is_some_and(|s| s.pc == *t && s.op == op::MOVE && s.b() == value)
+                    });
+                    if let Some(t) = to_store.filter(|_| twin && !inside && !finished && c.op == op::JUMP) {
+                        twin_returns.push((t, p.a(), value));
+                        last = c.pc;
+                        i = skip(code, i + 1);
+                        continue;
+                    }
                     let leaves = code.get(skip(code, i + 1)).is_some_and(|e| matches!(plain(e.op), op::JUMP | op::RETURN));
                     let moved = c.op == op::MOVE && c.b() == value;
                     let stored = if moved && (!inside || result == Some(c.a()) || (!finished && leaves)) {
@@ -1242,6 +1262,14 @@ fn match_once(m: &Module, caller: &Proto, id: usize, start: usize, assumed: &[Op
     let reaches_end = |t: i32| t == end || t == last_return || after_jump(after) == Some(t) || same_return(t);
     if to_end.iter().any(|t| !reaches_end(land(code, *t))) {
         return refuse("a return goes elsewhere");
+    }
+    // each jump for a twin return lands on the copy's store of that return
+    for (t, reg, value) in &twin_returns {
+        let store = code.get(code.partition_point(|e| e.pc < *t));
+        let into_result = store.is_some_and(|s| s.op == op::MOVE && s.b() == *value && Some(s.a()) == result);
+        if stores.get(t).is_none_or(|(_, r)| r != reg) || !into_result {
+            return refuse("a twin return lands on no store of it");
+        }
     }
     if let Some(r) = copied_return {
         if after.op != op::RETURN || (after.a(), after.b()) != r {
