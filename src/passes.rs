@@ -1457,18 +1457,20 @@ fn condition_for_flag(lines: &mut Vec<String>, decl: usize, flag: &str) -> bool 
     if !strip(&lines[first]).starts_with("if ") || !strip(&lines[first]).ends_with(" then") || if_end(lines, first) != Some(chain_end) {
         return false;
     }
-    if lines[decl + 1..first].iter().any(|l| loop_open(l) || strip(l).contains("function") || has_word(l, flag)) {
+    let around = |p: usize| (loop_open(&lines[p]) || strip(&lines[p]).contains("function")) && arm_end(lines, p) > first;
+    if (decl + 1..first).any(|p| around(p) || has_word(&lines[p], flag)) {
         return false;
     }
+    let mut chain: Vec<String> = lines[first..=chain_end].iter().filter(|l| !is_blank(l)).cloned().collect();
+    fold_test_locals(&mut chain);
     // tests and sets, nothing else
-    let pure = lines[first..=chain_end].iter().filter(|l| !is_blank(l)).all(|l| {
+    let pure = chain.iter().all(|l| {
         let t = strip(l);
         t == set || t == "end" || t == "else" || ((t.starts_with("if ") || t.starts_with("elseif ")) && t.ends_with(" then"))
     });
-    if !pure || (first..chain_end).filter(|&i| strip(&lines[i]) == set).count() == 0 {
+    if !pure || !chain.iter().any(|l| strip(l) == set) {
         return false;
     }
-    let chain: Vec<String> = lines[first..=chain_end].iter().filter(|l| !is_blank(l)).cloned().collect();
     let Some(cond) = flag_condition(&chain, d, &set) else { return false };
     // where it is read: the first thing tested by an `if`, or by an if
     // expression that is all a value is set to
@@ -1495,6 +1497,40 @@ fn condition_for_flag(lines: &mut Vec<String>, decl: usize, flag: &str) -> bool 
     lines.drain(first..=chain_end);
     lines.remove(decl);
     true
+}
+
+/// In an `if` chain of tests: `local x = e` whose one use is the first
+/// operand of the test right after it goes into that test, e in place of x
+/// (bracketed unless one operand). e is worked out at the same point.
+fn fold_test_locals(chain: &mut Vec<String>) {
+    let mut i = 0;
+    while i + 1 < chain.len() {
+        let t = strip(&chain[i]);
+        let found = t.strip_prefix("local ").and_then(|r| r.split_once(" = ")).filter(|(n, v)| is_token(n) && !top_level_comma(v));
+        let Some((name, value)) = found.map(|(n, v)| (n.to_string(), v.to_string())) else {
+            i += 1;
+            continue;
+        };
+        let next = &chain[i + 1];
+        let test = strip(next).strip_prefix("if ").and_then(|r| r.strip_suffix(" then"));
+        let uses = chain.iter().enumerate().filter(|(k, l)| *k != i && has_word(l, &name)).count();
+        let lead = |c: &str| {
+            let c = c.strip_prefix("not ").unwrap_or(c);
+            c == name || c.strip_prefix(name.as_str()).is_some_and(|r| r.starts_with(' '))
+        };
+        let Some(c) = test.filter(|c| indent_of(next) == indent_of(&chain[i]) && uses == 1 && lead(c)) else {
+            i += 1;
+            continue;
+        };
+        let v = if one_operand(&value) { value } else { format!("({value})") };
+        let (not, rest) = match c.strip_prefix("not ") {
+            Some(r) => ("not ", r),
+            None => ("", c),
+        };
+        let new_c = format!("{not}{v}{}", &rest[name.len()..]);
+        chain[i + 1] = format!("{}if {new_c} then", spaces(indent_of(next)));
+        chain.remove(i);
+    }
 }
 
 /// The ` then` that ends an if expression's condition: the first one outside
