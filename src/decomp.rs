@@ -458,6 +458,9 @@ struct Dec<'c, 'm> {
     incoming: Vec<u32>,
     /// Lowest pc of a jump to each pc.
     first_jump: Vec<i32>,
+    /// The lines of this function's code that are another function's, sorted:
+    /// copies of helpers.
+    foreign_lines: Vec<u32>,
     consumed: Vec<u32>,
     pending: BTreeMap<usize, E>,
     base_indent: i32,
@@ -903,6 +906,10 @@ impl<'c, 'm> Dec<'c, 'm> {
             line < own.0 || line > own.1 || ctx.spans.iter().any(|s| inside(s) && s.0 <= line && line <= s.1)
         };
         let flow = flow.unwrap_or_else(|| Flow::new(p, &foreign));
+        let mut foreign_lines: Vec<u32> = p.lines.clone();
+        foreign_lines.sort_unstable();
+        foreign_lines.dedup();
+        foreign_lines.retain(|l| foreign(*l));
         let suffix = if depth < 0 { String::new() } else { format!("_{}", depth + 1) };
         let size = p.sizecode.max(0) as usize + 2;
         let mut d = Dec {
@@ -939,6 +946,7 @@ impl<'c, 'm> Dec<'c, 'm> {
             labels: vec![false; size],
             incoming: vec![0; size],
             first_jump: vec![i32::MAX; size],
+            foreign_lines,
             consumed: vec![0; size],
             pending: BTreeMap::new(),
             base_indent: 0,
@@ -3156,7 +3164,10 @@ impl<'c, 'm> Dec<'c, 'm> {
         let (Some(a), Some(b)) = (lines.get(write as usize), lines.get(read as usize)) else {
             return false;
         };
-        b > a && *a >= self.p.linedefined
+        // inside a value, a write on a helper's line is the end of a copy, its
+        // call folded to what it gives: no statement can stand there
+        let copied = self.in_region && self.foreign_lines.binary_search(a).is_ok();
+        b > a && *a >= self.p.linedefined && !copied
     }
 
     /// Does something in [from, to) write r?
@@ -3247,7 +3258,13 @@ impl<'c, 'm> Dec<'c, 'm> {
             return *v;
         }
         let mut result = false;
-        if !self.shared(pc, r) {
+        // a local a closure shares: read where nothing could change it first,
+        // by the test right after (`x = a or b`, with x captured)
+        let tested_next = || {
+            let next = pc + self.insn(pc).n;
+            self.valid(next) && is_cond_jump(self.insn(next).op) && effects(&self.insn(next), self.p.maxstack).0.has(r)
+        };
+        if !self.shared(pc, r) || tested_next() {
             let code = &self.p.code;
             let mut top: Option<usize> = None; // first register past the last multi-value result
             let mut other_arm = -1; // up to here, a jumped-over path still needs r
