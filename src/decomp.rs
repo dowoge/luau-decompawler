@@ -2255,8 +2255,13 @@ impl<'c, 'm> Dec<'c, 'm> {
             if i != from {
                 if let Some((call, _)) = self.inline_at(ins.pc) {
                     let reads = |r: usize| call.args.iter().any(|x| matches!(x, Some(Arg::Reg(a, _)) if *a == r));
-                    if reads(q) || call.written.contains(&q) || call.upvals.iter().flatten().any(|u| *u == Up::Reg(q)) {
+                    if call.written.contains(&q) || call.upvals.iter().flatten().any(|u| *u == Up::Reg(q)) {
                         return false;
+                    }
+                    if reads(q) {
+                        // q and the call's value both arguments of the call put
+                        // back here, q's register first: said in that order
+                        return (q + 1..self.p.maxstack).any(|r| flow.has(r) && reads(r));
                     }
                     if (0..self.p.maxstack).any(|r| flow.has(r) && reads(r)) {
                         for k in call.result.into_iter().flat_map(|t| t..t + call.results) {
@@ -2315,9 +2320,11 @@ impl<'c, 'm> Dec<'c, 'm> {
             // arms make flows on from where they meet. Past the local limit,
             // any value a test makes on the way (an `if` expression, a
             // comparison, `a and b or c`) is read with the rest
+            // So is `f(g(), h(), if c then x else y)`: a later argument's arms
+            // touch neither q nor anything with effects, and q is said first
             let region = if self.tight {
                 is_cond_jump(ins.op).then(|| self.closed_region(i)).flatten()
-            } else if carries && building && matches!(ins.op, op::JUMPIF | op::JUMPIFNOT) {
+            } else if matches!(ins.op, op::JUMPIF | op::JUMPIFNOT) && carries && building || is_cond_jump(ins.op) && !carries && !rd.has(q) {
                 self.if_else_join(i)
             } else {
                 None
@@ -6023,13 +6030,18 @@ impl<'c, 'm> Dec<'c, 'm> {
                 let r = self.get(c);
                 let (sym, prec) = if o == op::AND { ("and", 2) } else { ("or", 1) };
                 let t = format!("{} {sym} {}", wrap(&l, prec), wrap(&r, prec + 1));
-                self.put(out, ind, a, ex(t, prec), true);
+                // `and` and `or` call nothing: as pure as what they join
+                let e = ex(t, prec);
+                e.borrow_mut().pure_ = l.borrow().pure_ && r.borrow().pure_;
+                self.put(out, ind, a, e, true);
             }
             op::ANDK | op::ORK => {
                 let l = self.get(b);
                 let (sym, prec) = if o == op::ANDK { ("and", 2) } else { ("or", 1) };
                 let t = format!("{} {sym} {}", wrap(&l, prec), kexpr(m, p, c as i64));
-                self.put(out, ind, a, ex(t, prec), true);
+                let e = ex(t, prec);
+                e.borrow_mut().pure_ = l.borrow().pure_;
+                self.put(out, ind, a, e, true);
             }
             op::CONCAT => {
                 let parts: Vec<String> = (b..c + 1).map(|r| { let v = self.get(r); wrap(&v, 6) }).collect();
