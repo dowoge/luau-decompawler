@@ -1500,6 +1500,16 @@ enum End {
 /// Fewest lines the copies a flag's removal makes may add, in all.
 const FOLLOW_GROWTH: usize = 48;
 
+thread_local! {
+    /// LUAU_WHY: what stopped the last flag followed.
+    static FOLLOW_WHY: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
+}
+
+fn follow_stop<T>(why: &'static str) -> Option<T> {
+    FOLLOW_WHY.with(|c| c.set(why));
+    None
+}
+
 /// The last resort for a flag: follow the code after `local F = false` with
 /// F's value known. A set goes, a test of F is decided (an arm never taken
 /// goes; one always taken is the code), and where the ways out of an `if`
@@ -1520,10 +1530,21 @@ fn follow_flag(lines: &mut Vec<String>, decl: usize, flag: &str) -> bool {
     let body: Vec<String> = lines[decl + 1..end].iter().filter(|l| !is_blank(l)).cloned().collect();
     let Some(stmts) = statements(&body, d) else { return false };
     let mut budget = 4 * FOLLOW_GROWTH as isize;
-    let Some((new, _)) = follow(&stmts, d, flag, false, &mut budget) else { return false };
-    if new.len() > body.len() + FOLLOW_GROWTH || new.iter().any(|l| has_word(l, flag)) {
+    FOLLOW_WHY.with(|c| c.set(""));
+    let got = follow(&stmts, d, flag, false, &mut budget);
+    let why = match &got {
+        None => FOLLOW_WHY.with(|c| c.get()),
+        Some((new, _)) if new.len() > body.len() + FOLLOW_GROWTH => "too many lines copied",
+        Some((new, _)) if new.iter().any(|l| has_word(l, flag)) => "still read",
+        Some(_) => "",
+    };
+    if !why.is_empty() {
+        if std::env::var_os("LUAU_WHY").is_some() {
+            eprintln!("NOFOLLOW\t{flag}\t{why}");
+        }
         return false;
     }
+    let Some((new, _)) = got else { return false };
     lines.splice(decl..end, new);
     true
 }
@@ -1547,11 +1568,12 @@ fn follow(stmts: &[Vec<String>], j: usize, flag: &str, mut v: bool, budget: &mut
             continue;
         }
         if s.len() == 1 {
-            out.extend(follow_line(&s[0], flag, v)?);
+            let Some(l) = follow_line(&s[0], flag, v) else { return follow_stop("a line reads it another way") };
+            out.extend(l);
             continue;
         }
         if !(head.starts_with("if ") && head.ends_with(" then")) {
-            return None; // a loop or a function that reads F
+            return follow_stop("a loop or a function reads it");
         }
         let rest = &stmts[k + 1..];
         let read_after = rest.iter().flatten().any(|l| has_word(l, flag));
@@ -1580,13 +1602,28 @@ fn follow(stmts: &[Vec<String>], j: usize, flag: &str, mut v: bool, budget: &mut
                 out.extend(chain);
                 return Some((out, End::Leaves));
             }
-            End::Leaves => return None,
+            End::Leaves => return follow_stop("read where nothing gets"),
             End::Falls(None) => {}
         }
-        // they disagree, and F is read after: what follows goes into each
-        let (chain, ends) = follow_chain(s, j, flag, v, rest, &HashSet::default(), budget)?;
+        // they disagree, and F is read after: what follows, up to its last
+        // read, goes into each; the rest stays after, unless it reads a name
+        // that part declares
+        let last = rest.iter().rposition(|x| x.iter().any(|l| has_word(l, flag)))?;
+        let (moved, kept) = rest.split_at(last + 1);
+        let mut later = HashSet::default();
+        for l in kept.iter().flatten() {
+            words_into(&mut later, l);
+        }
+        let top: Vec<String> = moved.iter().map(|x| x[0].clone()).collect();
+        let (moved, kept) = if declares_any(&top, &later) { (rest, &[][..]) } else { (moved, kept) };
+        let (chain, ends) = follow_chain(s, j, flag, v, moved, &later, budget)?;
         out.extend(chain);
-        return Some((out, ends));
+        if kept.is_empty() {
+            return Some((out, ends));
+        }
+        let (tail, tail_end) = follow(kept, j, flag, false, budget)?;
+        out.extend(tail);
+        return Some((out, if tail_end == End::Leaves { End::Leaves } else { ends }));
     }
     Some((out, End::Falls(Some(v))))
 }
@@ -1687,7 +1724,7 @@ fn follow_chain(
     }
     let moved: Vec<String> = rest.iter().flatten().map(|l| format!("    {l}")).collect();
     if moved.iter().any(|l| strip(l).starts_with("local jump_") && strip(l).ends_with(" = false")) {
-        return None; // another flag would be copied
+        return follow_stop("another flag would be copied");
     }
     let mut words = HashSet::default();
     for l in &moved {
@@ -1698,10 +1735,11 @@ fn follow_chain(
     for (cond, body) in arms {
         let c = match &cond {
             None => None,
-            Some(c) => match known_test(c, flag, v)? {
-                Test::Always(false) => continue,
-                Test::Always(true) => None,
-                Test::Text(t) => Some(t),
+            Some(c) => match known_test(c, flag, v) {
+                None => return follow_stop("a test reads it another way"),
+                Some(Test::Always(false)) => continue,
+                Some(Test::Always(true)) => None,
+                Some(Test::Text(t)) => Some(t),
             },
         };
         let last = c.is_none();
@@ -1709,15 +1747,16 @@ fn follow_chain(
         if !moved.is_empty() {
             let top: Vec<String> = lines.iter().filter(|l| indent_of(l) == j + 4).cloned().collect();
             if declares_any(&top, &words) {
-                return None; // the arm's own name would hide the one read after
+                return follow_stop("an arm declares a name read after");
             }
             *budget -= moved.len() as isize;
             if *budget < 0 {
-                return None;
+                return follow_stop("copies over budget");
             }
             lines.extend(moved.iter().cloned());
         }
-        let (new_body, end) = follow(&statements(&lines, j + 4)?, j + 4, flag, v, budget)?;
+        let Some(stmts) = statements(&lines, j + 4) else { return follow_stop("an arm's statements") };
+        let (new_body, end) = follow(&stmts, j + 4, flag, v, budget)?;
         new_arms.push((c, new_body));
         ends.push(end);
         if last {
