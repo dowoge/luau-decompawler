@@ -1372,6 +1372,11 @@ fn copy_unless_guards(lines: &mut Vec<String>) {
     }
 }
 
+/// `local a` or `local a, b`: names declared with no value.
+fn is_bare_local(t: &str) -> bool {
+    t.strip_prefix("local ").is_some_and(|r| r.split(", ").all(is_token))
+}
+
 /// `local jump_N = false`: jump_N.
 fn flag_declared(line: &str) -> Option<String> {
     strip(line)
@@ -1545,6 +1550,9 @@ fn follow_flag(lines: &mut Vec<String>, decl: usize, flag: &str) -> bool {
     if !why.is_empty() {
         if std::env::var_os("LUAU_WHY").is_some() {
             eprintln!("NOFOLLOW\t{flag}\t{why}");
+            if let Some((new, _)) = &got {
+                eprintln!("NOFOLLOW\t{flag}\tgrowth {} -> {}", body.len(), new.len());
+            }
         }
         return false;
     }
@@ -2081,9 +2089,12 @@ fn condition_for_flag(lines: &mut Vec<String>, decl: usize, flag: &str) -> bool 
     if (0..decl).any(|i| has_word(&lines[i], flag)) {
         return false;
     }
-    let d = indent_of(&lines[r]);
-    let Some(chain_end) = (decl + 1..r).rev().find(|&i| !is_blank(&lines[i])) else { return false };
-    if indent_of(&lines[chain_end]) != d || strip(&lines[chain_end]) != "end" {
+    // the `if` before the read; bare declarations and the start of a block
+    // between them do nothing
+    let quiet = |l: &str| is_blank(l) || is_bare_local(strip(l)) || matches!(strip(l), "repeat" | "do");
+    let Some(chain_end) = (decl + 1..r).rev().find(|&i| !quiet(&lines[i])) else { return false };
+    let d = indent_of(&lines[chain_end]);
+    if indent_of(&lines[r]) < d || strip(&lines[chain_end]) != "end" {
         return false;
     }
     let Some(first) = (decl + 1..chain_end).rev().find(|&i| indent_of(&lines[i]) == d && !is_blank(&lines[i]) && !is_arm(strip(&lines[i]))) else {
@@ -2127,8 +2138,17 @@ fn condition_for_flag(lines: &mut Vec<String>, decl: usize, flag: &str) -> bool 
     if !lead.starts_with(flag) || !ok_after(&lead[flag.len()..]) || !has_word(lead, flag) {
         return false;
     }
+    // what the declarations between make must not be what the tests read
+    let declared: Vec<&str> = lines[chain_end + 1..r]
+        .iter()
+        .filter_map(|l| strip(l).strip_prefix("local "))
+        .flat_map(|names| names.split(", "))
+        .collect();
+    if declared.iter().any(|n| has_word(&cond, n)) {
+        return false;
+    }
     let new_test = test.replacen(flag, &format!("({cond})"), 1);
-    lines[r] = format!("{}{before}{new_test}{after}", spaces(d));
+    lines[r] = format!("{}{before}{new_test}{after}", spaces(indent_of(&lines[r])));
     lines.drain(first..=chain_end);
     lines.remove(decl);
     true
@@ -2680,7 +2700,7 @@ fn copy_unless_at(lines: &mut Vec<String>, decl: usize, flag: &str, c: usize) ->
     let mut at = c;
     let chain_end = loop {
         let Some(i) = (decl + 1..at).rev().find(|&i| !is_blank(&lines[i])) else { return false };
-        let bare = strip(&lines[i]).strip_prefix("local ").is_some_and(is_token);
+        let bare = is_bare_local(strip(&lines[i]));
         if indent_of(&lines[i]) == d && bare {
             lifted.insert(0, lines[i].clone());
             at = i;
@@ -2758,7 +2778,7 @@ fn copy_unless_at(lines: &mut Vec<String>, decl: usize, flag: &str, c: usize) ->
         return false;
     }
     // a name the `if` reads would be the lifted local's
-    let names: Vec<&str> = lifted.iter().filter_map(|l| strip(l).strip_prefix("local ")).collect();
+    let names: Vec<&str> = lifted.iter().filter_map(|l| strip(l).strip_prefix("local ")).flat_map(|n| n.split(", ")).collect();
     if lines[first..=chain_end].iter().any(|l| names.iter().any(|n| has_word(l, n))) {
         return false;
     }
@@ -2931,7 +2951,7 @@ fn repeat_unless(lines: &mut Vec<String>, decl: usize, flag: &str) -> bool {
     let mut at = open;
     let chain_end = loop {
         let Some(i) = (decl + 1..at).rev().find(|&i| !is_blank(&lines[i])) else { return false };
-        if indent_of(&lines[i]) == d && strip(&lines[i]).strip_prefix("local ").is_some_and(is_token) {
+        if indent_of(&lines[i]) == d && is_bare_local(strip(&lines[i])) {
             lifted.insert(0, lines[i].clone());
             at = i;
             continue;
@@ -2955,7 +2975,7 @@ fn repeat_unless(lines: &mut Vec<String>, decl: usize, flag: &str) -> bool {
     if (0..lines.len()).any(|i| has_word(&lines[i], flag) && i != decl && i != c && !(first..chain_end).contains(&i)) {
         return false;
     }
-    let names: Vec<&str> = lifted.iter().filter_map(|l| strip(l).strip_prefix("local ")).collect();
+    let names: Vec<&str> = lifted.iter().filter_map(|l| strip(l).strip_prefix("local ")).flat_map(|n| n.split(", ")).collect();
     if lines[first..=chain_end].iter().any(|l| names.iter().any(|n| has_word(l, n))) {
         return false;
     }
