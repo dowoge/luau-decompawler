@@ -63,17 +63,17 @@ const FULL: [(u64, usize, u64); 40] = [
     (60, 160, 55501),
 ];
 
+/// The decompiler builds, and its own unit tests pass.
 fn build() -> bool {
-    let out = command("cargo")
-        .args(["build", "--release", "--bin", "luau_decompile"])
-        .current_dir(repo())
-        .output()
-        .expect("cargo");
-    if !out.status.success() {
-        let err = text_of(&out.stderr);
-        println!("{}", &err[err.len().saturating_sub(3000)..]);
+    for args in [&["build", "--release", "--bin", "luau_decompile"][..], &["test", "--release", "--bin", "luau_decompile"]] {
+        let out = command("cargo").args(args).current_dir(repo()).output().expect("cargo");
+        if !out.status.success() {
+            let said = format!("{}{}", text_of(&out.stdout), text_of(&out.stderr));
+            println!("cargo {}:\n{}", args[0], &said[said.len().saturating_sub(3000)..]);
+            return false;
+        }
     }
-    out.status.success()
+    true
 }
 
 fn random_sets(tools: &Tools, seeds: &[(u64, usize, u64)]) -> bool {
