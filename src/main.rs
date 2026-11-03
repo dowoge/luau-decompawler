@@ -113,6 +113,26 @@ static RETURN_TYPES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 /// `--cache-max-mib N`: the most a `--cache` folder may hold after a run.
 static CACHE_MAX_MIB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(512);
 
+/// `--stats-json PATH`: with --dir, what the run came to, as JSON.
+static STATS_JSON: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// A JSON string of s.
+fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// A finished text as `--strict` takes it: the text, or why it is refused.
 fn strict_check(text: String) -> Result<String, String> {
     if !STRICT.load(std::sync::atomic::Ordering::Relaxed) {
@@ -656,6 +676,30 @@ fn run_dir(src: &Path, dst: &Path, opcodes: Opcodes, noflat: bool, cache_dir: Op
     if let Some(c) = &cache {
         c.prune();
     }
+    if let Some(path) = STATS_JSON.get() {
+        let rows: Vec<String> = written
+            .iter()
+            .zip(&targets)
+            .map(|(w, (p, _))| {
+                let rel = p.strip_prefix(dst).unwrap_or(p).to_string_lossy().replace('\\', "/");
+                format!(
+                    "{{\"path\":{},\"decompiled\":{},\"flags\":{},\"dispatchers\":{}}}",
+                    json_string(&rel),
+                    w[4] == 1 && w[0] == 0,
+                    w[1].min(w[2]),
+                    w[3]
+                )
+            })
+            .collect();
+        let json = format!(
+            "{{\"decompiled\":{ok},\"failed\":{bad},\"flags\":{flags},\"dispatchers\":{blocks},\"seconds\":{:.3},\"files\":[{}]}}\n",
+            t0.elapsed().as_secs_f64(),
+            rows.join(",")
+        );
+        if let Err(e) = fs::write(path, json) {
+            eprintln!("{}: {e}", path.display());
+        }
+    }
     if bad == 0 {
         0
     } else {
@@ -729,6 +773,9 @@ fn usage() -> i32 {
          \x20              scripts seen before decompiles only those that changed\n\
          \x20 --cache-max-mib N  the most DIR holds after a run, least recently\n\
          \x20              used entries going first (512)\n\
+         \x20 --stats-json PATH  with --dir, the run's counts as JSON: scripts\n\
+         \x20              decompiled and failed, flags, dispatchers and time, in all and\n\
+         \x20              for each file\n\
          Bytecode saved as text, a `--` line and then base64, is read as such."
     );
     2
@@ -763,6 +810,15 @@ fn run(args: Vec<String>) -> i32 {
         Some(_) => return usage(),
         None => None,
     };
+    if let Some(i) = args.iter().position(|a| a == "--stats-json") {
+        match args.get(i + 1) {
+            Some(p) => {
+                let _ = STATS_JSON.set(PathBuf::from(p));
+            }
+            None => return usage(),
+        }
+        args.drain(i..i + 2);
+    }
     if let Some(i) = args.iter().position(|a| a == "--cache-max-mib") {
         match args.get(i + 1).and_then(|v| v.parse::<u64>().ok()) {
             Some(n) => CACHE_MAX_MIB.store(n, std::sync::atomic::Ordering::Relaxed),
