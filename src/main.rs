@@ -110,6 +110,9 @@ static STRICT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::ne
 /// annotated with it. Off by default: sources seldom write them.
 static RETURN_TYPES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// `--cache-max-mib N`: the most a `--cache` folder may hold after a run.
+static CACHE_MAX_MIB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(512);
+
 /// A finished text as `--strict` takes it: the text, or why it is refused.
 fn strict_check(text: String) -> Result<String, String> {
     if !STRICT.load(std::sync::atomic::Ordering::Relaxed) {
@@ -460,7 +463,7 @@ fn run_dir(src: &Path, dst: &Path, opcodes: Opcodes, noflat: bool, cache_dir: Op
     let budget = std::env::var("LUAU_BUDGET").ok().and_then(|v| v.parse().ok()).unwrap_or(5 << 18);
     // `--cache`: an entry per script, named by its place and its bytes
     let options = format!("{opcodes:?} noflat={noflat} info={}", decomp::INFO.load(std::sync::atomic::Ordering::Relaxed));
-    let cache = cache_dir.and_then(|d| cache::Cache::open(d, &options));
+    let cache = cache_dir.and_then(|d| cache::Cache::open(d, &options, CACHE_MAX_MIB.load(std::sync::atomic::Ordering::Relaxed)));
     let core: Vec<Core> = par_map_sized(&sizes, budget, |i| {
         let data = match fs::read(src.join(&files[i])) {
             Ok(d) => d,
@@ -650,6 +653,9 @@ fn run_dir(src: &Path, dst: &Path, opcodes: Opcodes, noflat: bool, cache_dir: Op
     let bad = failures + total(0);
     let (flags, blocks) = (total(1).min(total(2)), total(3));
     println!("{ok} decompiled, {bad} failed, {flags} flags, {blocks} dispatchers -> {}", dst.display());
+    if let Some(c) = &cache {
+        c.prune();
+    }
     if bad == 0 {
         0
     } else {
@@ -721,6 +727,8 @@ fn usage() -> i32 {
          \x20              strings or numbers (`T?` with nil)\n\
          \x20 --cache DIR  with --dir, keep each script's work in DIR: a run over\n\
          \x20              scripts seen before decompiles only those that changed\n\
+         \x20 --cache-max-mib N  the most DIR holds after a run, least recently\n\
+         \x20              used entries going first (512)\n\
          Bytecode saved as text, a `--` line and then base64, is read as such."
     );
     2
@@ -755,6 +763,13 @@ fn run(args: Vec<String>) -> i32 {
         Some(_) => return usage(),
         None => None,
     };
+    if let Some(i) = args.iter().position(|a| a == "--cache-max-mib") {
+        match args.get(i + 1).and_then(|v| v.parse::<u64>().ok()) {
+            Some(n) => CACHE_MAX_MIB.store(n, std::sync::atomic::Ordering::Relaxed),
+            None => return usage(),
+        }
+        args.drain(i..i + 2);
+    }
     if args.len() >= 2 && args[0] == "--dir" {
         let src = PathBuf::from(&args[1]);
         let dst = match args.iter().position(|a| a == "--out") {
