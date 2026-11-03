@@ -1346,11 +1346,7 @@ pub fn resolve_gotos(mut lines: Vec<String>) -> Option<Vec<String>> {
 fn copy_unless_guards(lines: &mut Vec<String>) {
     let mut k = 0;
     while k < lines.len() {
-        let flag = strip(&lines[k])
-            .strip_prefix("local ")
-            .and_then(|r| r.strip_suffix(" = false"))
-            .filter(|f| f.strip_prefix("jump_").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())))
-            .map(str::to_string);
+        let flag = flag_declared(&lines[k]);
         if let Some(f) = &flag {
             nil_unless_flag(lines, k, f);
         }
@@ -1364,6 +1360,25 @@ fn copy_unless_guards(lines: &mut Vec<String>) {
             _ => k += 1,
         }
     }
+    // what is left is followed through, the last declared first: a flag in
+    // another's code is gone before that code is copied
+    let mut tried: HashSet<String> = HashSet::default();
+    loop {
+        let found = (0..lines.len()).rev().find_map(|k| flag_declared(&lines[k]).filter(|f| !tried.contains(f)).map(|f| (k, f)));
+        let Some((k, f)) = found else { break };
+        if !follow_flag(lines, k, &f) {
+            tried.insert(f);
+        }
+    }
+}
+
+/// `local jump_N = false`: jump_N.
+fn flag_declared(line: &str) -> Option<String> {
+    strip(line)
+        .strip_prefix("local ")
+        .and_then(|r| r.strip_suffix(" = false"))
+        .filter(|f| f.strip_prefix("jump_").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())))
+        .map(str::to_string)
 }
 
 /// `local v  if not F then v = x end  if F or not v then`: wherever F holds,
@@ -1432,6 +1447,331 @@ fn nil_unless_flag(lines: &mut [String], decl: usize, flag: &str) {
             lines[r] = format!("{pad}if not {v} then");
         }
     }
+}
+
+/// What a test comes to once the flag in it is known.
+enum Test {
+    Always(bool),
+    Text(String),
+}
+
+/// A test with F as the first factor of its first term (`F`, `not F`,
+/// `not F and x`, `F or y`, the forms a flag's checks take), F being v:
+/// what is left of it. None when F is read any other way.
+fn known_test(c: &str, flag: &str, v: bool) -> Option<Test> {
+    if !has_word(c, flag) {
+        return Some(Test::Text(c.to_string()));
+    }
+    let terms = split_top_word(c, " or ");
+    let factors = split_top_word(terms[0], " and ");
+    let holds = if factors[0] == flag {
+        v
+    } else if factors[0].strip_prefix("not ") == Some(flag) {
+        !v
+    } else {
+        return None;
+    };
+    if factors[1..].iter().chain(&terms[1..]).any(|x| has_word(x, flag)) {
+        return None;
+    }
+    let others: Vec<&str> = terms[1..].to_vec();
+    if holds {
+        if factors.len() == 1 {
+            return Some(Test::Always(true)); // the first term holds: so does the `or`
+        }
+        let mut parts = vec![factors[1..].join(" and ")];
+        parts.extend(others.iter().map(|t| t.to_string()));
+        return Some(Test::Text(parts.join(" or ")));
+    }
+    if others.is_empty() {
+        return Some(Test::Always(false));
+    }
+    Some(Test::Text(others.join(" or ")))
+}
+
+/// How a block ends: falling out of it with F known (None when its ways
+/// out leave F different ways), or never (`return`, `break`, `continue`).
+#[derive(Clone, Copy, PartialEq)]
+enum End {
+    Falls(Option<bool>),
+    Leaves,
+}
+
+/// Fewest lines the copies a flag's removal makes may add, in all.
+const FOLLOW_GROWTH: usize = 48;
+
+/// The last resort for a flag: follow the code after `local F = false` with
+/// F's value known. A set goes, a test of F is decided (an arm never taken
+/// goes; one always taken is the code), and where the ways out of an `if`
+/// leave F different ways, the statements after it go into each of its
+/// arms, there to be followed with F known again. Nothing is done when F is
+/// read any other way (in a loop or a function), when a copy would hide a
+/// name with one an arm declares, or when the copies add too much.
+fn follow_flag(lines: &mut Vec<String>, decl: usize, flag: &str) -> bool {
+    let d = indent_of(&lines[decl]);
+    let end = (decl + 1..lines.len()).find(|&i| !is_blank(&lines[i]) && indent_of(&lines[i]) < d).unwrap_or(lines.len());
+    // the statements moved into arms must stay where `until` sees them
+    if end < lines.len() && strip(&lines[end]).starts_with("until ") && strip(&lines[end]) != "until true" {
+        return false;
+    }
+    if (0..decl).chain(end..lines.len()).any(|i| has_word(&lines[i], flag)) {
+        return false;
+    }
+    let body: Vec<String> = lines[decl + 1..end].iter().filter(|l| !is_blank(l)).cloned().collect();
+    let Some(stmts) = statements(&body, d) else { return false };
+    let mut budget = 4 * FOLLOW_GROWTH as isize;
+    let Some((new, _)) = follow(&stmts, d, flag, false, &mut budget) else { return false };
+    if new.len() > body.len() + FOLLOW_GROWTH || new.iter().any(|l| has_word(l, flag)) {
+        return false;
+    }
+    lines.splice(decl..end, new);
+    true
+}
+
+/// Statements of a block at indent j followed with F known to be v.
+fn follow(stmts: &[Vec<String>], j: usize, flag: &str, mut v: bool, budget: &mut isize) -> Option<(Vec<String>, End)> {
+    let set = format!("{flag} = true");
+    let mut out: Vec<String> = Vec::new();
+    for (k, s) in stmts.iter().enumerate() {
+        let head = strip(&s[0]);
+        if !s.iter().any(|l| has_word(l, flag)) {
+            out.extend(s.iter().cloned());
+            let t = head;
+            if s.len() == 1 && (t == "break" || t == "continue" || t == "return" || t.starts_with("return ")) {
+                return Some((out, End::Leaves)); // nothing after it runs
+            }
+            continue;
+        }
+        if s.len() == 1 && head == set {
+            v = true;
+            continue;
+        }
+        if s.len() == 1 {
+            out.extend(follow_line(&s[0], flag, v)?);
+            continue;
+        }
+        if !(head.starts_with("if ") && head.ends_with(" then")) {
+            return None; // a loop or a function that reads F
+        }
+        let rest = &stmts[k + 1..];
+        let read_after = rest.iter().flatten().any(|l| has_word(l, flag));
+        let mut after = HashSet::default();
+        for l in rest.iter().flatten() {
+            words_into(&mut after, l);
+        }
+        // the arms alone: if their ends agree, F is known after
+        let mut trial = *budget;
+        let (chain, ends) = follow_chain(s, j, flag, v, &[], &after, &mut trial)?;
+        match ends {
+            End::Falls(Some(w)) => {
+                *budget = trial;
+                out.extend(chain);
+                v = w;
+                continue;
+            }
+            End::Falls(None) if !read_after => {
+                *budget = trial;
+                out.extend(chain);
+                out.extend(rest.iter().flatten().cloned());
+                return Some((out, End::Falls(None)));
+            }
+            End::Leaves if !read_after => {
+                *budget = trial;
+                out.extend(chain);
+                return Some((out, End::Leaves));
+            }
+            End::Leaves => return None,
+            End::Falls(None) => {}
+        }
+        // they disagree, and F is read after: what follows goes into each
+        let (chain, ends) = follow_chain(s, j, flag, v, rest, &HashSet::default(), budget)?;
+        out.extend(chain);
+        return Some((out, ends));
+    }
+    Some((out, End::Falls(Some(v))))
+}
+
+/// A one-line statement reading F, F being v: `if <test> then x end`, or a
+/// value set to an if expression testing F.
+fn follow_line(line: &str, flag: &str, v: bool) -> Option<Vec<String>> {
+    let pad = spaces(indent_of(line));
+    let t = strip(line);
+    if let Some(r) = t.strip_prefix("if ").and_then(|r| r.strip_suffix(" end")) {
+        let th = top_level_then(&format!("{r} "))?;
+        let (c, then) = (&r[..th], r.get(th + 6..)?);
+        if top_level_word(then, " else ").is_some() || top_level_word(then, " elseif ").is_some() || has_word(then, flag) {
+            return None;
+        }
+        return Some(match known_test(c, flag, v)? {
+            Test::Always(true) => vec![format!("{pad}{then}")],
+            Test::Always(false) => Vec::new(),
+            Test::Text(c) => vec![format!("{pad}if {c} then {then} end")],
+        });
+    }
+    let at = t.find(" = if ")?;
+    let rest = &t[at + 6..];
+    let th = top_level_then(rest)?;
+    let (c, arms) = (&rest[..th], &rest[th + 6..]);
+    let el = top_level_word(arms, " else ")?;
+    let (a, b) = (&arms[..el], &arms[el + 6..]);
+    if top_level_word(a, " elseif ").is_some() || has_word(a, flag) || has_word(b, flag) {
+        return None;
+    }
+    let lhs = &t[..at];
+    Some(vec![match known_test(c, flag, v)? {
+        Test::Always(true) => format!("{pad}{lhs} = {a}"),
+        Test::Always(false) => format!("{pad}{lhs} = {b}"),
+        Test::Text(c) => format!("{pad}{lhs} = if {c} then {a} else {b}"),
+    }])
+}
+
+/// The first `word` (spaced) in s outside brackets and strings.
+fn top_level_word(s: &str, word: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let (mut depth, mut quote) = (0i32, None::<u8>);
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        match quote {
+            Some(q) => {
+                if c == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                b'"' | b'\'' | b'`' => quote = Some(c),
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => depth -= 1,
+                _ if depth == 0 && s[i..].starts_with(word) => return Some(i),
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    None
+}
+
+/// An `if` chain (its lines, at indent j) followed with F known to be v,
+/// `rest` going into each arm after its own statements; `after` holds the
+/// words of what still follows it.
+fn follow_chain(
+    chain: &[String],
+    j: usize,
+    flag: &str,
+    v: bool,
+    rest: &[Vec<String>],
+    after: &HashSet<String>,
+    budget: &mut isize,
+) -> Option<(Vec<String>, End)> {
+    if strip(chain.last()?) != "end" || indent_of(chain.last()?) != j {
+        return None;
+    }
+    let mut arms: Vec<(Option<String>, Vec<String>)> = Vec::new();
+    for l in &chain[..chain.len() - 1] {
+        let t = strip(l);
+        if indent_of(l) == j && t == "else" {
+            arms.push((None, Vec::new()));
+        } else if indent_of(l) == j && (t.starts_with("if ") || t.starts_with("elseif ")) && t.ends_with(" then") {
+            let c = t.strip_prefix("if ").or_else(|| t.strip_prefix("elseif "))?.strip_suffix(" then")?;
+            arms.push((Some(c.to_string()), Vec::new()));
+        } else {
+            arms.last_mut()?.1.push(l.clone());
+        }
+    }
+    if !arms.iter().any(|a| a.0.is_none()) {
+        arms.push((None, Vec::new())); // the way past every arm
+    }
+    let moved: Vec<String> = rest.iter().flatten().map(|l| format!("    {l}")).collect();
+    if moved.iter().any(|l| strip(l).starts_with("local jump_") && strip(l).ends_with(" = false")) {
+        return None; // another flag would be copied
+    }
+    let mut words = HashSet::default();
+    for l in &moved {
+        words_into(&mut words, l);
+    }
+    let mut new_arms: Vec<(Option<String>, Vec<String>)> = Vec::new();
+    let mut ends: Vec<End> = Vec::new();
+    for (cond, body) in arms {
+        let c = match &cond {
+            None => None,
+            Some(c) => match known_test(c, flag, v)? {
+                Test::Always(false) => continue,
+                Test::Always(true) => None,
+                Test::Text(t) => Some(t),
+            },
+        };
+        let last = c.is_none();
+        let mut lines = body;
+        if !moved.is_empty() {
+            let top: Vec<String> = lines.iter().filter(|l| indent_of(l) == j + 4).cloned().collect();
+            if declares_any(&top, &words) {
+                return None; // the arm's own name would hide the one read after
+            }
+            *budget -= moved.len() as isize;
+            if *budget < 0 {
+                return None;
+            }
+            lines.extend(moved.iter().cloned());
+        }
+        let (new_body, end) = follow(&statements(&lines, j + 4)?, j + 4, flag, v, budget)?;
+        new_arms.push((c, new_body));
+        ends.push(end);
+        if last {
+            break; // an arm always taken: those after it never are
+        }
+    }
+    let falls: Vec<Option<bool>> = ends.iter().filter_map(|e| if let End::Falls(x) = e { Some(*x) } else { None }).collect();
+    let end = match falls.first() {
+        None => End::Leaves,
+        Some(f) if f.is_some() && falls.iter().all(|x| x == f) => End::Falls(*f),
+        Some(_) => End::Falls(None),
+    };
+    Some((chain_lines(new_arms, j, after), end))
+}
+
+/// An `if` chain from its arms (None: `else`) at indent j. A first arm
+/// always taken is its own code, in a `do` block when it declares a name
+/// read after it (in `after`).
+fn chain_lines(mut arms: Vec<(Option<String>, Vec<String>)>, j: usize, after: &HashSet<String>) -> Vec<String> {
+    let pad = spaces(j);
+    if arms.len() > 1 && arms.last().is_some_and(|a| a.0.is_none() && a.1.is_empty()) {
+        arms.pop(); // an empty else
+    }
+    // `if c then else B end` is `if not c then B end`
+    if let [(Some(c), a), (None, b)] = &arms[..] {
+        if a.is_empty() {
+            let mut out = vec![format!("{pad}if {} then", negated_if(c))];
+            out.extend(b.iter().cloned());
+            out.push(format!("{pad}end"));
+            return out;
+        }
+    }
+    let Some(first) = arms.first() else { return Vec::new() };
+    if first.0.is_none() {
+        let body = &first.1;
+        let top: Vec<String> = body.iter().filter(|l| indent_of(l) == j + 4).cloned().collect();
+        if declares_any(&top, after) {
+            let mut out = vec![format!("{pad}do")];
+            out.extend(body.iter().cloned());
+            out.push(format!("{pad}end"));
+            return out;
+        }
+        return body.iter().map(|l| l[4.min(indent_of(l))..].to_string()).collect();
+    }
+    let mut out = Vec::new();
+    for (k, (c, body)) in arms.into_iter().enumerate() {
+        match c {
+            Some(c) => out.push(format!("{pad}{} {c} then", if k == 0 { "if" } else { "elseif" })),
+            None => out.push(format!("{pad}else")),
+        }
+        out.extend(body);
+    }
+    out.push(format!("{pad}end"));
+    out
 }
 
 /// `if a then if b then F = true end end  if F or c then`: an `if` of tests
