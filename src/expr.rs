@@ -602,7 +602,7 @@ pub fn list_texts(exprs: &[E], fixed: bool) -> Vec<String> {
 pub fn lua_string(b: &[u8]) -> String {
     let mut out = String::with_capacity(b.len() + 2);
     out.push('"');
-    for &c in b {
+    for (i, &c) in b.iter().enumerate() {
         match c {
             0x5C => out.push_str("\\\\"),
             0x22 => out.push_str("\\\""),
@@ -611,8 +611,10 @@ pub fn lua_string(b: &[u8]) -> String {
             0x09 => out.push_str("\\t"),
             32..=126 => out.push(c as char),
             _ => {
-                out.push('\\');
-                out.push_str(&c.to_string());
+                // a decimal escape reads up to three digits: before a digit
+                // it has all three, or `\7` `1` would read as `\71`
+                let digit_next = b.get(i + 1).is_some_and(u8::is_ascii_digit);
+                out.push_str(&if digit_next { format!("\\{c:03}") } else { format!("\\{c}") });
             }
         }
     }
@@ -731,6 +733,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn escapes_before_a_digit_have_three_digits() {
+        assert_eq!(lua_string(&[7, b'1']), "\"\\0071\"");
+        assert_eq!(lua_string(&[7, b'x']), "\"\\7x\"");
+        assert_eq!(lua_string(&[200, b'9']), "\"\\2009\"");
+        assert_eq!(lua_string(&[b'a', 1, b'2']), "\"a\\0012\"");
+    }
+
+    #[test]
     fn numbers_print_shortest() {
         assert_eq!(fmt_number(0.5), "0.5");
         assert_eq!(fmt_number(-4.0), "-4");
@@ -741,7 +751,12 @@ mod tests {
         assert_eq!(fmt_number(1.5e300), "1.5e+300");
         assert_eq!(fmt_number(0.0001), "0.0001");
         assert_eq!(fmt_number(1e-5), "1e-05");
+        // `math.huge` only where the library constants are known to fold
+        assert_eq!(fmt_number(f64::INFINITY), "1e999");
+        set_library_constants(true);
         assert_eq!(fmt_number(f64::INFINITY), "math.huge");
+        assert_eq!(fmt_number(f64::NEG_INFINITY), "-math.huge");
+        set_library_constants(false);
         assert_eq!(fmt_number(-f64::NAN), "0/0");
         assert_eq!(fmt_number(f64::NAN.copysign(1.0)), "-(0/0)");
     }
