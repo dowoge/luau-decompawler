@@ -1497,8 +1497,8 @@ enum End {
     Leaves,
 }
 
-/// Fewest lines the copies a flag's removal makes may add, in all.
-const FOLLOW_GROWTH: usize = 48;
+/// Most lines the copies a flag's removal makes may add, in all.
+const FOLLOW_GROWTH: usize = 80;
 
 thread_local! {
     /// LUAU_WHY: what stopped the last flag followed.
@@ -1529,7 +1529,9 @@ fn follow_flag(lines: &mut Vec<String>, decl: usize, flag: &str) -> bool {
     }
     let body: Vec<String> = lines[decl + 1..end].iter().filter(|l| !is_blank(l)).cloned().collect();
     let Some(stmts) = statements(&body, d) else { return false };
-    let mut budget = 4 * FOLLOW_GROWTH as isize;
+    // what the copies made on the way may come to, which keeps the time
+    // bounded; the lines added in the end are what decide
+    let mut budget = (8 * body.len() + 1000) as isize;
     FOLLOW_WHY.with(|c| c.set(""));
     let got = follow(&stmts, d, flag, false, &mut budget);
     let why = match &got {
