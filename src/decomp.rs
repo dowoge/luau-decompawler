@@ -366,6 +366,9 @@ pub struct Ctx<'m> {
     /// its span, the line of another helper whose copy its code starts with.
     /// A copy of it starts on that line.
     first_line: Vec<Option<u32>>,
+    /// The module folds and fast-calls builtins (-O1 up, `math` left alone,
+    /// no getfenv): a builtin called with no FASTCALL was spelled not to be.
+    builtins_fold: bool,
     /// Per function, which of its upvalues a closure shares by reference.
     byref_ups: Vec<Vec<bool>>,
     /// Functions no other lists as a child: only ever inlined, like
@@ -796,6 +799,39 @@ fn library_constants_fold(m: &Module) -> bool {
     })
 }
 
+/// A function Luau's compiler knows as a builtin (Compiler/src/Builtins.cpp):
+/// a call to it by that name is fast-called, or folded on constants.
+fn is_luau_builtin(name: &str) -> bool {
+    const GLOBALS: &[&str] = &[
+        "assert", "type", "typeof", "rawset", "rawget", "rawequal", "rawlen", "unpack", "select",
+        "getmetatable", "setmetatable", "tonumber", "tostring",
+    ];
+    const MATH: &[&str] = &[
+        "abs", "acos", "asin", "atan2", "atan", "ceil", "cosh", "cos", "deg", "exp", "floor", "fmod",
+        "frexp", "ldexp", "log10", "log", "max", "min", "modf", "pow", "rad", "sinh", "sin", "sqrt",
+        "tanh", "tan", "clamp", "sign", "round", "lerp", "isnan", "isinf", "isfinite",
+    ];
+    const BIT32: &[&str] = &[
+        "arshift", "band", "bnot", "bor", "bxor", "btest", "extract", "lrotate", "lshift", "replace",
+        "rrotate", "rshift", "countlz", "countrz", "byteswap",
+    ];
+    match name.split_once('.') {
+        None => GLOBALS.contains(&name),
+        Some(("math", f)) => MATH.contains(&f),
+        Some(("bit32", f)) => BIT32.contains(&f),
+        Some(("string", f)) => matches!(f, "byte" | "char" | "len" | "sub"),
+        Some(("table", f)) => matches!(f, "insert" | "unpack"),
+        _ => false,
+    }
+}
+
+/// A literal: a number, a string, true, false or nil.
+fn is_literal(t: &str) -> bool {
+    matches!(t, "true" | "false" | "nil")
+        || (t.starts_with('"') && t.ends_with('"') && t.len() >= 2)
+        || t.trim_start_matches('-').parse::<f64>().is_ok()
+}
+
 /// The module was compiled at -O1 or more: it shows a FASTCALL or a
 /// DUPCLOSURE, which only those levels write. Constants fold there.
 fn module_folds(m: &Module) -> bool {
@@ -894,6 +930,7 @@ pub fn decompile_lines(m: &Module, noflat: bool) -> Vec<String> {
         helpers: RefCell::new(helpers),
         spans,
         first_line,
+        builtins_fold: folds && library_constants_fold(m),
         orphans,
         defs,
         def_upvals: RefCell::new(HashMap::default()),
@@ -4163,6 +4200,15 @@ impl<'c, 'm> Dec<'c, 'm> {
     /// Is the call at pc one of Luau's builtins that return one value? A
     /// FASTCALL that names it says so, and at -O2 the compiler never lets
     /// such a call return more: no parentheses are needed to keep it to one.
+    /// Is the CALL at pc a FASTCALL's fallback?
+    fn fastcalled(&self, pc: i32) -> bool {
+        let Some(at) = self.flow.idx(pc) else { return false };
+        self.p.code[..at].iter().rev().take(48).any(|i| {
+            matches!(i.op, op::FASTCALL | op::FASTCALL1 | op::FASTCALL2 | op::FASTCALL2K | op::FASTCALL3)
+                && i.pc + 1 + i.c() as i32 == pc
+        })
+    }
+
     fn builtin_one(&self, pc: i32) -> bool {
         let Some(at) = self.flow.idx(pc) else { return false };
         self.p.code[..at]
@@ -5792,7 +5838,18 @@ impl<'c, 'm> Dec<'c, 'm> {
                 }
                 let args: Vec<E> = (first..first + nargs.max(0) as usize).map(|r| self.get(r)).collect();
                 let texts = list_texts(&args, b != 0);
-                let call = ex(format!("{}({})", wrap(&f, 100), texts.join(", ")), 100);
+                // a builtin called on constants with no FASTCALL: the source
+                // spelled it so Luau saw no builtin (`(math.abs)(-17)`); plain,
+                // it would fold, or be fast-called
+                let unfolded = b >= 2
+                    && args.len() <= 3
+                    && !self_call
+                    && is_luau_builtin(&f.borrow().text)
+                    && args.iter().all(|a| is_literal(&a.borrow().text))
+                    && self.ctx.builtins_fold
+                    && !self.fastcalled(pc);
+                let callee = if unfolded { format!("({})", f.borrow().text) } else { wrap(&f, 100) };
+                let call = ex(format!("{callee}({})", texts.join(", ")), 100);
                 call.borrow_mut().one = c == 2 && !self.builtin_one(pc);
                 // above the arguments: the call overwrites it, so nothing reads
                 // it, but it may have effects, and those come first
