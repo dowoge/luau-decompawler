@@ -1366,10 +1366,166 @@ fn copy_unless_guards(lines: &mut Vec<String>) {
     loop {
         let found = (0..lines.len()).rev().find_map(|k| flag_declared(&lines[k]).filter(|f| !tried.contains(f)).map(|f| (k, f)));
         let Some((k, f)) = found else { break };
-        if !follow_flag(lines, k, &f) {
+        if !follow_flag(lines, k, &f) && !break_for_flag(lines, k, &f) {
             tried.insert(f);
         }
     }
+}
+
+/// `local F = false  if ... end  if not F then S end`, every set of F going
+/// straight to the check: `repeat if ... end S until true`, each set a
+/// `break` past S. Nothing is copied, so S may be long; neither part may
+/// have a `break` or `continue` of its own (the `repeat` would take it).
+/// The check may be `if not F and x then A end`, S being `if x then A end`;
+/// or open a `repeat`: `repeat if not F then S break end R until true`
+/// becomes `repeat if ... end S until true` with each set `R break`, and
+/// S and R keep the ways out they had (they were in a `repeat` already).
+fn break_for_flag(lines: &mut Vec<String>, decl: usize, flag: &str) -> bool {
+    let set = format!("{flag} = true");
+    let check = format!("if not {flag} then");
+    let uses: Vec<usize> = (0..lines.len()).filter(|&i| i != decl && has_word(&lines[i], flag)).collect();
+    let reads: Vec<usize> = uses.iter().copied().filter(|&i| strip(&lines[i]) != set).collect();
+    let [c] = reads[..] else { return false };
+    if c < decl {
+        return false;
+    }
+    let ci = indent_of(&lines[c]);
+    let e = arm_end(lines, c);
+    let and_test = strip(&lines[c])
+        .strip_prefix(&format!("if not {flag} and ") as &str)
+        .and_then(|r| r.strip_suffix(" then"))
+        .map(str::to_string);
+    if strip(&lines[c]) != check && and_test.is_none() {
+        return false;
+    }
+    // `if not F and x then A else B end`: B is what the sets run
+    let mut els: Option<usize> = None;
+    let e = if e < lines.len() && indent_of(&lines[e]) == ci && strip(&lines[e]) == "else" && and_test.is_some() {
+        els = Some(e);
+        arm_end(lines, e)
+    } else {
+        e
+    };
+    if e >= lines.len() || indent_of(&lines[e]) != ci || strip(&lines[e]) != "end" {
+        return false;
+    }
+    // the `repeat` the check opens, if it does: its `break` after S and R
+    let opener = (decl + 1..c).rev().find(|&i| !is_blank(&lines[i]));
+    let in_repeat = opener.is_some_and(|o| strip(&lines[o]) == "repeat" && indent_of(&lines[o]) + 4 == ci);
+    // (the base indent of R's lines is the fifth value)
+    let (d, s, r, stop, before, r_base) = if in_repeat {
+        let open = opener.unwrap();
+        let u = arm_end(lines, open);
+        if and_test.is_some() || u >= lines.len() || strip(&lines[u]) != "until true" || indent_of(&lines[u]) + 4 != ci {
+            return false;
+        }
+        let body: Vec<usize> = (c + 1..e).filter(|&i| !is_blank(&lines[i])).collect();
+        let Some(&brk) = body.last() else { return false };
+        if strip(&lines[brk]) != "break" || indent_of(&lines[brk]) != ci + 4 {
+            return false;
+        }
+        // S one level out, at the `repeat`'s body; R where it is
+        let s: Vec<String> = body[..body.len() - 1].iter().map(|&i| lines[i][4..].to_string()).collect();
+        let r: Vec<String> = (e + 1..u).filter(|&i| !is_blank(&lines[i])).map(|i| lines[i].clone()).collect();
+        (ci - 4, s, r, u, open, ci)
+    } else {
+        let s: Vec<String> = match &and_test {
+            None => lines[c + 1..e].to_vec(),
+            Some(x) => {
+                let mut v = vec![format!("{}if {x} then", spaces(ci))];
+                v.extend(lines[c + 1..e].iter().cloned());
+                v.push(format!("{}end", spaces(ci)));
+                v.iter().map(|l| if is_blank(l) { String::new() } else { format!("    {l}") }).collect()
+            }
+        };
+        let r: Vec<String> = match els {
+            Some(x) => (x + 1..e).filter(|&i| !is_blank(&lines[i])).map(|i| lines[i].clone()).collect(),
+            None => Vec::new(),
+        };
+        (ci, s, r, e, c, ci + 4)
+    };
+    // the `if` before it, but for bare declarations
+    let mut lifted: Vec<String> = Vec::new();
+    let mut at = before;
+    let chain_end = loop {
+        let Some(i) = (decl + 1..at).rev().find(|&i| !is_blank(&lines[i])) else { return false };
+        if indent_of(&lines[i]) == d && is_bare_local(strip(&lines[i])) {
+            lifted.insert(0, lines[i].clone());
+            at = i;
+            continue;
+        }
+        break i;
+    };
+    if indent_of(&lines[chain_end]) != d || strip(&lines[chain_end]) != "end" {
+        return false;
+    }
+    let Some(first) = (decl + 1..chain_end).rev().find(|&i| indent_of(&lines[i]) == d && !is_blank(&lines[i]) && !is_arm(strip(&lines[i]))) else {
+        return false;
+    };
+    if !strip(&lines[first]).starts_with("if ") || if_end(lines, first) != Some(chain_end) {
+        return false;
+    }
+    // F still false where the `if` starts, and set only inside it, each set
+    // the last thing done before the check
+    let around = |p: usize| (loop_open(&lines[p]) || strip(&lines[p]).contains("function")) && arm_end(lines, p) > first;
+    if (decl + 1..first).any(|p| around(p) || has_word(&lines[p], flag)) {
+        return false;
+    }
+    let sets: Vec<usize> = uses.iter().copied().filter(|&i| i != c).collect();
+    let next = (chain_end + 1..lines.len()).find(|&i| !is_blank(&lines[i])).unwrap_or(lines.len());
+    let names: Vec<&str> = lifted.iter().filter_map(|l| strip(l).strip_prefix("local ")).flat_map(|n| n.split(", ")).collect();
+    let mut r_words = HashSet::default();
+    for l in &r {
+        words_into(&mut r_words, l);
+    }
+    let why = if sets.is_empty() || sets.iter().any(|&i| i < first || i > chain_end) {
+        "a set outside the if"
+    } else if !sets.iter().all(|&i| goes_straight_to(lines, i, next, d)) {
+        "a set code follows"
+    } else if has_own_exit(&lines[first..=chain_end]) || (!in_repeat && has_own_exit(&s)) {
+        "a way out the repeat would take"
+    } else if lines[first..=chain_end].iter().any(|l| names.iter().any(|n| has_word(l, n))) || declares_any(&lines[first..=chain_end], &r_words) {
+        "a name would be another"
+    } else if sets.len() * r.len() > 40 {
+        "too many lines copied"
+    } else {
+        ""
+    };
+    if !why.is_empty() {
+        if std::env::var_os("LUAU_WHY").is_some() {
+            eprintln!("NOBREAK\t{flag}\t{why}");
+        }
+        return false;
+    }
+    let pad = spaces(d);
+    let mut new: Vec<String> = lifted;
+    new.push(format!("{pad}repeat"));
+    for (i, l) in lines.iter().enumerate().take(chain_end + 1).skip(first) {
+        if sets.contains(&i) {
+            // R where the set was, then out past S
+            let at = indent_of(l) + 4;
+            for x in &r {
+                new.push(format!("{}{}", spaces(at + indent_of(x) - r_base), strip(x)));
+            }
+            // (not after a way out R ends with itself)
+            let ends = r.last().is_some_and(|x| {
+                let t = strip(x);
+                indent_of(x) == r_base && (t == "break" || t == "continue" || t == "return" || t.starts_with("return "))
+            });
+            if !ends {
+                new.push(format!("{}break", spaces(at)));
+            }
+        } else if is_blank(l) {
+            new.push(String::new());
+        } else {
+            new.push(format!("    {l}"));
+        }
+    }
+    new.extend(s);
+    new.push(format!("{pad}until true"));
+    lines.splice(first..=stop, new);
+    lines.remove(decl);
+    true
 }
 
 /// `local a` or `local a, b`: names declared with no value.
