@@ -1344,6 +1344,7 @@ pub fn resolve_gotos(mut lines: Vec<String>) -> Option<Vec<String>> {
 /// a set becomes nothing, and the flag goes. S is short, and reads no name
 /// the `if` declares.
 fn copy_unless_guards(lines: &mut Vec<String>) {
+    unique_flags(lines);
     let mut k = 0;
     while k < lines.len() {
         let flag = flag_declared(&lines[k]);
@@ -1356,14 +1357,22 @@ fn copy_unless_guards(lines: &mut Vec<String>) {
                     || copy_unless_repeat(lines, k, &f)
                     || repeat_unless(lines, k, &f)
                     || value_for_flag(lines, k, &f)
-                    || condition_for_flag(lines, k, &f) => {}
+                    || condition_for_flag(lines, k, &f) =>
+            {
+                // what was copied may hold another flag, now declared twice
+                unique_flags(lines);
+            }
             _ => k += 1,
         }
     }
     // what is left is followed through, the last declared first: a flag in
-    // another's code is gone before that code is copied
+    // another's code is gone before that code is copied. A flag that could
+    // not go, copied with that code, is tried again in each place.
     let mut tried: HashSet<String> = HashSet::default();
-    loop {
+    for _ in 0..10_000 {
+        for f in unique_flags(lines) {
+            tried.remove(&f);
+        }
         let found = (0..lines.len()).rev().find_map(|k| flag_declared(&lines[k]).filter(|f| !tried.contains(f)).map(|f| (k, f)));
         let Some((k, f)) = found else { break };
         if !follow_flag(lines, k, &f) && !break_for_flag(lines, k, &f) {
@@ -1531,6 +1540,34 @@ fn break_for_flag(lines: &mut Vec<String>, decl: usize, flag: &str) -> bool {
 /// `local a` or `local a, b`: names declared with no value.
 fn is_bare_local(t: &str) -> bool {
     t.strip_prefix("local ").is_some_and(|r| r.split(", ").all(is_token))
+}
+
+/// A flag declared again, its code copied (both arms of an `or`): each
+/// declaration after the first takes a number of its own in its block. The
+/// passes find a flag by name, and a copy's uses would be the other's too.
+/// Returns the names that were declared more than once.
+fn unique_flags(lines: &mut [String]) -> Vec<String> {
+    let number = |f: &str| f.strip_prefix("jump_").and_then(|n| n.parse::<u64>().ok());
+    let mut next = lines.iter().filter_map(|l| number(&flag_declared(l)?)).max().unwrap_or(0);
+    let mut seen: HashSet<String> = HashSet::default();
+    let mut twice: Vec<String> = Vec::new();
+    for k in 0..lines.len() {
+        let Some(f) = flag_declared(&lines[k]) else { continue };
+        if seen.insert(f.clone()) {
+            continue;
+        }
+        let d = indent_of(&lines[k]);
+        let end = (k + 1..lines.len()).find(|&i| !is_blank(&lines[i]) && indent_of(&lines[i]) < d).unwrap_or(lines.len());
+        next += 1;
+        let new = format!("jump_{next}");
+        if rename_lines(lines, &(k..end).collect::<Vec<_>>(), &f, &new) {
+            seen.insert(new);
+            if !twice.contains(&f) {
+                twice.push(f);
+            }
+        }
+    }
+    twice
 }
 
 /// `local jump_N = false`: jump_N.
