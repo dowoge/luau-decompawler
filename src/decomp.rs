@@ -1815,6 +1815,80 @@ impl<'c, 'm> Dec<'c, 'm> {
         code[start..].iter().take_while(|i| i.pc < to).map(|i| i.pc).find(|pc| self.flow.use_web(*pc, r).is_some())
     }
 
+    /// Is r, given at pc a value nothing reads, in the place of an argument of
+    /// a helper's copy that starts just after, for a parameter the helper never
+    /// reads? Only straight code runs between: the argument code.
+    fn feeds_copy(&self, pc: i32, r: usize) -> bool {
+        if self.flat {
+            return false;
+        }
+        let Some(i) = self.flow.idx(pc) else { return false };
+        let code = &self.p.code;
+        let next = code.get(i + 1).map_or(i32::MAX, |c| c.pc);
+        if self.live_at(next, r) {
+            return false;
+        }
+        for ins in code[i + 1..].iter().take(24) {
+            if let Some((call, _)) = self.inline_at(ins.pc) {
+                let unread = (0..call.args.len()).any(|k| call.args[k].is_none() && !call.omitted.get(k).copied().unwrap_or(false));
+                return unread && call.result.is_none_or(|t| r >= t + call.results.max(1)) && !self.live_at(call.end, r);
+            }
+            if ins.jump_target().is_some() || self.has_label(ins.pc) || ins.op == op::RETURN {
+                return false;
+            }
+        }
+        false
+    }
+
+    /// Where each parameter the helper never reads had its argument. Luau gives
+    /// every parameter whose argument is an expression a register of its own,
+    /// in order, above the call's result, and evaluates the argument there
+    /// whether or not the helper reads it (a constant or a local takes none).
+    /// A value waiting in such a place, dead after the copy and in order with
+    /// the registers of the arguments read, is that argument.
+    fn unread_args(&self, call: &Inlined) -> Vec<Option<usize>> {
+        let n = call.args.len();
+        let mut slots = vec![None; n];
+        let unread = |i: usize| call.args[i].is_none() && !call.omitted.get(i).copied().unwrap_or(false);
+        if !(0..n).any(unread) {
+            return slots;
+        }
+        let above = |r: usize| call.result.is_none_or(|t| r >= t + call.results.max(1));
+        // an argument read from above the result had a register of its own,
+        // waiting or written out by now; one below is a local's
+        let temp = |i: usize| match &call.args[i] {
+            Some(Arg::Reg(r, _)) if self.pending.contains_key(r) || (call.result.is_some() && above(*r)) => Some(*r),
+            _ => None,
+        };
+        let read: Vec<usize> = (0..n).filter_map(temp).collect();
+        let mut free: Vec<usize> = self
+            .pending
+            .keys()
+            .copied()
+            .filter(|r| above(*r) && !read.contains(r) && !self.live_at(call.end, *r))
+            .collect();
+        free.sort_unstable();
+        // read registers are in order too, or the guess is no better than none
+        if read.windows(2).any(|w| w[0] >= w[1]) {
+            return slots;
+        }
+        let mut at = 0;
+        for i in 0..n {
+            if let Some(r) = temp(i) {
+                while free.get(at).is_some_and(|f| *f <= r) {
+                    at += 1;
+                }
+            } else if unread(i) {
+                let next_read = (i + 1..n).find_map(temp);
+                if let Some(&f) = free.get(at).filter(|f| next_read.is_none_or(|t| **f < t)) {
+                    slots[i] = Some(f);
+                    at += 1;
+                }
+            }
+        }
+        slots
+    }
+
     /// Put the call back where a helper's code was copied in. The pc after it.
     fn helper_call(&mut self, out: &mut Vec<String>, ind: usize, pc: i32) -> Option<i32> {
         let (call, name) = self.inline_at(pc)?;
@@ -1834,9 +1908,15 @@ impl<'c, 'm> Dec<'c, 'm> {
                 self.assign(out, ind, *r, &e);
             }
         }
+        let unread = self.unread_args(&call);
         let mut args: Vec<String> = Vec::with_capacity(call.args.len());
-        for arg in &call.args {
+        for (i, arg) in call.args.iter().enumerate() {
             args.push(match arg {
+                None if unread[i].is_some() => {
+                    let v = self.get(unread[i]?);
+                    let text = v.borrow().text.clone();
+                    text
+                }
                 Some(Arg::Reg(r, read)) => {
                     self.declare_named(out, ind, *r);
                     let at = if self.flow.use_web(*read, *r).is_some() { *read } else { self.known_read(pc, call.end, *r).unwrap_or(*read) };
@@ -1850,7 +1930,16 @@ impl<'c, 'm> Dec<'c, 'm> {
                 None => "nil".to_string(),
             });
         }
+        // a value that waited for this call, which took it for no argument: a
+        // statement, as it would have been
+        let left: Vec<usize> = self.pending.iter().filter(|(_, e)| e.borrow().for_copy).map(|(r, _)| *r).collect();
+        for r in left {
+            let e = self.get(r);
+            e.borrow_mut().for_copy = false;
+            self.assign(out, ind, r, &e);
+        }
         while args.last().is_some_and(|a| a == "nil")
+            && unread[args.len() - 1].is_none()
             && (call.args[args.len() - 1].is_none() || call.omitted.get(args.len() - 1).copied().unwrap_or(false))
         {
             args.pop();
@@ -2331,7 +2420,7 @@ impl<'c, 'm> Dec<'c, 'm> {
             let has_call = x.fields.as_ref().is_some_and(|f| f.iter().any(|t| t.contains('(')));
             if is_call_text(&x.text) {
                 out.push(format!("{}{}", sp(ind), x.text));
-            } else if has_call || (x.fields.is_none() && x.text.contains('(') && !x.text.starts_with("function")) {
+            } else if x.for_copy || has_call || (x.fields.is_none() && x.text.contains('(') && !x.text.starts_with("function")) {
                 // a table nothing reads, built with calls, or another value
                 // with calls in it: those still happen
                 drop(x);
@@ -2341,6 +2430,13 @@ impl<'c, 'm> Dec<'c, 'm> {
         }
         let pc = self.cur_pc;
         let inline = inline && !self.overwrites_waiting(r);
+        // nothing reads it, but a call put back just after may take it (one
+        // with effects still goes out first if a statement comes between)
+        if inline && self.feeds_copy(pc, r) {
+            e.borrow_mut().for_copy = true;
+            self.pset(r, e);
+            return;
+        }
         if inline && (self.read_once(pc, r) || (self.in_region && self.reaches_join_unread(pc, r))) {
             // the variable this value was computed for, at this register
             let k = self.flow.def_web(pc, r).map(|w| KW + w).unwrap_or_else(|| self.var_key(r));

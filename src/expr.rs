@@ -66,6 +66,9 @@ pub struct X {
     /// A snapshot of a local register (not of an upvalue): printed as the
     /// local, Luau would read it where it is used.
     pub local_copy: bool,
+    /// Read by nothing, waiting for a helper's call copied in just after:
+    /// the argument of a parameter the helper never reads.
+    pub for_copy: bool,
     /// The names a constructor's fields or a closure's captures read: all a
     /// constructor or closure reads when it is made (a body runs later).
     pub names_read: HashSet<u64>,
@@ -104,6 +107,7 @@ pub fn ex(text: impl Into<String>, prec: i32) -> E {
         constructor: false,
         newtable: false,
         local_copy: false,
+        for_copy: false,
         names_read: HashSet::default(),
     }))
 }
