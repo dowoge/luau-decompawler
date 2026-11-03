@@ -1358,6 +1358,7 @@ fn copy_unless_guards(lines: &mut Vec<String>) {
             Some(f)
                 if copy_unless(lines, k, &f)
                     || copy_unless_repeat(lines, k, &f)
+                    || repeat_unless(lines, k, &f)
                     || value_for_flag(lines, k, &f)
                     || condition_for_flag(lines, k, &f) => {}
             _ => k += 1,
@@ -2133,8 +2134,12 @@ fn statements(body: &[String], j: usize) -> Option<Vec<Vec<String>>> {
 }
 
 /// An `if` chain (its lines, at indent j) with S at the end of each arm that
-/// comes out of it, and the sets of the flag gone.
+/// comes out of it, and R in place of each set of the flag.
 fn unless_chain(chain: &[String], j: usize, flag: &str, s: &[String], copies: &mut usize) -> Option<Vec<String>> {
+    dispatch_chain(chain, j, flag, s, &[], copies)
+}
+
+fn dispatch_chain(chain: &[String], j: usize, flag: &str, s: &[String], r: &[String], copies: &mut usize) -> Option<Vec<String>> {
     let pad = spaces(j);
     if strip(chain.last()?) != "end" || indent_of(chain.last()?) != j {
         return None;
@@ -2156,7 +2161,7 @@ fn unless_chain(chain: &[String], j: usize, flag: &str, s: &[String], copies: &m
     let has_else = arms.iter().any(|a| strip(&a.0) == "else");
     let mut new_arms: Vec<(String, Vec<String>)> = Vec::new();
     for (head, body) in &arms {
-        new_arms.push((head.clone(), unless_body(body, j + 4, flag, s, copies)?));
+        new_arms.push((head.clone(), unless_body(body, j + 4, flag, s, r, copies)?));
     }
     if !has_else {
         *copies += 1;
@@ -2180,9 +2185,10 @@ fn unless_chain(chain: &[String], j: usize, flag: &str, s: &[String], copies: &m
 }
 
 /// One arm's body (at indent j): its last statement decides. A set of the
-/// flag goes; an `if` chain takes S in its own arms; a way out (`return`,
-/// `break`, `continue`) needs nothing; anything else is followed by S.
-fn unless_body(body: &[String], j: usize, flag: &str, s: &[String], copies: &mut usize) -> Option<Vec<String>> {
+/// flag becomes R; an `if` chain takes S in its own arms; a way out
+/// (`return`, `break`, `continue`) needs nothing; anything else is followed
+/// by S.
+fn unless_body(body: &[String], j: usize, flag: &str, s: &[String], r: &[String], copies: &mut usize) -> Option<Vec<String>> {
     let stmts = statements(body, j)?;
     let copy = |copies: &mut usize| -> Vec<String> {
         *copies += 1;
@@ -2195,6 +2201,7 @@ fn unless_body(body: &[String], j: usize, flag: &str, s: &[String], copies: &mut
     let mut out: Vec<String> = before.iter().flatten().cloned().collect();
     let t = strip(&last[0]);
     if last.len() == 1 && t == format!("{flag} = true") {
+        out.extend(r.iter().map(|l| format!("{}{l}", spaces(j))));
         return Some(out);
     }
     if !last.iter().any(|l| has_word(l, flag)) {
@@ -2206,10 +2213,98 @@ fn unless_body(body: &[String], j: usize, flag: &str, s: &[String], copies: &mut
         return Some(out);
     }
     if t.starts_with("if ") && t.ends_with(" then") {
-        out.extend(unless_chain(last, j, flag, s, copies)?);
+        out.extend(dispatch_chain(last, j, flag, s, r, copies)?);
         return Some(out);
     }
     None
+}
+
+/// `local F = false  if ... end  repeat if not F then S break end R until
+/// true`: the `repeat` is `if not F then S else R end`, so S goes at each
+/// end of the `if` that sets F and R in place of each set, when neither has
+/// a way out of the `repeat` of its own. Bare declarations between the
+/// `if` and the `repeat` go up before the `if`.
+fn repeat_unless(lines: &mut Vec<String>, decl: usize, flag: &str) -> bool {
+    let check = format!("if not {flag} then");
+    let Some(c) = (decl + 1..lines.len()).find(|&i| strip(&lines[i]) == check) else { return false };
+    let Some(open) = (decl + 1..c).rev().find(|&i| !is_blank(&lines[i])) else { return false };
+    let d = indent_of(&lines[open]);
+    if strip(&lines[open]) != "repeat" || indent_of(&lines[c]) != d + 4 {
+        return false;
+    }
+    // S: the check's body before its last `break`
+    let ce = arm_end(lines, c);
+    if ce >= lines.len() || indent_of(&lines[ce]) != d + 4 || strip(&lines[ce]) != "end" {
+        return false;
+    }
+    let s_lines: Vec<usize> = (c + 1..ce).filter(|&i| !is_blank(&lines[i])).collect();
+    let [.., brk] = s_lines[..] else { return false };
+    if strip(&lines[brk]) != "break" || indent_of(&lines[brk]) != d + 8 {
+        return false;
+    }
+    // R: the rest of the `repeat`
+    let u = arm_end(lines, open);
+    if u >= lines.len() || indent_of(&lines[u]) != d || strip(&lines[u]) != "until true" {
+        return false;
+    }
+    let s: Vec<String> = s_lines[..s_lines.len() - 1].iter().map(|&i| lines[i][d + 8..].to_string()).collect();
+    let r: Vec<String> = (ce + 1..u).filter(|&i| !is_blank(&lines[i])).map(|i| lines[i][d + 4..].to_string()).collect();
+    let exits = |b: &[String]| b.iter().any(|l| has_word(l, "break") || has_word(l, "continue") || has_any_goto(l) || parse_label(l).is_some());
+    if s.is_empty() || exits(&s) || exits(&r) || s.iter().chain(&r).any(|l| has_word(l, flag)) {
+        return false;
+    }
+    // the `if` before it, but for bare declarations
+    let mut lifted: Vec<String> = Vec::new();
+    let mut at = open;
+    let chain_end = loop {
+        let Some(i) = (decl + 1..at).rev().find(|&i| !is_blank(&lines[i])) else { return false };
+        if indent_of(&lines[i]) == d && strip(&lines[i]).strip_prefix("local ").is_some_and(is_token) {
+            lifted.insert(0, lines[i].clone());
+            at = i;
+            continue;
+        }
+        break i;
+    };
+    if indent_of(&lines[chain_end]) != d || strip(&lines[chain_end]) != "end" {
+        return false;
+    }
+    let Some(first) = (decl + 1..chain_end).rev().find(|&i| indent_of(&lines[i]) == d && !is_blank(&lines[i]) && !is_arm(strip(&lines[i]))) else {
+        return false;
+    };
+    if !strip(&lines[first]).starts_with("if ") || if_end(lines, first) != Some(chain_end) {
+        return false;
+    }
+    // F is false where the `if` starts, and read nowhere else
+    let around = |p: usize| (loop_open(&lines[p]) || strip(&lines[p]).contains("function")) && arm_end(lines, p) > first;
+    if (decl + 1..first).any(|p| around(p) || has_word(&lines[p], flag)) {
+        return false;
+    }
+    if (0..lines.len()).any(|i| has_word(&lines[i], flag) && i != decl && i != c && !(first..chain_end).contains(&i)) {
+        return false;
+    }
+    let names: Vec<&str> = lifted.iter().filter_map(|l| strip(l).strip_prefix("local ")).collect();
+    if lines[first..=chain_end].iter().any(|l| names.iter().any(|n| has_word(l, n))) {
+        return false;
+    }
+    let mut words = HashSet::default();
+    for l in s.iter().chain(&r) {
+        words_into(&mut words, l);
+    }
+    if declares_any(&lines[first..=chain_end], &words) {
+        return false;
+    }
+    let sets = (first..chain_end).filter(|&i| strip(&lines[i]) == format!("{flag} = true")).count();
+    let chain: Vec<String> = lines[first..=chain_end].iter().filter(|l| !is_blank(l)).cloned().collect();
+    let mut copies = 0;
+    let Some(new) = dispatch_chain(&chain, d, flag, &s, &r, &mut copies) else { return false };
+    if sets == 0 || copies * s.len() + sets * r.len() > 40 || new.iter().any(|l| has_word(l, flag)) {
+        return false;
+    }
+    lines.splice(first..=u, lifted.into_iter().chain(new));
+    if !(0..lines.len()).any(|i| i != decl && has_word(&lines[i], flag)) {
+        lines.remove(decl);
+    }
+    true
 }
 
 /// `local jump_N = false ... if jump_N then S end`, S a line or two, every
