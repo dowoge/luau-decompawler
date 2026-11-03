@@ -2068,7 +2068,7 @@ fn copy_unless_at(lines: &mut Vec<String>, decl: usize, flag: &str, c: usize) ->
     if (e + 1..lines.len()).any(|i| has_word(&lines[i], flag)) {
         return false;
     }
-    if body.is_empty() || body.len() > 16 || body.iter().any(|l| has_any_goto(l) || parse_label(l).is_some()) {
+    if body.is_empty() || body.iter().any(|l| has_any_goto(l) || parse_label(l).is_some()) {
         return false;
     }
     let mut words = HashSet::default();
@@ -2081,7 +2081,9 @@ fn copy_unless_at(lines: &mut Vec<String>, decl: usize, flag: &str, c: usize) ->
     let chain: Vec<String> = lines[first..=chain_end].iter().filter(|l| !is_blank(l)).cloned().collect();
     let mut copies = 0;
     let Some(new) = unless_chain(&chain, d, flag, &body, &mut copies) else { return false };
-    if sets == 0 || copies == 0 || copies * body.len() > 40 || new.iter().any(|l| has_word(l, flag)) {
+    // one copy is a move; more are held to a few lines
+    let too_long = copies > 1 && (body.len() > 16 || copies * body.len() > 40);
+    if sets == 0 || copies == 0 || too_long || new.iter().any(|l| has_word(l, flag)) {
         return false;
     }
     // a name the `if` reads would be the lifted local's
@@ -2297,7 +2299,8 @@ fn repeat_unless(lines: &mut Vec<String>, decl: usize, flag: &str) -> bool {
     let chain: Vec<String> = lines[first..=chain_end].iter().filter(|l| !is_blank(l)).cloned().collect();
     let mut copies = 0;
     let Some(new) = dispatch_chain(&chain, d, flag, &s, &r, &mut copies) else { return false };
-    if sets == 0 || copies * s.len() + sets * r.len() > 40 || new.iter().any(|l| has_word(l, flag)) {
+    let moved = copies <= 1 && sets == 1;
+    if sets == 0 || (!moved && copies * s.len() + sets * r.len() > 40) || new.iter().any(|l| has_word(l, flag)) {
         return false;
     }
     lines.splice(first..=u, lifted.into_iter().chain(new));
@@ -2348,11 +2351,13 @@ fn copy_guard(lines: &mut Vec<String>, decl: usize, flag: &str) -> bool {
         let t = strip(l);
         indent_of(l) >= d + 4 && !t.starts_with("::") && !t.contains("function") && !has_any_goto(t)
     };
-    if body.is_empty() || body.len() > 12 || !body.iter().all(fits) {
+    if body.is_empty() || !body.iter().all(fits) {
         return false;
     }
     let sets: Vec<usize> = uses.iter().copied().filter(|&i| strip(&lines[i]) == set).collect();
-    if sets.is_empty() || sets.iter().any(|&i| i < decl || i > c) || body.len() * sets.len() > 28 {
+    // one set takes the lines over; more copies are held to a few
+    let too_long = sets.len() > 1 && (body.len() > 12 || body.len() * sets.len() > 28);
+    if sets.is_empty() || sets.iter().any(|&i| i < decl || i > c) || too_long {
         return false;
     }
     // the copies read nothing the code between declares for itself
