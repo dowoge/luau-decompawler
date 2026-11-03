@@ -1732,8 +1732,10 @@ fn follow_flag(lines: &mut Vec<String>, decl: usize, flag: &str) -> bool {
     let mut budget = (8 * body.len() + 1000) as isize;
     FOLLOW_WHY.with(|c| c.set(""));
     let got = follow(&stmts, d, flag, false, &mut budget, None);
-    // the copies may come to as much again as the block, or 80 lines
-    let growth = FOLLOW_GROWTH.max(body.len());
+    // the copies may come to twice the block again, or 80 lines: in 2900
+    // random programs the two that needed most took 2.25x and 2.5x the block,
+    // and no flag is left (a flag reads worse than the copied arms)
+    let growth = FOLLOW_GROWTH.max(2 * body.len());
     let why = match &got {
         None => FOLLOW_WHY.with(|c| c.get()),
         Some((new, _)) if new.len() > body.len() + growth => "too many lines copied",
