@@ -461,6 +461,9 @@ struct Dec<'c, 'm> {
     /// The lines of this function's code that are another function's, sorted:
     /// copies of helpers.
     foreign_lines: Vec<u32>,
+    /// Per pc: can control get there from the function's start? (Dead code
+    /// stays in the bytecode where a test folded: `c and false`.)
+    reachable: Vec<bool>,
     consumed: Vec<u32>,
     pending: BTreeMap<usize, E>,
     base_indent: i32,
@@ -910,6 +913,21 @@ impl<'c, 'm> Dec<'c, 'm> {
         foreign_lines.sort_unstable();
         foreign_lines.dedup();
         foreign_lines.retain(|l| foreign(*l));
+        let mut reachable = vec![false; p.sizecode.max(0) as usize + 2];
+        {
+            let at = |pc: i32| p.code.partition_point(|i| i.pc < pc);
+            let mut todo: Vec<i32> = p.code.first().map(|i| i.pc).into_iter().collect();
+            while let Some(pc) = todo.pop() {
+                let Some(slot) = reachable.get_mut(pc as usize) else { continue };
+                if *slot {
+                    continue;
+                }
+                *slot = true;
+                let Some(ins) = p.code.get(at(pc)).filter(|i| i.pc == pc) else { continue };
+                let (s, n) = ins.successors();
+                todo.extend(s[..n].iter().copied().filter(|x| *x >= 0));
+            }
+        }
         let suffix = if depth < 0 { String::new() } else { format!("_{}", depth + 1) };
         let size = p.sizecode.max(0) as usize + 2;
         let mut d = Dec {
@@ -947,6 +965,7 @@ impl<'c, 'm> Dec<'c, 'm> {
             incoming: vec![0; size],
             first_jump: vec![i32::MAX; size],
             foreign_lines,
+            reachable,
             consumed: vec![0; size],
             pending: BTreeMap::new(),
             base_indent: 0,
@@ -4398,6 +4417,14 @@ impl<'c, 'm> Dec<'c, 'm> {
             let ins = self.insn(q);
             let a = ins.a();
             if is_cond_jump(ins.op) {
+                // `c and false` folded: both ways go on at one place
+                if let Some(t) = self.same_way(q) {
+                    if self.pending.get(&a).is_some_and(|e| !e.borrow().pure_) {
+                        return Err(fail("a value with effects tested for nothing"));
+                    }
+                    q = t;
+                    continue;
+                }
                 // tests whose paths meet again before the join: a value of
                 // their own, read on the way (`f(if c then x else y) or z`)
                 let inner = self.flow.idx(q).and_then(|i| self.closed_region(i));
@@ -4975,6 +5002,36 @@ impl<'c, 'm> Dec<'c, 'm> {
         }
     }
 
+    /// The last instruction before target that control can get to: a dead
+    /// jump a folded test left (`c and false`) is no way over an else. (A
+    /// loop's dead closing jump still makes the loop: not for that.)
+    fn last_live_before(&self, target: i32) -> Option<i32> {
+        let code = &self.p.code;
+        let k = code.partition_point(|i| i.pc < target);
+        let last = code[..k].iter().rev().find(|i| self.reachable.get(i.pc as usize).copied().unwrap_or(true))?;
+        Some(last.pc)
+    }
+
+    /// `if c and false then`, folded: a test of a value or a constant whose
+    /// fall-through is a JUMP to where the test jumps, nothing jumping into
+    /// the code between, which never runs. Both ways go there: its target.
+    fn same_way(&self, pc: i32) -> Option<i32> {
+        let ins = self.insn(pc);
+        let pure_test = matches!(
+            ins.op,
+            op::JUMPIF | op::JUMPIFNOT | op::JUMPXEQKNIL | op::JUMPXEQKB | op::JUMPXEQKN | op::JUMPXEQKS
+        );
+        let t = ins.jump_target()?;
+        let nxt = pc + ins.n;
+        // (to a loop's way out they are a `break`: they leave the loop)
+        if !pure_test || t <= nxt || !self.valid(nxt) || self.jump_word(t).is_some() {
+            return None;
+        }
+        let j = self.insn(nxt);
+        let dead = (nxt + j.n..t).all(|q| !self.has_label(q));
+        (matches!(j.op, op::JUMP | op::JUMPX) && j.jump_target() == Some(t) && dead).then_some(t)
+    }
+
     fn reg_text(&mut self, r: usize) -> String {
         if self.pending.contains_key(&r) {
             return self.get(r).borrow().text.clone();
@@ -4998,6 +5055,22 @@ impl<'c, 'm> Dec<'c, 'm> {
         let (a, d) = (ins.a(), ins.d());
         let mut nxt = pc + ins.n;
         let pad = sp(ind);
+        // to the end of this block, which `if c and false then` cannot say
+        // here (inside it, that form keeps the dead arm, as the source had)
+        if let Some(t) = self.same_way(pc).filter(|t| *t == end) {
+            // only the tested value's effects are left of it
+            if let Some(e) = self.ppop(a) {
+                let x = e.borrow();
+                if is_call_text(&x.text) {
+                    out.push(format!("{pad}{}", x.text));
+                } else if !x.pure_ {
+                    drop(x);
+                    self.assign(out, ind, a, &e);
+                }
+            }
+            self.consume(t, 2);
+            return t;
+        }
         if let Some(f) = self.bool_value(pc, nxt, Some(&mut *out), ind, false) {
             return f;
         }
@@ -5199,7 +5272,20 @@ impl<'c, 'm> Dec<'c, 'm> {
             let mut then_end = target;
             let mut else_end = None;
             let mut after = target; // where the then-branch continues
-            if let Some(last) = self.last_insn_before(target) {
+            // a dead jump just before target is the one over an else (after a
+            // `return` the compiler still writes it), unless the branch goes on
+            // into target itself: then a folded test (`c and false`) left it,
+            // and what target holds runs both ways
+            let live = |q: i32| self.reachable.get(q as usize).copied().unwrap_or(true);
+            let into_target = self.p.code[self.flow.idx(nxt).unwrap_or(0)..]
+                .iter()
+                .take_while(|i| i.pc < target)
+                .any(|i| live(i.pc) && matches!(i.op, op::JUMP | op::JUMPX) && i.jump_target() == Some(target));
+            let last = match self.last_insn_before(target) {
+                Some(l) if !live(l) && into_target && !self.is_loop_head(target) => self.last_live_before(target),
+                other => other,
+            };
+            if let Some(last) = last {
                 if last >= nxt {
                     let li = self.insn(last);
                     let jt = last + 1 + li.d();
