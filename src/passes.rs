@@ -1858,7 +1858,30 @@ fn follow(stmts: &[Vec<String>], j: usize, flag: &str, mut v: bool, budget: &mut
         let rest = &stmts[k + 1..];
         let read_after = rest.iter().flatten().any(|l| has_word(l, flag));
         if head == "repeat" && s.last().is_some_and(|l| strip(l) == "until true" && indent_of(l) == j) {
-            let (lines, end, used) = follow_repeat(s, j, flag, v, rest, budget)?;
+            let mut trial = *budget;
+            let got = follow_repeat(s, j, flag, v, rest, &mut trial);
+            if got.is_none() && FOLLOW_WHY.with(|c| c.get()) == "what would go into a repeat leaves it" {
+                // the `repeat` undone instead: what follows each of its ways out
+                // goes into an `else` there, and the flag is followed through that
+                let inner = statements(&s[1..s.len() - 1], j + 4)?;
+                let flat = unrepeat(&inner, j + 4, budget)?;
+                let lines: Vec<String> = flat.iter().map(|l| l[4.min(indent_of(l))..].to_string()).collect();
+                let mut later = HashSet::default();
+                for l in rest.iter().flatten() {
+                    words_into(&mut later, l);
+                }
+                let top: Vec<String> = lines.iter().filter(|l| indent_of(l) == j).cloned().collect();
+                if declares_any(&top, &later) {
+                    return follow_stop("an undone repeat declares a name read after");
+                }
+                let mut again = statements(&lines, j)?;
+                again.extend(rest.iter().cloned());
+                let (tail, end) = follow(&again, j, flag, v, budget, exits.as_deref_mut())?;
+                out.extend(tail);
+                return Some((out, end));
+            }
+            let (lines, end, used) = got?;
+            *budget = trial;
             out.extend(lines);
             match end {
                 End::Falls(Some(w)) if used == 0 => {
@@ -1957,6 +1980,82 @@ fn split_at_last_read<'a>(rest: &'a [Vec<String>], flag: &str) -> (&'a [Vec<Stri
         return (rest, &[], HashSet::default());
     }
     (moved, kept, later)
+}
+
+/// The body of a `repeat ... until true` (statements at indent j) without
+/// its own ways out: after `if c then break end` what follows goes into
+/// `if not c then ... end`, and after an `if` with a way out in an arm, into
+/// each arm that comes out of it. None for a way out in anything else, a
+/// name an arm declares that the moved statements read, or past `budget`.
+fn unrepeat(stmts: &[Vec<String>], j: usize, budget: &mut isize) -> Option<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    for (k, s) in stmts.iter().enumerate() {
+        let head = strip(&s[0]);
+        let rest = &stmts[k + 1..];
+        let moved: Vec<String> = rest.iter().flatten().map(|l| format!("    {l}")).collect();
+        if s.len() == 1 && (head == "break" || head == "continue") {
+            return Some(out); // what follows never runs
+        }
+        if let Some((c, _)) = one_line_exit(head).filter(|_| s.len() == 1) {
+            *budget -= moved.len() as isize;
+            if *budget < 0 {
+                return None;
+            }
+            let inner = if moved.is_empty() { Vec::new() } else { unrepeat(&statements(&moved, j + 4)?, j + 4, budget)? };
+            if !inner.is_empty() {
+                out.push(format!("{}if {} then", spaces(j), negated_if(c)));
+                out.extend(inner);
+                out.push(format!("{}end", spaces(j)));
+            } else if !c.is_empty() {
+                // the test's effects still happen
+                out.push(format!("{}if {c} then end", spaces(j)));
+            }
+            return Some(out);
+        }
+        if !has_own_exit(s) {
+            out.extend(s.iter().cloned());
+            continue;
+        }
+        if !(head.starts_with("if ") && head.ends_with(" then")) || strip(s.last()?) != "end" {
+            return None;
+        }
+        // the arms, each with what follows
+        let mut arms: Vec<(Option<String>, Vec<String>)> = Vec::new();
+        for l in &s[..s.len() - 1] {
+            let t = strip(l);
+            if indent_of(l) == j && t == "else" {
+                arms.push((None, Vec::new()));
+            } else if indent_of(l) == j && (t.starts_with("if ") || t.starts_with("elseif ")) && t.ends_with(" then") {
+                let c = t.strip_prefix("if ").or_else(|| t.strip_prefix("elseif "))?.strip_suffix(" then")?;
+                arms.push((Some(c.to_string()), Vec::new()));
+            } else {
+                arms.last_mut()?.1.push(l.clone());
+            }
+        }
+        if !arms.iter().any(|a| a.0.is_none()) {
+            arms.push((None, Vec::new()));
+        }
+        let mut words = HashSet::default();
+        for l in &moved {
+            words_into(&mut words, l);
+        }
+        let mut new_arms = Vec::new();
+        for (c, mut body) in arms {
+            let top: Vec<String> = body.iter().filter(|l| indent_of(l) == j + 4).cloned().collect();
+            if declares_any(&top, &words) {
+                return None;
+            }
+            *budget -= moved.len() as isize;
+            if *budget < 0 {
+                return None;
+            }
+            body.extend(moved.iter().cloned());
+            new_arms.push((c, unrepeat(&statements(&body, j + 4)?, j + 4, budget)?));
+        }
+        out.extend(chain_lines(new_arms, j, &HashSet::default()));
+        return Some(out);
+    }
+    Some(out)
 }
 
 /// Is there a `break` or `continue` in these lines that no loop or function
