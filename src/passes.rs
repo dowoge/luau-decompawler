@@ -932,7 +932,7 @@ pub fn merge_elseif(body: Vec<String>, ind: usize, goes_round: bool) -> Vec<Stri
     if let Some(((test, _), skip)) = found {
         if skip < body.len() && !test.contains('\n') {
             let mut out = Vec::with_capacity(body.len());
-            out.push(format!("{pad}elseif {} then", negated_test(&test)));
+            out.push(format!("{pad}elseif {} then", negated_if(&test)));
             out.extend(body[skip..].iter().cloned());
             return out;
         }
@@ -998,6 +998,16 @@ fn negated_test(c: &str) -> String {
         }
     }
     negated(c)
+}
+
+/// negated_test for a whole condition of an `if`: `not (a < b)` loses the
+/// brackets too, which nothing beside it needs.
+fn negated_if(c: &str) -> String {
+    let n = negated_test(c);
+    match n.strip_prefix('(').and_then(|r| r.strip_suffix(')')) {
+        Some(inner) if matching_paren(n.as_bytes(), 0) == Some(n.len() - 1) => inner.to_string(),
+        _ => n,
+    }
 }
 
 /// The condition a `while` runs on, from X in the `if X then break end` that
@@ -1341,6 +1351,9 @@ fn copy_unless_guards(lines: &mut Vec<String>) {
             .and_then(|r| r.strip_suffix(" = false"))
             .filter(|f| f.strip_prefix("jump_").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())))
             .map(str::to_string);
+        if let Some(f) = &flag {
+            nil_unless_flag(lines, k, f);
+        }
         match flag {
             Some(f)
                 if copy_unless(lines, k, &f)
@@ -1348,6 +1361,74 @@ fn copy_unless_guards(lines: &mut Vec<String>) {
                     || value_for_flag(lines, k, &f)
                     || condition_for_flag(lines, k, &f) => {}
             _ => k += 1,
+        }
+    }
+}
+
+/// `local v  if not F then v = x end  if F or not v then`: wherever F holds,
+/// v was never given a value, so `not v` holds there too and the test is
+/// `not v`. v is declared without one in the test's block, and on the way
+/// it is named only inside `if not F then` blocks, with no other arm, that
+/// come after every set of F.
+fn nil_unless_flag(lines: &mut [String], decl: usize, flag: &str) {
+    let set = format!("{flag} = true");
+    let guard = format!("if not {flag} then");
+    let (before, after) = (format!("if {flag} or not "), format!(" or {flag} then"));
+    let last_set = (decl + 1..lines.len()).filter(|&i| strip(&lines[i]) == set).last();
+    let Some(last_set) = last_set else { return };
+    for r in last_set + 1..lines.len() {
+        let t = strip(&lines[r]);
+        let v = t
+            .strip_prefix(before.as_str())
+            .and_then(|x| x.strip_suffix(" then"))
+            .or_else(|| t.strip_prefix("if not ").and_then(|x| x.strip_suffix(after.as_str())));
+        let Some(v) = v.filter(|v| is_token(v)).map(str::to_string) else { continue };
+        let ind = indent_of(&lines[r]);
+        // its declaration, in this block
+        let mut dv = None;
+        for i in (0..r).rev() {
+            if is_blank(&lines[i]) {
+                continue;
+            }
+            if indent_of(&lines[i]) < ind {
+                break;
+            }
+            if indent_of(&lines[i]) == ind && strip(&lines[i]) == format!("local {v}") {
+                dv = Some(i);
+                break;
+            }
+        }
+        let Some(dv) = dv else { continue };
+        // every line naming v on the way is inside a guard after the sets
+        let mut i = dv + 1;
+        let mut fits = true;
+        while i < r {
+            let l = &lines[i];
+            if is_blank(l) {
+                i += 1;
+                continue;
+            }
+            if indent_of(l) == ind && strip(l) == guard && i > last_set {
+                let Some(e) = if_end(lines, i) else {
+                    fits = false;
+                    break;
+                };
+                if arm_end(lines, i) != e {
+                    fits = false; // an else runs where F holds
+                    break;
+                }
+                i = e + 1;
+                continue;
+            }
+            if has_word(l, &v) {
+                fits = false;
+                break;
+            }
+            i += 1;
+        }
+        if fits {
+            let pad = spaces(ind);
+            lines[r] = format!("{pad}if not {v} then");
         }
     }
 }
@@ -1920,9 +2001,21 @@ fn copy_unless(lines: &mut Vec<String>, decl: usize, flag: &str) -> bool {
 fn copy_unless_at(lines: &mut Vec<String>, decl: usize, flag: &str, c: usize) -> bool {
     let set = format!("{flag} = true");
     let check = format!("if not {flag} then");
-    // the `if` right before the check
+    // the `if` right before the check, but for declarations without a value
+    // there, which go up before it
     let d = indent_of(&lines[c]);
-    let Some(chain_end) = (decl + 1..c).rev().find(|&i| !is_blank(&lines[i])) else { return false };
+    let mut lifted: Vec<String> = Vec::new();
+    let mut at = c;
+    let chain_end = loop {
+        let Some(i) = (decl + 1..at).rev().find(|&i| !is_blank(&lines[i])) else { return false };
+        let bare = strip(&lines[i]).strip_prefix("local ").is_some_and(is_token);
+        if indent_of(&lines[i]) == d && bare {
+            lifted.insert(0, lines[i].clone());
+            at = i;
+            continue;
+        }
+        break i;
+    };
     if indent_of(&lines[chain_end]) != d || strip(&lines[chain_end]) != "end" {
         return false;
     }
@@ -1985,7 +2078,12 @@ fn copy_unless_at(lines: &mut Vec<String>, decl: usize, flag: &str, c: usize) ->
     if sets == 0 || copies == 0 || copies * body.len() > 32 || new.iter().any(|l| has_word(l, flag)) {
         return false;
     }
-    lines.splice(first..=e, new);
+    // a name the `if` reads would be the lifted local's
+    let names: Vec<&str> = lifted.iter().filter_map(|l| strip(l).strip_prefix("local ")).collect();
+    if lines[first..=chain_end].iter().any(|l| names.iter().any(|n| has_word(l, n))) {
+        return false;
+    }
+    lines.splice(first..=e, lifted.into_iter().chain(new));
     true
 }
 
@@ -2062,7 +2160,7 @@ fn unless_chain(chain: &[String], j: usize, flag: &str, s: &[String], copies: &m
     // `if c then else B end` is `if not c then B end`
     if new_arms.len() == 2 && new_arms[0].1.is_empty() && strip(&new_arms[1].0) == "else" {
         let c = strip(&new_arms[0].0).strip_prefix("if ")?.strip_suffix(" then")?.to_string();
-        let mut out = vec![format!("{pad}if {} then", negated_test(&c))];
+        let mut out = vec![format!("{pad}if {} then", negated_if(&c))];
         out.extend(new_arms[1].1.iter().cloned());
         out.push(format!("{pad}end"));
         return Some(out);
@@ -2634,7 +2732,7 @@ fn drop_unread_flag(lines: &mut Vec<String>, flag: &str) {
             continue;
         }
         if next == "else" {
-            lines[k] = format!("{pad}if {} then", negated_test(c));
+            lines[k] = format!("{pad}if {} then", negated_if(c));
             lines.remove(k + 1);
         }
         k += 1;
