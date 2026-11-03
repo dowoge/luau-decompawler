@@ -360,6 +360,10 @@ pub struct Ctx<'m> {
     helpers: RefCell<Vec<(usize, Rc<str>)>>,
     /// Per function: the source lines it spans.
     spans: Vec<(u32, u32)>,
+    /// Per function: the line of its first instruction when that is outside
+    /// its span, the line of another helper whose copy its code starts with.
+    /// A copy of it starts on that line.
+    first_line: Vec<Option<u32>>,
     /// Per function, which of its upvalues a closure shares by reference.
     byref_ups: Vec<Vec<bool>>,
     /// Functions no other lists as a child: only ever inlined, like
@@ -806,7 +810,16 @@ pub fn decompile_lines(m: &Module, noflat: bool) -> Vec<String> {
         }
     }
     let spans: Vec<(u32, u32)> = spans;
-    let closureless = |i: &usize| *i != m.main && !made.contains(i) && !m.protos[*i].lines.is_empty();
+    let first_line = m
+        .protos
+        .iter()
+        .zip(&spans)
+        .map(|(p, &(from, to))| {
+            let first = p.code.iter().find(|i| !matches!(i.op, op::PREPVARARGS | op::NOP | op::BREAK | op::COVERAGE))?;
+            p.lines.get(first.pc as usize).copied().filter(|l| *l < from || *l > to)
+        })
+        .collect();
+    let closureless =|i: &usize| *i != m.main && !made.contains(i) && !m.protos[*i].lines.is_empty();
     let unnamed = |i: usize| m.protos[i].name.as_deref().is_none_or(str::is_empty);
     let orphans: Vec<usize> = (0..m.protos.len()).filter(closureless).filter(|i| unnamed(*i)).collect();
     // `local function f`, every call inlined: the compiler made no closure,
@@ -860,6 +873,7 @@ pub fn decompile_lines(m: &Module, noflat: bool) -> Vec<String> {
         noflat,
         helpers: RefCell::new(helpers),
         spans,
+        first_line,
         orphans,
         defs,
         def_upvals: RefCell::new(HashMap::default()),
@@ -1556,9 +1570,13 @@ impl<'c, 'm> Dec<'c, 'm> {
             }
         }
         let mut found = None;
+        let its_line = |idx: usize| {
+            let (from, to) = self.ctx.spans[idx];
+            (from <= line && line <= to) || self.ctx.first_line[idx] == Some(line)
+        };
         for (idx, name) in helpers {
             let (from, to) = self.ctx.spans[idx];
-            if idx == self.idx || line < from || line > to || (from <= own.0 && own.1 <= to) {
+            if idx == self.idx || !its_line(idx) || (from <= own.0 && own.1 <= to) {
                 continue; // not its lines, or it encloses this function
             }
             // another local of this function under that name would take the
@@ -1589,6 +1607,18 @@ impl<'c, 'm> Dec<'c, 'm> {
                 self.note_refusal(idx, (usize::MAX, "writes a local no capture shows".to_string()));
                 continue;
             }
+            // a parameter read straight from a local the copy writes: a local
+            // written anywhere is copied to a register of its own for a call
+            let assigned: Vec<usize> =
+                self.m.protos[idx].code.iter().filter(|i| i.op == op::SETUPVAL).map(|i| i.b()).collect();
+            let aliased = call.args.iter().flatten().any(|a| {
+                let Arg::Reg(c, _) = a else { return false };
+                call.upval_writes.contains(c) || assigned.iter().any(|u| call.upvals.get(*u) == Some(&Some(Up::Reg(*c))))
+            });
+            if aliased {
+                self.note_refusal(idx, (usize::MAX, "a parameter is a local the copy writes".to_string()));
+                continue;
+            }
             let leftover = call.written.iter().any(|r| {
                 !call.holds_result(*r)
                     && !call.upval_writes.contains(r)
@@ -1597,8 +1627,13 @@ impl<'c, 'm> Dec<'c, 'm> {
             });
             let dropped = self.ctx.defs.values().flatten().any(|d| d.1 == idx);
             if !leftover && (!dropped || call.upvals.iter().all(Option::is_some)) {
-                found = Some((Rc::new(call), name));
-                break;
+                // a helper whose code holds a copy of another starts with
+                // that copy: the one that covers more is the call
+                let longer = found.as_ref().is_none_or(|(f, _): &(Rc<Inlined>, Rc<str>)| call.end > f.end);
+                if longer {
+                    found = Some((Rc::new(call), name));
+                }
+                continue;
             }
             let live: Vec<usize> =
                 call.written.iter().copied().filter(|r| self.valid(call.end) && self.live_at(call.end, *r)).collect();
@@ -1613,7 +1648,7 @@ impl<'c, 'm> Dec<'c, 'm> {
             };
             for &idx in &self.ctx.orphans {
                 let (from, to) = self.ctx.spans[idx];
-                if idx == self.idx || line < from || line > to || from < own.0 || to > own.1 || twin(idx) {
+                if idx == self.idx || !its_line(idx) || from < own.0 || to > own.1 || twin(idx) {
                     continue;
                 }
                 let Some(call) = match_call(self.m, self.p, idx, start) else {
