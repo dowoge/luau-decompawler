@@ -324,15 +324,46 @@ fn read_index(src: &Path) -> HashMap<String, String> {
 }
 
 /// A bytecode file's module: bytecode itself, or saved as text. What no
-/// compiler makes is refused here (bytecode::validate).
+/// compiler makes is refused here (bytecode::validate). When the opcodes
+/// stored the way asked for read as nothing sound, the other ways are
+/// tried (a Roblox client's `* 203`, stock Luau, a game's wire).
 fn load(data: &[u8], opcodes: Opcodes) -> Result<Module, String> {
     let text = bytecode::saved_text(data);
-    let m = bytecode::parse_as(text.as_deref().unwrap_or(data), opcodes)?;
-    bytecode::validate(&m, |ins, maxstack| {
-        let (rd, wr) = analysis::full_effects(ins, maxstack);
-        !(maxstack..256).any(|r| rd.has(r) || wr.has(r))
-    })?;
-    Ok(m)
+    let bytes = text.as_deref().unwrap_or(data);
+    let read = |o: Opcodes| -> Result<Module, String> {
+        let m = bytecode::parse_as(bytes, o)?;
+        bytecode::validate(&m, |ins, maxstack| {
+            let (rd, wr) = analysis::full_effects(ins, maxstack);
+            !(maxstack..256).any(|r| rd.has(r) || wr.has(r))
+        })?;
+        Ok(m)
+    };
+    let first = read(opcodes);
+    if first.is_err() && bytes.first() != Some(&0) {
+        for other in [Opcodes::Key(203), Opcodes::Stock, Opcodes::Wire] {
+            if other != opcodes {
+                if let Ok(m) = read(other) {
+                    return Ok(m);
+                }
+            }
+        }
+    }
+    first
+}
+
+/// What the compiler writes for a script it could not compile (version 0,
+/// then its message): that message, as comments, since there is no code.
+fn refused_source(data: &[u8]) -> Option<String> {
+    let text = bytecode::saved_text(data);
+    let bytes = text.as_deref().unwrap_or(data);
+    if bytes.first() != Some(&0) {
+        return None;
+    }
+    let mut out = String::from("-- the compiler refused this script:\n");
+    for l in String::from_utf8_lossy(&bytes[1..]).lines() {
+        out.push_str(&format!("-- {l}\n"));
+    }
+    Some(out)
 }
 
 fn run_dir(src: &Path, dst: &Path, opcodes: Opcodes, noflat: bool, cache_dir: Option<&Path>) -> i32 {
@@ -435,6 +466,9 @@ fn run_dir(src: &Path, dst: &Path, opcodes: Opcodes, noflat: bool, cache_dir: Op
             Ok(d) => d,
             Err(e) => return Core::done(write_out(i, &Err(e.to_string()))),
         };
+        if let Some(text) = refused_source(&data) {
+            return Core::done(write_out(i, &Ok(text)));
+        }
         let place = format!("{}{}", targets[i].1, names.get(sids[i]).map_or("", String::as_str));
         let key = cache.as_ref().map(|c| c.key(&place, &data));
         if let Some(hit) = cache.as_ref().zip(key.as_ref()).and_then(|(c, k)| c.get(k)) {
@@ -650,6 +684,9 @@ fn run_stream(opcodes: Opcodes, noflat: bool) -> i32 {
     let out = Mutex::new(std::io::stdout());
     let written = par_map(items.len(), |i| {
         let one = || -> Result<String, String> {
+            if let Some(text) = refused_source(items[i]) {
+                return Ok(text);
+            }
             let m = load(items[i], opcodes)?;
             let lines = name_round(decompile_core(&m, None, noflat), &Extra::default());
             strict_check(to_text(&finish_lines(lines, Some(&m), is_native(&m))))
@@ -738,7 +775,9 @@ fn run(args: Vec<String>) -> i32 {
             return 2;
         }
     };
+    let refused = refused_source(&data);
     let text = match load(&data, opcodes) {
+        _ if refused.is_some() => refused.unwrap_or_default(),
         Ok(m) if disasm => decomp::disassemble(&m),
         Ok(m) => {
             let lines = name_round(decompile_core(&m, None, noflat), &Extra::default());
