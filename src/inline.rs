@@ -25,8 +25,9 @@ thread_local! {
     static REACHED: Cell<(usize, usize, u8, u8)> = const { Cell::new((0, 0, 0, 0)) };
     /// The final check that refused, if the walk itself got through.
     static CHECK: Cell<&'static str> = const { Cell::new("") };
-    /// Parameters the last walk had seen no value of, where it stopped.
-    static UNSEEN: Cell<usize> = const { Cell::new(0) };
+    /// Parameters the last walk had seen no value of, where it stopped (one
+    /// bit each).
+    static UNSEEN: Cell<u64> = const { Cell::new(0) };
 }
 
 fn refuse<T>(why: &'static str) -> Option<T> {
@@ -1158,7 +1159,7 @@ pub fn match_call(m: &Module, caller: &Proto, id: usize, start: usize) -> Option
 /// follows has to be off the helper's lines. Tried only where the plain walk
 /// got into the copy with a parameter it saw no value of, or that number
 /// exists; at most 200 walks.
-fn solve(m: &Module, caller: &Proto, id: usize, start: usize, reached: usize, unseen: usize) -> Option<Inlined> {
+fn solve(m: &Module, caller: &Proto, id: usize, start: usize, reached: usize, unseen: u64) -> Option<Inlined> {
     let helper = &m.protos[id];
     let n = helper.numparams;
     let want = helper.code.iter().filter(|i| !ignored(i.op)).count();
@@ -1168,9 +1169,15 @@ fn solve(m: &Module, caller: &Proto, id: usize, start: usize, reached: usize, un
     if !fresh(m, caller, id, start, 4) {
         return None;
     }
+    // all of the copy: its returns jump to where it ends, which says so (code
+    // after it may keep its line: `(f(x) or 0)`); a copy without them ends
+    // where the helper's lines stop
     let whole = |found: Inlined| -> Option<Inlined> {
-        let next = caller.code.get(caller.code.partition_point(|c| c.pc < found.end));
-        next.is_none_or(|c| outside(helper, caller, c.pc)).then_some(found)
+        let code = &caller.code;
+        let from = code.partition_point(|c| c.pc < code.get(start).map_or(0, |s| s.pc));
+        let jumped = code[from..].iter().take_while(|c| c.pc < found.end).any(|c| c.jump_target() == Some(found.end));
+        let next = code.get(code.partition_point(|c| c.pc < found.end));
+        (jumped || next.is_none_or(|c| outside(helper, caller, c.pc))).then_some(found)
     };
     let code = &caller.code;
     let mut cands: Vec<Val> = Vec::new();
@@ -1186,17 +1193,51 @@ fn solve(m: &Module, caller: &Proto, id: usize, start: usize, reached: usize, un
         return None;
     }
     let none = vec![None; n];
+    let mut found: Vec<Val> = Vec::new();
     for c in code[start..].iter().filter(|c| !ignored(c.op)).take(want + 8) {
         for v in consts_of(m, caller, c) {
-            add(v, &mut cands);
+            add(v, &mut found);
         }
+    }
+    // the helper's arithmetic on a parameter and a constant, undone from the
+    // copy's numbers (`p // 3` folded to 2 gives 6): first, being likeliest
+    for ins in helper.code.iter().filter(|i| !ignored(i.op)) {
+        let o = plain(ins.op);
+        let (param, k) = match o {
+            op::ADDK | op::SUBK | op::MULK | op::DIVK | op::IDIVK | op::MODK => (ins.b(), ins.c()),
+            op::SUBRK | op::DIVRK => (ins.c(), ins.b()),
+            _ => continue,
+        };
+        let Some(k) = (param < n).then(|| Val::of_k(helper, m, k).and_then(|v| v.num())).flatten() else { continue };
+        for y in found.iter().filter_map(Val::num) {
+            let x = match o {
+                op::ADDK => y - k,
+                op::SUBK => y + k,
+                op::MULK if k != 0.0 => y / k,
+                op::DIVK | op::IDIVK => y * k,
+                op::MODK => y,
+                op::SUBRK => k - y,
+                op::DIVRK if y != 0.0 => k / y,
+                _ => continue,
+            };
+            if x.is_finite() {
+                add(Val::Num(x), &mut cands);
+            }
+        }
+    }
+    for v in found {
+        add(v, &mut cands);
     }
     for v in [Val::Num(0.0), Val::Num(1.0), Val::Num(-1.0), Val::Num(2.0), Val::Bool(true), Val::Bool(false), Val::Nil] {
         add(v, &mut cands);
     }
-    cands.truncate(12);
+    cands.truncate(16);
     let assigned = |r: usize| helper.code.iter().any(|i| !ignored(i.op) && full_effects(i, helper.maxstack).1.has(r));
-    let free: Vec<usize> = (0..n).filter(|r| !assigned(*r)).collect();
+    // only those the plain walk saw no value of: the others it paired
+    let free: Vec<usize> = (0..n).filter(|r| !assigned(*r) && (*r >= 64 || unseen & (1 << r) != 0)).collect();
+    if free.is_empty() {
+        return None;
+    }
     let mut tries = 0;
     // one parameter given, then two, then three; each a choice of candidates
     for size in 1..=free.len() {
@@ -1608,7 +1649,7 @@ fn match_once(
         }
         let mut c = code.get(i)?;
         REACHED.with(|r| r.set((k, want.len(), p.op, c.op)));
-        UNSEEN.with(|u| u.set(walk.args.iter().filter(|a| a.is_none()).count()));
+        UNSEEN.with(|u| u.set(walk.args.iter().enumerate().filter(|(r, a)| a.is_none() && *r < 64).fold(0, |m, (r, _)| m | 1 << r)));
         landing.insert(p.pc, c.pc);
         // `return a, b` of locals a closure captured: the copy moves the
         // results out first and closes the locals after
@@ -1711,6 +1752,25 @@ fn match_once(
                     result = Some(c.a());
                     last = c.pc;
                     i = skip(code, i + 1);
+                }
+                // `return p` of a parameter nothing read before: the copy moves
+                // its argument (a local's register, or its own) into the result
+                2 if p.a() < walk.helper.numparams
+                    && walk.map[p.a()].is_none()
+                    && walk.args[p.a()].is_none()
+                    && walk.assumed[p.a()].is_none()
+                    && !walk.assigned[p.a()]
+                    && !walk.unread.contains_key(&p.a())
+                    && c.op == op::MOVE
+                    && !walk.written.contains(&c.b())
+                    && result.is_none_or(|r| r == c.a()) =>
+                {
+                    walk.map[p.a()] = Some(c.b());
+                    walk.args[p.a()] = Some(Arg::Reg(c.b(), c.pc));
+                    result = Some(c.a());
+                    last = c.pc;
+                    i = skip(code, i + 1);
+                    stores.insert(c.pc, (code.get(i)?.pc, p.a()));
                 }
                 _ if p.b() != 1 && walk.map[p.a()].is_none() && !walk.unread.contains_key(&p.a()) => {
                     if result.is_some() {
