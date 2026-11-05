@@ -2983,7 +2983,14 @@ impl<'c, 'm> Dec<'c, 'm> {
                     continue;
                 }
             }
-            pc = self.stmt(out, ind, pc, end);
+            let next = self.stmt(out, ind, pc, end);
+            if next <= pc {
+                // jumps no compiler lays out (blocks out of order) can send the
+                // walk back: refused, as it would go round for ever (the job's
+                // panic is caught)
+                panic!("a statement at pc {pc} that does not move on");
+            }
+            pc = next;
         }
     }
 
