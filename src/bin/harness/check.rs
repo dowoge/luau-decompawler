@@ -206,6 +206,21 @@ pub fn main(args: &Args) -> u8 {
     if args.flag("--full") {
         // damaged bytecode is refused or decompiled, never a crash or a hang
         ok = crate::damage::run(&tools, &tools.decompiler, 60, 1, 25, 10) && ok;
+        // bytecode no compiler lays out this way but the VM still runs: these
+        // forms (no line info, flipped tests, jumps through jumps) reorder
+        // nothing, so each must come out behaving the same, with no crash or
+        // hang (block reorderings, which may be refused, are not checked here)
+        let craft = crate::craft::Options {
+            count: 120,
+            seed: 1,
+            size: 25,
+            per: 1,
+            kinds: vec![crate::craft::Kind::Stripped, crate::craft::Kind::Inverted, crate::craft::Kind::Bounced],
+            keep: None,
+            write: None,
+            binary: tools.decompiler.clone(),
+        };
+        ok = crate::craft::run(&tools, &craft) && ok;
     }
     if let Ok(dumps) = std::env::var("LUAU_RUN") {
         ok = real_scripts(&tools, &dumps) && ok;

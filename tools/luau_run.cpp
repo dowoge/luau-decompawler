@@ -6,11 +6,12 @@
 // scripts unless -O0 or -O1 says otherwise, with an instruction budget so a
 // broken program cannot hang.
 //
-//   luau_run [-O0|-O1|-O2] [--budget N] [--seconds S] [--stream] FILE...
+//   luau_run [-O0|-O1|-O2] [--budget N] [--seconds S] [--stream] [--bytecode] FILE...
 // prints, per file:  "=== FILE" then its output, then "=== ok" or
 // "=== error: MESSAGE" (chunk names and line numbers stripped, since they
 // differ between a program and its decompiled form). With --stream, programs
 // come as records on stdin too (see records.h), each called by its name.
+// With --bytecode, each file is bytecode, loaded without compiling.
 //
 // Files run on every core, and each one's lines come out together when it
 // ends, in no particular order. The budget counts calls and loop passes, so a
@@ -83,7 +84,7 @@ static std::string strip_location(std::string msg) {
 
 // Everything one program prints, its result line last. A program from the
 // command line is read here; a record brings its own.
-static std::string run_file(Record& file, bool named, long budget, lua_CompileOptions opts) {
+static std::string run_file(Record& file, bool named, bool bytecode, long budget, lua_CompileOptions opts) {
     std::string out = "=== " + file.name + "\n";
     if (named) {
         std::ifstream f(file.name, std::ios::binary);
@@ -93,7 +94,15 @@ static std::string run_file(Record& file, bool named, long budget, lua_CompileOp
     }
     const std::string& src = file.data;
     size_t size = 0;
-    char* bc = luau_compile(src.data(), src.size(), &opts, &size);
+    char* bc = nullptr;
+    if (bytecode) {
+        // loaded as it is: bytecode no compiler wrote, for the decompiler to read
+        size = src.size();
+        bc = static_cast<char*>(std::malloc(size ? size : 1));
+        std::memcpy(bc, src.data(), size);
+    } else {
+        bc = luau_compile(src.data(), src.size(), &opts, &size);
+    }
     lua_State* L = luaL_newstate();
     luaL_openlibs(L);
     lua_pushcfunction(L, lprint, "print");
@@ -153,6 +162,7 @@ int main(int argc, char** argv) {
     long budget = 20000000;
     double seconds = 0;
     bool stream = false;
+    bool bytecode = false;
     std::vector<Record> files;  // from the command line: names only
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--budget") == 0 && i + 1 < argc)
@@ -161,6 +171,8 @@ int main(int argc, char** argv) {
             seconds = std::atof(argv[++i]);
         else if (std::strcmp(argv[i], "--stream") == 0)
             stream = true;
+        else if (std::strcmp(argv[i], "--bytecode") == 0)
+            bytecode = true;
         else if (std::strcmp(argv[i], "-O0") == 0 || std::strcmp(argv[i], "-O1") == 0 ||
                  std::strcmp(argv[i], "-O2") == 0)
             opts.optimizationLevel = argv[i][2] - '0';
@@ -188,7 +200,7 @@ int main(int argc, char** argv) {
         for (int i = next++; i < count; i = next++) {
             w->since = now_ms();
             w->file = i;
-            const std::string said = run_file(files[i], size_t(i) < named, budget, opts);
+            const std::string said = run_file(files[i], size_t(i) < named, bytecode, budget, opts);
             std::lock_guard<std::mutex> hold(lock);
             if (w->abandoned)
                 return;  // too late: it was counted as never ending

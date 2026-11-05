@@ -163,7 +163,7 @@ pub fn op_name(o: u8) -> String {
 }
 
 /// Two words for these upstream opcode numbers.
-fn insn_len(o: u8) -> i32 {
+pub fn insn_len(o: u8) -> i32 {
     match o {
         7 | 8 | 12 | 15 | 16 | 20 | 27..=32 | 53 | 55 | 58 | 60 | 66 | 74 | 75 | 77..=80
         | 83..=88 | 90 | 91 | 93 | 94 => 2,

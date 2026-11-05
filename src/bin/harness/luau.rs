@@ -41,8 +41,10 @@ pub fn repo() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
+/// One per core, or LUAU_THREADS of them, as the tools do.
 pub fn workers() -> usize {
-    thread::available_parallelism().map_or(4, |n| n.get())
+    let cores = thread::available_parallelism().map_or(4, |n| n.get());
+    std::env::var("LUAU_THREADS").ok().and_then(|v| v.parse().ok()).map_or(cores, |n: usize| n.max(1))
 }
 
 /// f over items, on all cores, the results in order.
@@ -260,6 +262,15 @@ impl Tools {
     /// program still going after `seconds` has none: luau_run leaves it behind
     /// and finishes the rest.
     pub fn outputs(&self, programs: &[Item], seconds: u64, budget: u64) -> HashMap<String, String> {
+        self.outputs_as(programs, seconds, budget, false)
+    }
+
+    /// The same for bytecode, which runs as it is.
+    pub fn bytecode_outputs(&self, programs: &[Item], seconds: u64, budget: u64) -> HashMap<String, String> {
+        self.outputs_as(programs, seconds, budget, true)
+    }
+
+    fn outputs_as(&self, programs: &[Item], seconds: u64, budget: u64, bytecode: bool) -> HashMap<String, String> {
         if programs.is_empty() {
             return HashMap::new();
         }
@@ -267,12 +278,15 @@ impl Tools {
             let mut cmd = command(&self.run);
             self.level_arg(&mut cmd);
             cmd.arg("--budget").arg(budget.to_string()).arg("--seconds").arg(seconds.to_string()).arg("--stream");
+            if bytecode {
+                cmd.arg("--bytecode");
+            }
             let input = records(part.iter().map(|p| (p.name.as_str(), p.data.as_slice())));
             run_limited(&mut cmd, Some(input), seconds * 4 + 60)
         };
         let ran = run(programs);
         let mut found = parse_outputs(&text_of(&ran.stdout));
-        if found.contains_key("--stream") {
+        if found.contains_key("--stream") || found.contains_key("--bytecode") {
             // it would have every program never finish, and tests pass
             outdated(&self.run);
         }
