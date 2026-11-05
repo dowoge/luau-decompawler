@@ -208,14 +208,20 @@ pub fn main(args: &Args) -> u8 {
         ok = crate::damage::run(&tools, &tools.decompiler, 60, 1, 25, 10) && ok;
         // bytecode no compiler lays out this way but the VM still runs: these
         // forms (no line info, flipped tests, jumps through jumps) reorder
-        // nothing, so each must come out behaving the same, with no crash or
+        // nothing, so each must come out behaving the same; edge-value number
+        // constants (NaN, infinities, -0) must round-trip; none may crash or
         // hang (block reorderings, which may be refused, are not checked here)
         let craft = crate::craft::Options {
             count: 120,
             seed: 1,
             size: 25,
             per: 1,
-            kinds: vec![crate::craft::Kind::Stripped, crate::craft::Kind::Inverted, crate::craft::Kind::Bounced],
+            kinds: vec![
+                crate::craft::Kind::Stripped,
+                crate::craft::Kind::Inverted,
+                crate::craft::Kind::Bounced,
+                crate::craft::Kind::Numbers,
+            ],
             keep: None,
             write: None,
             binary: tools.decompiler.clone(),

@@ -1,19 +1,25 @@
 //! Bytecode no compiler writes: random programs are compiled, then each is
 //! rewritten into forms the VM runs but the compiler never makes (blocks in
 //! another order, branches turned round, jumps through jumps, code nothing
-//! reaches, tests that go nowhere, line info gone or wrong). The rewritten
-//! bytecode is run as it is, and its decompiled text must print the same.
+//! reaches, tests that go nowhere, line info gone or wrong, number constants
+//! made edge values). The rewritten bytecode is run as it is, and its
+//! decompiled text must print the same (for a value mutation, the same as the
+//! mutated bytecode, which it changed on purpose).
 
 use std::collections::HashMap;
 use std::path::Path;
 
 use crate::bytecode::{insn_len, op};
 use crate::gen;
-use crate::luau::{decompile_many, par_map, Args, Item, Tools, USUAL_BUDGET};
+use crate::luau::{decompile_many, par_map, Args, Item, Tools};
 use crate::rng::Rng;
 
 const DECOMPILE_LIMIT: u64 = 300;
 const RUN_LIMIT: u64 = 60;
+/// A tighter instruction budget than difftest: an edge constant put into a
+/// loop bound makes it run and print to the budget, so a big one would hold
+/// gigabytes of identical output in memory for nothing.
+const CRAFT_BUDGET: u64 = 500_000;
 
 /// What a copy is rewritten by.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -36,11 +42,14 @@ pub enum Kind {
     Dead,
     /// `JUMPIF r +0`: a test whose both ways go to the next instruction
     NoWay,
+    /// number and integer constants replaced with edge values (NaN, infinities,
+    /// -0, denormals, i64 limits)
+    Numbers,
     /// several of the above at once
     Mixed,
 }
 
-pub const KINDS: [Kind; 10] = [
+pub const KINDS: [Kind; 11] = [
     Kind::Stripped,
     Kind::OneLine,
     Kind::Scrambled,
@@ -50,11 +59,20 @@ pub const KINDS: [Kind; 10] = [
     Kind::Bounced,
     Kind::Dead,
     Kind::NoWay,
+    Kind::Numbers,
     Kind::Mixed,
 ];
 
 fn kind_named(name: &str) -> Option<Kind> {
     KINDS.iter().copied().find(|k| format!("{k:?}").eq_ignore_ascii_case(name))
+}
+
+impl Kind {
+    /// Whether the rewrite leaves the program running exactly as it did. All do
+    /// but the value mutations, which change what it computes on purpose.
+    fn preserves_behavior(self) -> bool {
+        !matches!(self, Kind::Numbers | Kind::Mixed)
+    }
 }
 
 // ---- the container, kept as raw as possible ----
@@ -120,8 +138,11 @@ struct RawProto {
 }
 
 struct RawModule {
-    /// version, types version, strings, userdata names
-    head: Vec<u8>,
+    version: u8,
+    tv: u8,
+    strings: Vec<Vec<u8>>,
+    /// the userdata type remap, raw (tv 3), ending in its 0 byte
+    udtail: Vec<u8>,
     protos: Vec<RawProto>,
     main: u64,
 }
@@ -177,16 +198,18 @@ fn read_module(data: &[u8]) -> Option<RawModule> {
         return None;
     }
     let tv = r.u8()?;
+    let mut strings = Vec::new();
     for _ in 0..r.varint()? {
         let n = r.varint()? as usize;
-        r.take(n)?;
+        strings.push(r.take(n)?.to_vec());
     }
+    let ud_start = r.o;
     if tv == 3 {
         while r.u8()? != 0 {
             r.varint()?;
         }
     }
-    let head = data[..r.o].to_vec();
+    let udtail = data[ud_start..r.o].to_vec();
     let mut protos = Vec::new();
     for _ in 0..r.varint()? {
         let start = r.o;
@@ -243,11 +266,17 @@ fn read_module(data: &[u8]) -> Option<RawModule> {
         protos.push(RawProto { head, code, consts, linedefined, debugname, lines, debug });
     }
     let main = r.varint()?;
-    (r.o == data.len()).then_some(RawModule { head, protos, main })
+    (r.o == data.len()).then_some(RawModule { version, tv, strings, udtail, protos, main })
 }
 
 fn write_module(m: &RawModule) -> Vec<u8> {
-    let mut out = m.head.clone();
+    let mut out = vec![m.version, m.tv];
+    put_varint(&mut out, m.strings.len() as u64);
+    for s in &m.strings {
+        put_varint(&mut out, s.len() as u64);
+        out.extend_from_slice(s);
+    }
+    out.extend_from_slice(&m.udtail);
     put_varint(&mut out, m.protos.len() as u64);
     for p in &m.protos {
         out.extend_from_slice(&p.head);
@@ -276,6 +305,104 @@ fn write_module(m: &RawModule) -> Vec<u8> {
     }
     put_varint(&mut out, m.main);
     out
+}
+
+// ---- adversarial constant values ----
+
+fn adversarial_number(rng: &mut Rng) -> f64 {
+    let fixed = [
+        f64::NAN,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        -0.0,
+        0.0,
+        f64::MAX,
+        f64::MIN_POSITIVE,
+        f64::EPSILON,
+        2f64.powi(53),
+        2f64.powi(53) + 1.0,
+        2f64.powi(63),
+        5e-324,
+        1.7976931348623157e308,
+        0.1 + 0.2,
+        1.0 / 3.0,
+        -1.0,
+    ];
+    match rng.below(2) {
+        0 => fixed[rng.below(fixed.len())],
+        // a random bit pattern: any finite or non-finite double, printed and read back
+        _ => {
+            let bits = (rng.below(1 << 32) as u64) << 32 | rng.below(1 << 32) as u64;
+            f64::from_bits(bits)
+        }
+    }
+}
+
+fn adversarial_integer(rng: &mut Rng) -> i128 {
+    let fixed: [i128; 8] = [0, -1, 1, i64::MAX as i128, i64::MIN as i128, 1 << 53, -(1 << 53), 255];
+    fixed[rng.below(fixed.len())]
+}
+
+/// Rewrites the number (type 2) and integer (type 9) constants of a proto's
+/// constant blob, keeping everything else (string, import, table, children)
+/// byte for byte. None if the blob does not parse.
+fn mutate_number_consts(blob: &[u8], rng: &mut Rng) -> Option<Vec<u8>> {
+    let mut r = Reader { d: blob, o: 0 };
+    let nk = r.varint()?;
+    let mut out = Vec::with_capacity(blob.len());
+    put_varint(&mut out, nk);
+    for _ in 0..nk {
+        let tag = r.u8()?;
+        out.push(tag);
+        match tag {
+            0 => {}
+            1 => out.push(r.u8()?),
+            2 => {
+                r.take(8)?;
+                let v = if rng.below(2) == 0 { adversarial_number(rng) } else { f64::from_le_bytes(blob[r.o - 8..r.o].try_into().ok()?) };
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            3 | 6 => put_varint(&mut out, r.varint()?),
+            4 => out.extend_from_slice(r.take(4)?),
+            5 => {
+                let n = r.varint()?;
+                put_varint(&mut out, n);
+                for _ in 0..n {
+                    put_varint(&mut out, r.varint()?);
+                }
+            }
+            7 => out.extend_from_slice(r.take(16)?),
+            8 => {
+                let n = r.varint()?;
+                put_varint(&mut out, n);
+                for _ in 0..n {
+                    put_varint(&mut out, r.varint()?);
+                    out.extend_from_slice(r.take(4)?);
+                }
+            }
+            9 => {
+                let neg = r.u8()?;
+                let v = r.varint()?;
+                if rng.below(2) == 0 {
+                    let a = adversarial_integer(rng);
+                    out.push(u8::from(a < 0));
+                    put_varint(&mut out, a.unsigned_abs() as u64);
+                } else {
+                    out.push(neg);
+                    put_varint(&mut out, v);
+                }
+            }
+            11 => out.extend_from_slice(r.take(32)?),
+            _ => return None,
+        }
+    }
+    // the children list, unchanged
+    let nchild = r.varint()?;
+    put_varint(&mut out, nchild);
+    for _ in 0..nchild {
+        put_varint(&mut out, r.varint()?);
+    }
+    (r.o == blob.len()).then_some(out)
 }
 
 // ---- instructions with their jumps as targets ----
@@ -659,7 +786,9 @@ impl Func {
 pub fn craft(bc: &[u8], kind: Kind, rng: &mut Rng) -> Option<Vec<u8>> {
     let mut m = read_module(bc)?;
     let kinds: Vec<Kind> = if kind == Kind::Mixed {
-        let mut picked: Vec<Kind> = KINDS[3..9].iter().copied().filter(|_| rng.below(2) == 0).collect();
+        // one or more of the body rewrites (reorderings, padding, numbers),
+        // plus one line-info change
+        let mut picked: Vec<Kind> = KINDS[3..10].iter().copied().filter(|_| rng.below(2) == 0).collect();
         if picked.is_empty() {
             picked.push(Kind::Shuffled);
         }
@@ -684,6 +813,7 @@ pub fn craft(bc: &[u8], kind: Kind, rng: &mut Rng) -> Option<Vec<u8>> {
         encode(&f, p)?;
         for k in &kinds {
             match k {
+                Kind::Numbers => p.consts = mutate_number_consts(&p.consts, rng)?,
                 Kind::Stripped => {
                     p.lines = None;
                     p.debugname = 0;
@@ -794,7 +924,7 @@ pub fn run(tools: &Tools, o: &Options) -> bool {
         .collect();
     let crafted: Vec<Item> = copies.iter().enumerate().map(|(c, x)| Item::new(format!("c{c}"), x.data.clone())).collect();
     let all: Vec<Item> = originals.into_iter().chain(crafted).collect();
-    let ran = tools.bytecode_outputs(&all, RUN_LIMIT, USUAL_BUDGET);
+    let ran = tools.bytecode_outputs(&all, RUN_LIMIT, CRAFT_BUDGET);
     let blobs: Vec<Vec<u8>> = copies.iter().map(|c| c.data.clone()).collect();
     let texts = decompile_many(&o.binary, &blobs, DECOMPILE_LIMIT);
     let decs: Vec<Item> = texts
@@ -802,14 +932,17 @@ pub fn run(tools: &Tools, o: &Options) -> bool {
         .enumerate()
         .filter_map(|(c, t)| Some(Item::new(format!("d{c}"), t.as_ref().ok()?.clone())))
         .collect();
-    let dec_ran = tools.outputs(&decs, RUN_LIMIT, USUAL_BUDGET);
+    let dec_ran = tools.outputs(&decs, RUN_LIMIT, CRAFT_BUDGET);
     let mut failures: Vec<(usize, String)> = Vec::new();
     for (c, copy) in copies.iter().enumerate() {
         let t = &mut tally[o.kinds.iter().position(|k| *k == copy.kind).expect("a kind asked for")];
         let orig = ran.get(&format!("o{}", copy.program));
         let mine = ran.get(&format!("c{c}"));
-        if orig != mine {
-            t.changed += 1; // the rewrite itself is wrong: a harness bug
+        // structure-preserving rewrites must run exactly as the original did:
+        // a difference means a bug in the rewriter. Value mutations (numbers)
+        // change behaviour on purpose, so only the decompiled copy is checked.
+        if copy.kind.preserves_behavior() && orig != mine {
+            t.changed += 1;
             failures.push((c, "the rewritten bytecode behaves differently from the original".into()));
             continue;
         }
