@@ -205,10 +205,9 @@ pub fn kstr<'a>(m: &'a Module, p: &Proto, i: usize) -> Option<&'a str> {
 }
 
 fn kstr_or<'a>(m: &'a Module, p: &Proto, i: usize, d: &'a str) -> &'a str {
-    match kstr(m, p, i) {
-        Some(s) if !s.is_empty() => s,
-        _ => d,
-    }
+    // the empty string is a real key (`t[""]`); only a non-string constant,
+    // which no source writes here, falls back to the placeholder
+    kstr(m, p, i).unwrap_or(d)
 }
 
 fn index_suffix(name: &str) -> String {
