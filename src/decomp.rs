@@ -2447,7 +2447,9 @@ impl<'c, 'm> Dec<'c, 'm> {
             }
         }
         let pc = self.cur_pc;
-        let inline = inline && !self.overwrites_waiting(r);
+        // all of `...` up to the top is no variable's value, so it changes no
+        // variable a waiting value reads (its register may have been one's)
+        let inline = inline && (e.borrow().multret || !self.overwrites_waiting(r));
         // nothing reads it, but a call put back just after may take it (one
         // with effects still goes out first if a statement comes between)
         if inline && self.feeds_copy(pc, r) {
@@ -6209,6 +6211,9 @@ impl<'c, 'm> Dec<'c, 'm> {
             op::GETVARARGS => {
                 let va = ex("...", 100);
                 va.borrow_mut().one = b == 2; // `local x = ...` keeps the first value only
+                // all of them, up to the top: for the call, return or list
+                // after it, never a variable's value
+                va.borrow_mut().multret = b == 0;
                 self.put(out, ind, a, va, true);
             }
             _ => {
