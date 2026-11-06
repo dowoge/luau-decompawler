@@ -200,6 +200,7 @@ pub fn main(args: &Args) -> u8 {
     if ok {
         ok = cases::run(&Args(Vec::new()), false) == 0;
         ok = suites(&tools, args.flag("--full")) && ok;
+        ok = crate::golden::run(&tools, false) && ok;
     }
     let seeds: &[(u64, usize, u64)] = if args.flag("--full") { &FULL } else { &QUICK };
     ok = random_sets(&tools, seeds) && ok;

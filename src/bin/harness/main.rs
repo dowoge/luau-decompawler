@@ -5,6 +5,7 @@
 //!   harness difftest              random programs must print the same after decompiling
 //!   harness damage                damaged bytecode: refused or decompiled, never a crash
 //!   harness craft                 bytecode no compiler writes must decompile and behave
+//!   harness golden [--bless]      kept bytecode (tools/bytecode) keeps its text and behaviour
 //!   harness reduce FILE           shrinks a program the decompiler gets wrong
 //!   harness edits                 which real functions differ, and by what edit
 //!   harness undeclared DIR...     generated names used without a declaration
@@ -27,6 +28,7 @@ mod diff;
 mod difftest;
 mod edits;
 mod gen;
+mod golden;
 mod luau;
 mod reduce;
 mod rng;
@@ -71,6 +73,7 @@ fn main() -> ExitCode {
         "edits" => edits::main(&args),
         "undeclared" => text::undeclared_main(&args),
         "same" => text::same_main(&args),
+        "golden" => golden::main(&args),
         "gen" => gen::main(&args),
         "validate" => validate::main(&args),
         _ => {
