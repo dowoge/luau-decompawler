@@ -603,10 +603,27 @@ pub fn list_texts(exprs: &[E], fixed: bool) -> Vec<String> {
 
 // ------------------------------------------------------------- formatting
 
+/// A string literal for these bytes.
 pub fn lua_string(b: &[u8]) -> String {
+    literal(b, false)
+}
+
+/// A string literal for a constant's text (bytecode::text_of), whose raw
+/// bytes are carried as U+10FF00 + byte: written as those bytes again.
+pub fn text_literal(t: &str) -> String {
+    literal(t.as_bytes(), true)
+}
+
+fn literal(b: &[u8], text: bool) -> String {
     let mut out = String::with_capacity(b.len() + 2);
     out.push('"');
-    for (i, &c) in b.iter().enumerate() {
+    let mut i = 0;
+    while i < b.len() {
+        let (c, len) = match b[i..] {
+            [0xF4, 0x8F, t @ 0xBC..=0xBF, f @ 0x80..=0xBF, ..] if text => (((t & 0x03) << 6) | (f & 0x3F), 4),
+            _ => (b[i], 1),
+        };
+        i += len;
         match c {
             0x5C => out.push_str("\\\\"),
             0x22 => out.push_str("\\\""),
@@ -617,7 +634,7 @@ pub fn lua_string(b: &[u8]) -> String {
             _ => {
                 // a decimal escape reads up to three digits: before a digit
                 // it has all three, or `\7` `1` would read as `\71`
-                let digit_next = b.get(i + 1).is_some_and(u8::is_ascii_digit);
+                let digit_next = b.get(i).is_some_and(u8::is_ascii_digit);
                 out.push_str(&if digit_next { format!("\\{c:03}") } else { format!("\\{c}") });
             }
         }
@@ -735,6 +752,24 @@ pub fn fmt_number(v: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_gives_its_bytes_back() {
+        let cases: [&[u8]; 7] = [
+            b"plain",
+            &[216, 245, 180, 200],
+            &[201, 200, b'7'],
+            &[b'o', b'k', 128, b'x'],
+            "\u{10FF00}".as_bytes(),
+            &[0xF4, 0x8F, 0xBC],
+            &[0xF4, 0x8F, 0xBF, 0xBF, 255, b'1'],
+        ];
+        for b in cases {
+            assert_eq!(text_literal(&crate::bytecode::text_of(b)), lua_string(b), "{b:?}");
+        }
+        // two different keys stay two
+        assert_ne!(crate::bytecode::text_of(&[216, 245]), crate::bytecode::text_of(&[201, 200]));
+    }
 
     #[test]
     fn escapes_before_a_digit_have_three_digits() {

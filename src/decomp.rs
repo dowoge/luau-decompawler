@@ -214,7 +214,7 @@ fn index_suffix(name: &str) -> String {
     if is_ident(name) && !is_keyword(name) {
         format!(".{name}")
     } else {
-        format!("[{}]", lua_string(name.as_bytes()))
+        format!("[{}]", text_literal(name))
     }
 }
 
@@ -267,7 +267,7 @@ fn field_text(name: &str) -> String {
     if is_ident(name) && !is_keyword(name) {
         name.to_string()
     } else {
-        format!("[{}]", lua_string(name.as_bytes()))
+        format!("[{}]", text_literal(name))
     }
 }
 
@@ -283,7 +283,7 @@ fn template_fields(m: &Module, p: &Proto, i: i64) -> Vec<String> {
         let field = if is_ident(name) && !is_keyword(name) {
             name.to_string()
         } else {
-            format!("[{}]", lua_string(name.as_bytes()))
+            format!("[{}]", text_literal(name))
         };
         out.push(format!("{field} = {}", kexpr(m, p, *val as i64)));
     }

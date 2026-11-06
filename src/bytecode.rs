@@ -442,6 +442,52 @@ pub fn saved_text(data: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// The first of 256 private-use characters standing for raw bytes in text.
+pub const RAW_BYTE: u32 = 0x10FF00;
+
+/// A string constant as text that gives its bytes back: a byte that is not
+/// part of a UTF-8 character (and each byte of a character in the range the
+/// raw bytes use) becomes the character RAW_BYTE + byte, which
+/// `expr::lua_string` writes as that byte again. Replacing such bytes with
+/// U+FFFD made different keys one key (`t["\216\245"]` and `t["\201\200"]`
+/// both `t["\239\191\189\239\191\189"]`), and their values each other's.
+pub fn text_of(b: &[u8]) -> String {
+    let raw = |out: &mut String, x: u8| out.push(char::from_u32(RAW_BYTE + u32::from(x)).unwrap());
+    let mut out = String::with_capacity(b.len());
+    let mut rest = b;
+    while !rest.is_empty() {
+        match std::str::from_utf8(rest) {
+            Ok(s) => {
+                push_text(&mut out, s, raw);
+                break;
+            }
+            Err(e) => {
+                let good = e.valid_up_to();
+                push_text(&mut out, std::str::from_utf8(&rest[..good]).unwrap(), raw);
+                let bad = e.error_len().unwrap_or(rest.len() - good);
+                for &x in &rest[good..good + bad] {
+                    raw(&mut out, x);
+                }
+                rest = &rest[good + bad..];
+            }
+        }
+    }
+    out
+}
+
+fn push_text(out: &mut String, s: &str, raw: impl Fn(&mut String, u8)) {
+    for c in s.chars() {
+        if u32::from(c) >= RAW_BYTE {
+            let mut buf = [0u8; 4];
+            for &x in c.encode_utf8(&mut buf).as_bytes() {
+                raw(out, x);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+}
+
 /// A jump too far for its 16-bit D gets a trampoline in front of it
 /// (BytecodeBuilder::expandJumps): `JUMP +1; JUMPX far; OP -2`, OP jumping
 /// back to the JUMPX. Undone here: OP jumps far itself and the two before it
@@ -507,7 +553,7 @@ fn parse_layout(data: &[u8], opcodes: Opcodes, sized: bool) -> R<Module> {
         let n = r.varint()? as usize;
         strings.push(r.take(n)?.to_vec());
     }
-    let text: Vec<String> = strings.iter().map(|s| String::from_utf8_lossy(s).into_owned()).collect();
+    let text: Vec<String> = strings.iter().map(|s| text_of(s)).collect();
     let mut userdata: Vec<Option<String>> = Vec::new();
     if tv == 3 {
         let mut idx = r.u8()?;
