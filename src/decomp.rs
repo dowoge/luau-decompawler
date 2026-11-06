@@ -2354,6 +2354,8 @@ impl<'c, 'm> Dec<'c, 'm> {
         // a join the walk came to itself, from a test it went through
         let mut joined: Option<i32> = None;
         let building = self.pending.get(&q).is_some_and(|e| e.borrow().fields.is_some());
+        // the value went into a table still being built (below)
+        let mut in_constructor = false;
         while i < code.len() {
             let ins = &code[i];
             // a helper copied in after: a call, whatever branches it has
@@ -2413,6 +2415,13 @@ impl<'c, 'm> Dec<'c, 'm> {
             if rd.has(q) && method_args {
                 return true;
             }
+            // that table stored with q as its target or key: an assignment
+            // made of parts, whose parts the source said one by one (q being
+            // built itself, the store is its constructor's)
+            let store_op = matches!(ins.op, op::SETTABLEKS | op::SETTABLEN | op::SETTABLE | op::SETGLOBAL | op::SETUPVAL);
+            if rd.has(q) && in_constructor && store_op && !building {
+                return false;
+            }
             if rd.has(q) {
                 let (b, c) = (ins.b(), ins.c());
                 let binary = matches!(
@@ -2454,6 +2463,19 @@ impl<'c, 'm> Dec<'c, 'm> {
                 }
                 joined = Some(join);
                 i = to;
+                continue;
+            }
+            // a field of a table still being built: what flows there is part
+            // of that constructor, read where the table is
+            let table = match ins.op {
+                op::SETTABLEKS | op::SETTABLEN | op::SETTABLE => Some(ins.b()),
+                op::SETLIST => Some(ins.a()),
+                _ => None,
+            };
+            if let Some(table) = table.filter(|t| carries && *t != q && self.pending.get(t).is_some_and(|e| e.borrow().fields.is_some())) {
+                flow.add(table);
+                in_constructor = true;
+                i += 1;
                 continue;
             }
             let (s, n) = ins.successors();
@@ -3716,6 +3738,21 @@ impl<'c, 'm> Dec<'c, 'm> {
         if done {
             self.ppop(r);
             self.seal(table);
+            // stored next into a constructor still being built, and read by
+            // nothing after: an item of that constructor, not a variable
+            let nxt = pc + self.insn(pc).n;
+            let item = self.valid(nxt) && {
+                let s = self.insn(nxt);
+                matches!(s.op, op::SETTABLEKS | op::SETTABLEN)
+                    && s.a() == r
+                    && s.b() != r
+                    && self.pending.get(&s.b()).is_some_and(|e| e.borrow().fields.is_some())
+                    && !self.live_after(nxt, r)
+            };
+            if item {
+                self.pset(r, table.clone());
+                return;
+            }
             self.flush_impure(out, ind, r);
             self.assign(out, ind, r, table);
         }
