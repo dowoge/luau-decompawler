@@ -2169,7 +2169,10 @@ impl<'c, 'm> Dec<'c, 'm> {
         }
         let mut q = self.cur_pc + here.n;
         let (mut targets, mut values) = (Vec::new(), Vec::new());
-        for &temp in waiting {
+        let mut group = waiting.to_vec();
+        let mut i = 0;
+        while i < group.len() {
+            let temp = group[i];
             if !self.valid(q) || self.has_label(q) {
                 return None;
             }
@@ -2183,11 +2186,20 @@ impl<'c, 'm> Dec<'c, 'm> {
             if !self.declared[key] {
                 return None;
             }
-            targets.push(self.regname[key].clone()?);
+            let target = self.regname[key].clone()?;
             values.push(self.pending[&temp].borrow().render());
             q += ins.n;
+            i += 1;
+            // `a, b, c = c, a, b`: a waiting value that reads a variable this
+            // line writes must be said in it too, or it reads the new value
+            for other in self.waiting_on(r, &target) {
+                if !group.contains(&other) {
+                    group.push(other);
+                }
+            }
+            targets.push(target);
         }
-        for &temp in waiting {
+        for &temp in &group {
             self.ppop(temp);
         }
         targets.push(Rc::from(name));
