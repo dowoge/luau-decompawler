@@ -5370,8 +5370,11 @@ impl<'c, 'm> Dec<'c, 'm> {
             && self.pending.contains_key(&a)
             && self.live_at(pc + 1 + d, a)
         {
-            // `x = a or b` that did not fold: a still flows to the target
+            // `x = a or b` that did not fold: a still flows to the target.
+            // What waits below it with effects was made first (`c[k] or f()`
+            // before a read of c that f may change): it goes out first
             let e = self.get(a);
+            self.flush_impure_below(out, ind, a, Some(&e), a);
             self.assign(out, ind, a, &e);
         }
         let (mut cond, target);
