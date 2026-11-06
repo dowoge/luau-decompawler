@@ -1080,11 +1080,23 @@ impl<'c, 'm> Dec<'c, 'm> {
             d.declared[i] = true;
             d.param_names.push(name);
         }
-        // named locals from debug info, when the script kept it
+        // named locals from debug info, when the script kept it: a name that is
+        // no identifier, a keyword, a global the script uses, the function's own
+        // name, or one another parameter already has keeps its `argN` (debug
+        // info is only a hint)
+        let mut taken: Vec<&str> = Vec::new();
         for (name, s, reg) in &p.locals {
-            if *reg < p.numparams && *s == 0 {
+            let name = name.as_str();
+            let usable = is_ident(name)
+                && !is_keyword(name)
+                && !d.ctx.globals.contains(name)
+                && !taken.contains(&name)
+                && p.name.as_deref() != Some(name)
+                && !d.param_names.iter().any(|n| &**n == name);
+            if *reg < p.numparams && *s == 0 && usable {
+                taken.push(name);
                 let k = d.var_key(*reg) as usize;
-                d.regname[k] = Some(Rc::from(name.as_str()));
+                d.regname[k] = Some(Rc::from(name));
             }
         }
         d.collect_labels();
