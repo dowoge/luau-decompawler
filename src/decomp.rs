@@ -503,6 +503,10 @@ struct Dec<'c, 'm> {
     defs_left: Vec<(u32, usize)>,
     /// Computing part of a larger value: what it computes waits for that one.
     in_value: bool,
+    /// value_of calls inside the outermost one, and how deep they are: a
+    /// value tried several ways at each level could take exponential time.
+    value_depth: u32,
+    value_calls: u32,
     value_reg: Option<usize>,
 }
 
@@ -1089,6 +1093,8 @@ impl<'c, 'm> Dec<'c, 'm> {
             defs_left: Vec::new(),
             in_value: false,
             value_reg: None,
+            value_depth: 0,
+            value_calls: 0,
         };
         for i in 0..p.numparams {
             let name: Rc<str> = Rc::from(format!("arg{}{}", i + 1, d.suffix));
@@ -3273,6 +3279,16 @@ impl<'c, 'm> Dec<'c, 'm> {
 
     /// Run [start, stop) as pure expression code; the value it leaves in r.
     fn value_of(&mut self, start: i32, stop: i32, r: usize, ind: usize, end: i32) -> Option<E> {
+        if self.value_depth == 0 {
+            self.value_calls = 0;
+        }
+        // tried more ways than any script needs (real ones stay under 100):
+        // the code is written as statements instead
+        self.value_calls += 1;
+        if self.value_calls > VALUE_CALLS {
+            return None;
+        }
+        self.value_depth += 1;
         let old = self.join_ok;
         let outer = (self.in_value, self.value_reg);
         self.join_ok = Some(stop); // the value meets the other branch's there
@@ -3281,6 +3297,7 @@ impl<'c, 'm> Dec<'c, 'm> {
         let v = self.value_of_body(start, stop, r, ind, end);
         (self.in_value, self.value_reg) = outer;
         self.join_ok = old;
+        self.value_depth -= 1;
         v
     }
 
@@ -6716,6 +6733,9 @@ fn drop_unused_copies(out: &mut Vec<String>, names: Vec<Rc<str>>) {
     }
 }
 
+/// The most value_of calls one outermost value may take: nested if-expressions
+/// tried each way at every level would take exponential time.
+const VALUE_CALLS: u32 = 4096;
 
 /// Luau's limit on locals in scope in one function, its parameters included.
 const LOCAL_LIMIT: usize = 200;
