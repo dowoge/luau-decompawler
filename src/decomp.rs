@@ -1626,11 +1626,16 @@ impl<'c, 'm> Dec<'c, 'm> {
     /// `function f()`, `local function f()`, `function t.k()` (and a
     /// constructor's `k = function`), never for `f = function()` or `local f =
     /// function()`. `want`: the name the target has to match.
+    /// A function with no name (stripped bytecode) that captures the variable
+    /// it is stored into is one too: in `local f = function` its body could
+    /// not see `f`.
     fn definition_rest(&self, x: &X, want: Option<&str>) -> Option<String> {
         let child = x.closure?;
-        let name = self.m.protos[child].name.as_deref().filter(|n| !n.is_empty())?;
-        if want.is_some_and(|w| w != name) {
-            return None;
+        match self.m.protos[child].name.as_deref().filter(|n| !n.is_empty()) {
+            Some(name) if want.is_some_and(|w| w != name) => return None,
+            Some(_) => {}
+            None if x.calls_itself && want.is_none() => {}
+            None => return None,
         }
         x.text.strip_prefix("function(").map(|r| format!("({r}"))
     }
@@ -6483,6 +6488,7 @@ impl<'c, 'm> Dec<'c, 'm> {
             }
         };
         let mut caps: Vec<Rc<str>> = Vec::new();
+        let mut calls_itself = false;
         let mut q = pc + ins.n;
         while self.valid(q) && self.insn(q).op == op::CAPTURE {
             let ci = self.insn(q);
@@ -6491,6 +6497,7 @@ impl<'c, 'm> Dec<'c, 'm> {
                 caps.push(Rc::from(self.upval(creg)));
             } else {
                 if creg == a {
+                    calls_itself = true;
                     // `local function f` that calls itself: name it now, so
                     // the body refers to it by that name
                     if let Some(hint) = m.protos[child].name.as_deref() {
@@ -6541,6 +6548,7 @@ impl<'c, 'm> Dec<'c, 'm> {
         let closure = ex_pure(text);
         closure.borrow_mut().hint = fname;
         closure.borrow_mut().closure = Some(child);
+        closure.borrow_mut().calls_itself = calls_itself;
         closure.borrow_mut().names_read = captured;
         self.put(out, ind, a, closure, true);
         q

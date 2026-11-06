@@ -55,6 +55,9 @@ pub struct X {
     pub uses: HashSet<u64>,
     /// The function this value creates.
     pub closure: Option<usize>,
+    /// That function captures the variable it is stored into: only `local
+    /// function f` puts `f` in scope for its own body.
+    pub calls_itself: bool,
     /// A copy of a variable a closure shares: a call may change the variable,
     /// and Luau reads a local operand where it is used, so the copy is a
     /// local of its own before any call.
@@ -103,6 +106,7 @@ pub fn ex(text: impl Into<String>, prec: i32) -> E {
         ifelse: None,
         uses: HashSet::default(),
         closure: None,
+        calls_itself: false,
         snapshot: false,
         constructor: false,
         newtable: false,
