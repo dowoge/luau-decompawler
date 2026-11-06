@@ -2635,6 +2635,10 @@ impl<'c, 'm> Dec<'c, 'm> {
             self.pset(r, e);
             return;
         }
+        // a value grown from statement after statement (`acc = acc + k` each
+        // time) past what one source expression can be goes out as one:
+        // Luau runs out of registers beyond about 250 operators in a chain
+        let inline = inline && !too_many_operators(&e.borrow().text);
         if inline && (self.read_once(pc, r) || (self.in_region && self.reaches_join_unread(pc, r))) {
             // the variable this value was computed for, at this register
             let k = self.flow.def_web(pc, r).map(|w| KW + w).unwrap_or_else(|| self.var_key(r));
@@ -6664,6 +6668,42 @@ fn state_operand_first(ins: &Insn, val: &RegSet, st: &RegSet, prev: Option<Insn>
         }
         _ => true,
     }
+}
+
+/// More binary operators than a source expression holds (outside strings):
+/// Luau compiles about 250 in one chain, and no script came near 200.
+fn too_many_operators(text: &str) -> bool {
+    const MOST: usize = 200;
+    // each operator takes at least ` + ` and an operand; a function's body
+    // holds statements, not one expression
+    if text.len() < MOST * 3 || text.contains("function") {
+        return false;
+    }
+    let b = text.as_bytes();
+    let (mut n, mut quote, mut i) = (0, 0u8, 0);
+    while i < b.len() {
+        let c = b[i];
+        if quote != 0 {
+            if c == b'\\' {
+                i += 1;
+            } else if c == quote {
+                quote = 0;
+            }
+        } else if matches!(c, b'"' | b'\'' | b'`') {
+            quote = c;
+        } else if c == b' ' && i + 2 < b.len() && b[i + 2] == b' ' && matches!(b[i + 1], b'+' | b'-' | b'*' | b'/' | b'%' | b'^' | b'<' | b'>') {
+            n += 1;
+        } else if c == b' ' && (b[i + 1..].starts_with(b".. ") || b[i + 1..].starts_with(b"and ") || b[i + 1..].starts_with(b"or ")
+            || b[i + 1..].starts_with(b"== ") || b[i + 1..].starts_with(b"~= ") || b[i + 1..].starts_with(b"// "))
+        {
+            n += 1;
+        }
+        if n > MOST {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 /// NEWTABLE's B for a hash part of n keys: the power of two that holds them, as log2 + 1.
