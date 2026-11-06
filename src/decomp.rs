@@ -891,6 +891,30 @@ pub fn decompile_lines(m: &Module, noflat: bool) -> Vec<String> {
             helpers.push((i, Rc::from(m.protos[i].name.as_deref().unwrap_or(""))));
         }
     }
+    // `(function() end)()`, inlined: no code at all is left of it, so it goes
+    // back where its line says, in the smallest function around it (two alike
+    // on one line once: a compiler that writes a copy of each leaves twins)
+    let empty = |i: usize| {
+        let p = &m.protos[i];
+        p.numparams == 0
+            && p.nups == 0
+            && p.vararg == 0
+            && p.code.iter().filter(|c| !matches!(c.op, op::NOP | op::BREAK | op::COVERAGE | op::PREPVARARGS)).count() == 1
+            && p.code.iter().any(|c| c.op == op::RETURN && c.b() == 1)
+    };
+    let mut placed: HashSet<u32> = HashSet::default();
+    for &i in orphans.iter().filter(|i| empty(**i)) {
+        let (from, to) = spans[i];
+        if !placed.insert(from) {
+            continue;
+        }
+        let around = (0..m.protos.len())
+            .filter(|o| *o != i && !empty(*o) && spans[*o].0 <= from && to <= spans[*o].1)
+            .min_by_key(|o| spans[*o].1 - spans[*o].0);
+        if let Some(parent) = around {
+            defs.entry(parent).or_default().push((from, i));
+        }
+    }
     defs.values_mut().for_each(|v| v.sort_unstable());
     // per function, its upvalues some closure creating it shares by reference
     let mut byref_ups: Vec<Vec<bool>> = m.protos.iter().map(|p| vec![false; p.nups]).collect();
@@ -2015,9 +2039,53 @@ impl<'c, 'm> Dec<'c, 'm> {
                     self.assign(out, ind, t, &e);
                 }
             }
+            // nothing reads the result, but the copy loads it: a call made as
+            // a statement compiles a constant, local, global or function it
+            // returns to nothing, so the source kept the value
+            // (`local x = f()`, x never read)
+            None if call.result.is_some_and(|t| call.results == 1 && self.result_loaded(call.helper, pc, call.end, call.last, t)) => {
+                let t = call.result.unwrap();
+                let e = ex(text, 100);
+                self.flush_impure_for(out, ind, t, Some(&e));
+                self.assign(out, ind, t, &e);
+            }
             None => out.push(format!("{}{text}", sp(ind))),
         }
         Some(call.end)
+    }
+
+    /// Is the copy's last instruction (at `last`, between `from` and `to`) the
+    /// last write to r, and does it load r (a constant, nil, a local, upvalue
+    /// or global, a function, `...`)? That is the return's value, which a call
+    /// made as a statement leaves out. (A local the helper built in the
+    /// result's register and returns was written by its own code before.)
+    fn result_loaded(&self, call_helper: usize, from: i32, to: i32, last_pc: i32, r: usize) -> bool {
+        let Some(start) = self.flow.idx(from) else { return false };
+        let last = self.p.code[start..].iter().take_while(|i| i.pc < to).filter(|i| effects(i, self.p.maxstack).1.has(r)).last();
+        // on the line of one of the helper's returns: its value, not a local of
+        // the helper's own computed before (`local ok = a and b; return ok`)
+        let helper = &self.m.protos[call_helper];
+        let return_lines: Vec<u32> =
+            helper.code.iter().filter(|i| i.op == op::RETURN).filter_map(|i| helper.lines.get(i.pc as usize).copied()).collect();
+        last.is_some_and(|i| {
+            i.pc == last_pc
+                && i.a() == r
+                && self.p.lines.get(i.pc as usize).is_some_and(|l| return_lines.contains(l))
+                && matches!(
+                    i.op,
+                    op::LOADNIL
+                        | op::LOADN
+                        | op::LOADK
+                        | op::LOADKX
+                        | op::MOVE
+                        | op::GETUPVAL
+                        | op::GETIMPORT
+                        | op::GETGLOBAL
+                        | op::DUPCLOSURE
+                        | op::NEWCLOSURE
+                        | op::GETVARARGS
+                )
+        })
     }
 
     /// A value is in r from the code before `from`, made by a call or by one put
@@ -4069,8 +4137,13 @@ impl<'c, 'm> Dec<'c, 'm> {
                 Some(c) => {
                     let name = self.m.protos[idx].name.clone().unwrap_or_default();
                     let text = self.closure_text(idx, c, ind);
-                    let body = text.strip_prefix("function").unwrap_or(&text);
-                    format!("{}local function {name}{body}", sp(ind))
+                    if name.is_empty() {
+                        // an empty function called where it stood
+                        format!("{}({text})()", sp(ind))
+                    } else {
+                        let body = text.strip_prefix("function").unwrap_or(&text);
+                        format!("{}local function {name}{body}", sp(ind))
+                    }
                 }
                 None => String::new(), // no call showed its upvalues
             };
