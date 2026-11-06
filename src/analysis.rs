@@ -4,7 +4,7 @@
 //! Luau reuses a register for unrelated locals once a scope ends. The writes
 //! that reach a common read are one variable.
 
-use crate::bytecode::{is_for, op, Insn, Proto};
+use crate::bytecode::{is_cond_jump, is_for, op, Insn, Proto};
 
 /// A function has at most 255 registers. What bad bytecode names past that,
 /// with a range running on from a high register, is dropped.
@@ -668,8 +668,87 @@ impl Flow {
             let branches = |c: &crate::bytecode::Insn| c.jump_target().is_some();
             !(i > 0 && branches(&code[i - 1])) && !code.get(i + 1).is_some_and(branches)
         };
+        // a constant something replaces is not the last word: it joins what
+        // replaces it. Joined to what it replaced as well, `local a, b` in
+        // each arm of a loop's `if` would be one variable for all the arms,
+        // which the back jump brings to each other's declarations
+        let mut replaced_later = vec![false; ndefs];
+        for &(_, old, _) in &replaced {
+            if (old as usize) < ndefs {
+                replaced_later[old as usize] = true;
+            }
+        }
         let mut merged = Vec::new();
+        let unread = |parent: &mut Vec<u32>, x: u32| !read_web[find(parent, x) as usize];
+        // can code at index `from` go on to `to` without a jump backward?
+        // (looked for so far, then taken to: as before)
+        let forward = |from: usize, to: usize| {
+            if from >= to {
+                return false;
+            }
+            let mut seen = vec![false; to - from + 1];
+            let mut stack = vec![from];
+            let mut steps = 0usize;
+            while let Some(i) = stack.pop() {
+                if i == to {
+                    return true;
+                }
+                steps += 1;
+                if steps > 20_000 {
+                    return true;
+                }
+                let (s, m) = code[i].successors();
+                for t in &s[..m] {
+                    let j = code.partition_point(|x| x.pc < *t);
+                    if j > i && j <= to && !seen[j - from] {
+                        seen[j - from] = true;
+                        stack.push(j);
+                    }
+                }
+            }
+            false
+        };
+        // a test between two instructions, or a jump landing past the first
+        // (counted once: tests[i] tests before i, landings[i] landings up to i)
+        let mut tests = vec![0u32; n + 1];
+        let mut landings = vec![0u32; n + 1];
+        for i in 0..n {
+            tests[i + 1] = tests[i] + u32::from(is_cond_jump(code[i].op));
+            landings[i + 1] = landings[i] + u32::from(targets[i + 1]);
+        }
+        let branch_between =
+            |from: usize, to: usize| from < to && (tests[to] > tests[from] || landings[to] > landings[from]);
+        // inside a loop's body: some jump backward goes from past i to i or before
+        let mut depth = vec![0i32; n + 1];
+        for (i, c) in code.iter().enumerate() {
+            if let Some(t) = c.jump_target().filter(|t| *t <= c.pc) {
+                let head = code.partition_point(|x| x.pc < t);
+                depth[head] += 1;
+                depth[i + 1] -= 1;
+            }
+        }
+        let mut in_loop = vec![false; n];
+        let mut level = 0;
+        for i in 0..n {
+            level += depth[i];
+            in_loop[i] = level > 0;
+        }
         for (new, old, r) in replaced {
+            // a constant no one reads, replaced in its turn, is a declaration
+            // (`local a`) when what it replaces comes to it only round a loop:
+            // `local a, b` in each arm of a loop's `if` is each arm's own, not
+            // one variable the back jump carries from arm to arm. (One that is
+            // read, `x = 0` in an arm, is a value like any other; and in code
+            // that runs straight on, registers are shared as before, which
+            // keeps long functions under the local limit.)
+            if constant(new)
+                && replaced_later[new as usize]
+                && unread(&mut parent, new)
+                && old < first_entry
+                && !forward(def_idx[old as usize] as usize, def_idx[new as usize] as usize)
+            {
+                continue;
+            }
             let entry_value = old >= first_entry;
             if entry_value && r >= p.numparams {
                 continue;
@@ -680,9 +759,19 @@ impl Flow {
             if closes.iter().any(|c| from < *c && *c < to && code[*c].a() <= r) {
                 continue;
             }
-            let unread = |parent: &mut Vec<u32>, x: u32| !read_web[find(parent, x) as usize];
             let dead_old = constant(old) && unread(&mut parent, old);
-            let dead_new = constant(new) && alone(new) && unread(&mut parent, new);
+            // (not the last word but a declaration in an arm of a loop's body,
+            // past a test from where the old value was made: `local a` in an
+            // `if` there is that arm's, made anew each time round, whatever the
+            // register held before; replaced in its turn, it joins what
+            // replaces it. Elsewhere it shares the register's variable as
+            // before, which keeps long functions under the local limit)
+            let at = def_idx[new as usize] as usize;
+            let declared_in_arm = replaced_later[new as usize]
+                && in_loop[at]
+                && old < first_entry
+                && branch_between(def_idx[old as usize] as usize, at);
+            let dead_new = constant(new) && alone(new) && !declared_in_arm && unread(&mut parent, new);
             if dead_old || dead_new {
                 merged.push((new, old));
             }
