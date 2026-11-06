@@ -92,10 +92,51 @@ fn finish_lines(mut lines: Vec<String>, m: Option<&Module>, native: bool) -> Vec
     if let Some(m) = m.filter(|_| decomp::INFO.load(std::sync::atomic::Ordering::Relaxed)) {
         lines = decomp::info_comments(lines, m);
     }
+    if let Some(line) = m.filter(|_| KEEP_LINES.load(std::sync::atomic::Ordering::Relaxed)).and_then(one_line) {
+        lines = on_one_line(&lines, line, native);
+        return lines;
+    }
     if native {
         lines.insert(0, "--!native".to_string());
     }
     lines
+}
+
+/// `--keep-lines`: a script all on one line (minified) is written on that line.
+static KEEP_LINES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The one line every instruction of the module is on, if there is one: a
+/// minified script. (Some check their own line numbers through `debug`.)
+fn one_line(m: &Module) -> Option<u32> {
+    let mut found: Option<u32> = None;
+    for p in &m.protos {
+        // (the main function's PREPVARARGS is on the chunk's first line)
+        let code = p.code.iter().filter(|i| i.op != bytecode::op::PREPVARARGS);
+        for l in code.filter_map(|i| p.lines.get(i.pc as usize).copied()) {
+            match found {
+                None => found = Some(l),
+                Some(f) if f == l => {}
+                Some(_) => return None,
+            }
+        }
+    }
+    found.filter(|l| *l >= 1)
+}
+
+/// The lines joined on source line `line`: blank lines and whole-line comments
+/// go (a comment would hide the rest); `--!native` stays on the first line.
+/// Statements that a line break alone kept apart already end in `;`.
+fn on_one_line(lines: &[String], line: u32, native: bool) -> Vec<String> {
+    let code: Vec<&str> = lines.iter().map(|l| l.trim()).filter(|l| !l.is_empty() && !l.starts_with("--")).collect();
+    let mut out: Vec<String> = Vec::new();
+    if native {
+        out.push("--!native".to_string());
+    }
+    while (out.len() as u32) + 1 < line {
+        out.push(String::new());
+    }
+    out.push(code.join(" "));
+    out
 }
 
 fn is_native(m: &Module) -> bool {
@@ -763,6 +804,8 @@ fn usage() -> i32 {
          \x20              (203 for a Roblox client's bytecode); with --dir, .lua, .luau,\n\
          \x20              .txt and .bin files are read too\n\
          \x20 --tabs       indent with tabs\n\
+         \x20 --keep-lines a script the bytecode shows all on one line (minified) is\n\
+         \x20              written on that line: some check their own line numbers\n\
          \x20 --info       above each function, a comment with its upvalues, constants,\n\
          \x20              parameters, registers, instructions and flags\n\
          \x20 --strict     a script needing a flag for a jump, or blocks dispatched by\n\
@@ -785,6 +828,7 @@ fn run(args: Vec<String>) -> i32 {
     let noflat = std::env::var_os("LUAU_NOFLAT").is_some_and(|v| !v.is_empty());
     let upstream = args.iter().any(|a| a == "--upstream");
     TABS.store(args.iter().any(|a| a == "--tabs"), std::sync::atomic::Ordering::Relaxed);
+    KEEP_LINES.store(args.iter().any(|a| a == "--keep-lines"), std::sync::atomic::Ordering::Relaxed);
     decomp::INFO.store(args.iter().any(|a| a == "--info"), std::sync::atomic::Ordering::Relaxed);
     STRICT.store(args.iter().any(|a| a == "--strict"), std::sync::atomic::Ordering::Relaxed);
     RETURN_TYPES.store(args.iter().any(|a| a == "--return-types"), std::sync::atomic::Ordering::Relaxed);
@@ -800,7 +844,7 @@ fn run(args: Vec<String>) -> i32 {
         None if upstream => Opcodes::Stock,
         None => Opcodes::Wire,
     };
-    let flags = ["--upstream", "--tabs", "--info", "--strict", "--return-types"];
+    let flags = ["--upstream", "--tabs", "--info", "--strict", "--return-types", "--keep-lines"];
     let mut args: Vec<String> = args.into_iter().filter(|a| !flags.contains(&a.as_str())).collect();
     if let Some(i) = args.iter().position(|a| a == "--key") {
         args.drain(i..i + 2);
@@ -960,5 +1004,21 @@ mod tests {
         assert_eq!(sanitize("/Workspace/Car/", "7"), "Workspace/Car");
         assert_eq!(sanitize("a:b\\c", "7"), "a_b_c");
         assert_eq!(sanitize("///", "7"), "7");
+    }
+}
+
+#[cfg(test)]
+mod keep_lines_tests {
+    use super::*;
+
+    #[test]
+    fn a_minified_script_goes_back_on_its_line() {
+        let lines: Vec<String> =
+            ["local t = {}", "", "-- a note", "t.x = 1;", "(print)(t.x)"].iter().map(|s| s.to_string()).collect();
+        let out = on_one_line(&lines, 3, false);
+        assert_eq!(out, vec!["", "", "local t = {} t.x = 1; (print)(t.x)"]);
+        let native = on_one_line(&lines, 2, true);
+        assert_eq!(native[0], "--!native");
+        assert_eq!(native.len(), 2);
     }
 }
