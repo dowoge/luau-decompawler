@@ -58,6 +58,9 @@ pub struct X {
     /// That function captures the variable it is stored into: only `local
     /// function f` puts `f` in scope for its own body.
     pub calls_itself: bool,
+    /// Made by an inlined copy, of a function written further in, and read by
+    /// nothing: its definition goes unless a call by name needs it.
+    pub unused_copy: bool,
     /// A copy of a variable a closure shares: a call may change the variable,
     /// and Luau reads a local operand where it is used, so the copy is a
     /// local of its own before any call.
@@ -107,6 +110,7 @@ pub fn ex(text: impl Into<String>, prec: i32) -> E {
         uses: HashSet::default(),
         closure: None,
         calls_itself: false,
+        unused_copy: false,
         snapshot: false,
         constructor: false,
         newtable: false,

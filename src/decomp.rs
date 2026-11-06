@@ -348,6 +348,8 @@ type Body = Rc<(Vec<String>, Vec<String>)>;
 /// One module being decompiled.
 pub struct Ctx<'m> {
     m: &'m Module,
+    /// Per function, the function its definition is written in, by lines.
+    home: Vec<Option<usize>>,
     globals: HashSet<String>,
     /// A closure's text depends only on its proto, what it captures and its
     /// depth, and every enclosing pass asks for it again.
@@ -494,6 +496,8 @@ struct Dec<'c, 'm> {
     joined_value: Option<usize>,
     /// Per pc: the helper inlined there, and its name.
     inlined: RefCell<Vec<Option<Option<(Rc<Inlined>, Rc<str>)>>>>,
+    /// Definitions written for closures copies made that nothing read.
+    unused_copies: Vec<Rc<str>>,
     refusals: RefCell<Vec<(usize, String)>>,
     /// Dropped definitions still to come, next last.
     defs_left: Vec<(u32, usize)>,
@@ -942,8 +946,22 @@ pub fn decompile_lines(m: &Module, noflat: bool) -> Vec<String> {
             }
         }
     }
+    // per function, the function its definition is written in: the smallest
+    // other whose lines take in its first line (none without line info)
+    let home: Vec<Option<usize>> = (0..m.protos.len())
+        .map(|c| {
+            let line = m.protos[c].linedefined;
+            if m.protos[c].lines.is_empty() || line == 0 {
+                return None;
+            }
+            (0..m.protos.len())
+                .filter(|&o| o != c && spans[o].0 < line && line < spans[o].1)
+                .min_by_key(|&o| spans[o].1 - spans[o].0)
+        })
+        .collect();
     let ctx = Ctx {
         m,
+        home,
         byref_ups,
         globals: module_globals(m),
         memo: RefCell::new(HashMap::default()),
@@ -1066,6 +1084,7 @@ impl<'c, 'm> Dec<'c, 'm> {
             skip_to: None,
             joined_value: None,
             inlined: RefCell::new(vec![None; p.lines.len()]),
+            unused_copies: Vec::new(),
             refusals: RefCell::new(Vec::new()),
             defs_left: Vec::new(),
             in_value: false,
@@ -1617,6 +1636,9 @@ impl<'c, 'm> Dec<'c, 'm> {
             match self.definition_rest(&x, None) {
                 Some(rest) => out.push(format!("{pad}local function {name}{rest}")),
                 None => out.push(format!("{pad}local {name} = {}", x.text)),
+            }
+            if x.unused_copy {
+                self.unused_copies.push(name.clone());
             }
         }
     }
@@ -2993,6 +3015,7 @@ impl<'c, 'm> Dec<'c, 'm> {
             self.emit_range(&mut out, base, 0, p.sizecode, None, None);
         }
         self.fill_defs(&mut out);
+        drop_unused_copies(&mut out, std::mem::take(&mut self.unused_copies));
         // its loads may all have been inside copies put back as calls
         for (name, line) in shared.into_iter().rev() {
             if out.iter().any(|l| contains_ident(l, &name)) {
@@ -6487,6 +6510,16 @@ impl<'c, 'm> Dec<'c, 'm> {
                 _ => panic!("DUPCLOSURE constant is not a closure"),
             }
         };
+        // a closure an inlined copy made, of a function written further in, that
+        // nothing reads: making it does nothing, and the function is written
+        // where it is defined. Printing it here too would repeat it, and every
+        // function it holds, once per copy; it goes unless a call put back by
+        // name needs it (see drop_unused_copies)
+        let spans = &self.ctx.spans;
+        let own = spans[self.idx];
+        let further_in = self.ctx.home[child]
+            .is_some_and(|h| h != self.idx && own.0 <= spans[h].0 && spans[h].1 <= own.1 && spans[h] != own);
+        let unused_copy = further_in && !self.pending.contains_key(&a) && !self.live_after(pc, a);
         let mut caps: Vec<Rc<str>> = Vec::new();
         let mut calls_itself = false;
         let mut q = pc + ins.n;
@@ -6549,6 +6582,7 @@ impl<'c, 'm> Dec<'c, 'm> {
         closure.borrow_mut().hint = fname;
         closure.borrow_mut().closure = Some(child);
         closure.borrow_mut().calls_itself = calls_itself;
+        closure.borrow_mut().unused_copy = unused_copy;
         closure.borrow_mut().names_read = captured;
         self.put(out, ind, a, closure, true);
         q
@@ -6659,6 +6693,29 @@ fn declared_names(chunk: &str, base: &str) -> Vec<String> {
     let head = rest.split(" = ").next().unwrap_or(rest);
     head.split(',').map(|s| s.trim().to_string()).filter(|s| is_ident(s)).collect()
 }
+
+/// A definition of a closure a copy made that nothing read goes when nothing
+/// else in the body names it (a call put back by name keeps it).
+fn drop_unused_copies(out: &mut Vec<String>, names: Vec<Rc<str>>) {
+    for name in names {
+        let def = |l: &str| {
+            let t = l.trim_start();
+            t.strip_prefix("local function ").or_else(|| t.strip_prefix("local ")).is_some_and(|r| {
+                r.strip_prefix(&*name).is_some_and(|rest| rest.starts_with('(') || rest.starts_with(" = function"))
+            })
+        };
+        let defs: Vec<usize> = (0..out.len()).filter(|&i| def(&out[i])).collect();
+        let [at] = defs[..] else { continue };
+        // a function that defines the name for itself means its own by it
+        let own = format!("local function {name}(");
+        let names_it = |i: usize| i != at && contains_ident(&out[i], &name) && !out[i].contains(&own);
+        if (0..out.len()).any(names_it) {
+            continue;
+        }
+        out.remove(at);
+    }
+}
+
 
 /// Luau's limit on locals in scope in one function, its parameters included.
 const LOCAL_LIMIT: usize = 200;
