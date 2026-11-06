@@ -1369,13 +1369,14 @@ fn copy_unless_guards(lines: &mut Vec<String>) {
     // another's code is gone before that code is copied. A flag that could
     // not go, copied with that code, is tried again in each place.
     let mut tried: HashSet<String> = HashSet::default();
+    let room = 3 * lines.len() + FOLLOW_TOTAL_SLACK;
     for _ in 0..10_000 {
         for f in unique_flags(lines) {
             tried.remove(&f);
         }
         let found = (0..lines.len()).rev().find_map(|k| flag_declared(&lines[k]).filter(|f| !tried.contains(f)).map(|f| (k, f)));
         let Some((k, f)) = found else { break };
-        if !follow_flag(lines, k, &f) && !break_for_flag(lines, k, &f) {
+        if !follow_flag(lines, k, &f, room) && !break_for_flag(lines, k, &f) {
             tried.insert(f);
         }
     }
@@ -1698,6 +1699,12 @@ enum End {
 /// Most lines the copies a flag's removal makes may add, in all.
 const FOLLOW_GROWTH: usize = 80;
 
+/// The most a function may grow to by following all its flags: three times
+/// what it was, and this many lines more. Each flag may take its block to
+/// three times its size, and flags nested in each other's blocks would do
+/// that again and again (ten deep, 20 lines came to half a million).
+const FOLLOW_TOTAL_SLACK: usize = 4000;
+
 thread_local! {
     /// LUAU_WHY: what stopped the last flag followed.
     static FOLLOW_WHY: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
@@ -1714,8 +1721,12 @@ fn follow_stop<T>(why: &'static str) -> Option<T> {
 /// leave F different ways, the statements after it go into each of its
 /// arms, there to be followed with F known again. Nothing is done when F is
 /// read any other way (in a loop or a function), when a copy would hide a
-/// name with one an arm declares, or when the copies add too much.
-fn follow_flag(lines: &mut Vec<String>, decl: usize, flag: &str) -> bool {
+/// name with one an arm declares, or when the copies add too much: for this
+/// flag, or past `room`, the most lines the whole may come to.
+fn follow_flag(lines: &mut Vec<String>, decl: usize, flag: &str, room: usize) -> bool {
+    if lines.len() >= room {
+        return false;
+    }
     let d = indent_of(&lines[decl]);
     let end = (decl + 1..lines.len()).find(|&i| !is_blank(&lines[i]) && indent_of(&lines[i]) < d).unwrap_or(lines.len());
     // the statements moved into arms must stay where `until` sees them
@@ -1739,6 +1750,7 @@ fn follow_flag(lines: &mut Vec<String>, decl: usize, flag: &str) -> bool {
     let why = match &got {
         None => FOLLOW_WHY.with(|c| c.get()),
         Some((new, _)) if new.len() > body.len() + growth => "too many lines copied",
+        Some((new, _)) if lines.len() - (end - decl) + new.len() > room => "the function would grow too much",
         Some((new, _)) if new.iter().any(|l| has_word(l, flag)) => "still read",
         Some(_) => "",
     };
