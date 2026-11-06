@@ -195,6 +195,8 @@ pub struct Insn {
     pub w: u32,
     pub aux: u32,
     pub n: i32,
+    /// A jump's offset when it is too far for D (see `untrampoline`).
+    pub far: Option<i32>,
 }
 
 impl Insn {
@@ -212,6 +214,9 @@ impl Insn {
     }
     #[inline]
     pub fn d(&self) -> i32 {
+        if let Some(far) = self.far {
+            return far;
+        }
         (self.w >> 16) as u16 as i16 as i32
     }
 
@@ -437,6 +442,44 @@ pub fn saved_text(data: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// A jump too far for its 16-bit D gets a trampoline in front of it
+/// (BytecodeBuilder::expandJumps): `JUMP +1; JUMPX far; OP -2`, OP jumping
+/// back to the JUMPX. Undone here: OP jumps far itself and the two before it
+/// are NOPs, so the code has the shape the source gave it. Only where nothing
+/// else jumps to the JUMPX. What lands on the first JUMP (a `LOADB` skipping
+/// one, whose count the compiler does not move) goes on through both NOPs to
+/// OP, as it went on through the JUMP.
+fn untrampoline(code: &mut [Insn]) {
+    if !code.iter().any(|i| i.op == op::JUMPX) {
+        return;
+    }
+    // how many jumps land on each pc
+    let mut landed: std::collections::HashMap<i32, u32> = std::collections::HashMap::new();
+    for i in code.iter() {
+        if let Some(t) = i.jump_target() {
+            *landed.entry(t).or_default() += 1;
+        }
+    }
+    for k in 0..code.len().saturating_sub(2) {
+        let (j, x, o) = (code[k], code[k + 1], code[k + 2]);
+        let relay = j.op == op::JUMP
+            && j.d() == 1
+            && x.op == op::JUMPX
+            && x.pc == j.pc + 1
+            && o.pc == x.pc + 1
+            && o.op != op::JUMPX
+            && o.jump_target() == Some(x.pc)
+            && landed.get(&x.pc) == Some(&1); // the JUMPX is reached only from OP
+        if !relay {
+            continue;
+        }
+        let Some(target) = x.jump_target() else { continue };
+        code[k + 2].far = Some(target - (o.pc + 1));
+        code[k].op = op::NOP;
+        code[k + 1].op = op::NOP;
+    }
+}
+
 /// Reads a whole bytecode blob whose opcodes are stored as `opcodes` says.
 /// A Roblox client writes its own scripts with a low version byte but each
 /// proto led by its byte size, as v12+ does; such a blob reads with sizes
@@ -509,9 +552,10 @@ fn parse_layout(data: &[u8], opcodes: Opcodes, sized: bool) -> R<Module> {
             };
             let n = insn_len(o);
             let aux = if n == 2 && pc + 1 < sizecode { word(pc + 1) } else { 0 };
-            code.push(Insn { pc: pc as i32, op: o, w, aux, n });
+            code.push(Insn { pc: pc as i32, op: o, w, aux, n, far: None });
             pc += n as usize;
         }
+        untrampoline(&mut code);
         let nk = r.varint()? as usize;
         let mut k = Vec::with_capacity(nk.min(1 << 16));
         for _ in 0..nk {
