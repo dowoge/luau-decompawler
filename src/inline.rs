@@ -1651,6 +1651,32 @@ fn match_once(
         REACHED.with(|r| r.set((k, want.len(), p.op, c.op)));
         UNSEEN.with(|u| u.set(walk.args.iter().enumerate().filter(|(r, a)| a.is_none() && *r < 64).fold(0, |m, (r, _)| m | 1 << r)));
         landing.insert(p.pc, c.pc);
+        // `f()` of a parameter given a local function: the compiler copied
+        // that function's code in here too, so the call is a copy of it
+        if let Some(nested) = nested_call(&walk, &want, k, caller, start, i) {
+            for &(param, r, at) in &nested.binds {
+                match walk.args[param] {
+                    None => {
+                        walk.args[param] = Some(Arg::Reg(r, at));
+                        walk.map[param] = Some(r);
+                    }
+                    Some(Arg::Reg(x, _)) if x == r => {}
+                    _ => return refuse("a parameter given two values"),
+                }
+            }
+            let call = want[k + nested.skip];
+            if call.c() != 1 {
+                walk.map[call.a()] = nested.call.result;
+            }
+            walk.written.extend(nested.call.written.iter().copied());
+            for w in &want[k..=k + nested.skip] {
+                landing.insert(w.pc, c.pc);
+            }
+            last = nested.call.last;
+            i = skip(code, code.partition_point(|x| x.pc < nested.call.end));
+            folded = nested.skip;
+            continue;
+        }
         // `return a, b` of locals a closure captured: the copy moves the
         // results out first and closes the locals after
         if p.op == op::CLOSEUPVALS && c.op != op::CLOSEUPVALS && want.get(k + 1).is_some_and(|w| w.op == op::RETURN) {
@@ -2033,6 +2059,155 @@ fn feeds_return(want: &[&Insn], k: usize) -> bool {
         }
     }
     false
+}
+
+thread_local! {
+    /// How deep nested_call has gone: copies within copies within copies.
+    static NESTED: Cell<u32> = const { Cell::new(0) };
+}
+
+/// A call of the helper's found in the copy as a copy of the function called:
+/// the copy, how many of the helper's instructions after this one it covers
+/// (the call last), and the parameters it shows the values of.
+struct Nested {
+    call: Inlined,
+    skip: usize,
+    binds: Vec<(usize, usize, i32)>,
+}
+
+/// A call of the helper's where the copy has the called function's code: the
+/// compiler copied that in at the call site but not in the helper's own code.
+///   `MOVE t, param; CALL t`: a parameter given a local function. Each
+///   closure the caller made before the copy and left in its register is
+///   tried there; exactly one may match.
+///   `DUPCLOSURE t, G; MOVE t+1, x ...; CALL t`: a function literal called
+///   with values (in the helper, with a parameter it could not fold).
+/// The arguments must be the walk's for the helper's call (an unread
+/// parameter of the helper takes the copy's), the result where it wants one.
+fn nested_call(walk: &Walk<'_>, want: &[&Insn], k: usize, caller: &Proto, start: usize, i: usize) -> Option<Nested> {
+    let code = &caller.code;
+    if code.get(i).is_none_or(|c| c.op == op::MOVE || plain(c.op) == op::CALL) {
+        return None; // a plain call: the function moved into place
+    }
+    if NESTED.with(Cell::get) >= 3 {
+        return None;
+    }
+    let p = want[k];
+    if matches!(p.op, op::DUPCLOSURE | op::NEWCLOSURE) {
+        return literal_call(walk, want, k, caller, i);
+    }
+    if p.op != op::MOVE || p.b() >= walk.helper.numparams || walk.assigned[p.b()] {
+        return None;
+    }
+    let call = want.get(k + 1)?;
+    if plain(call.op) != op::CALL || call.a() != p.a() || call.b() == 0 {
+        return None;
+    }
+    let mut cands: Vec<(usize, i32, usize)> = Vec::new();
+    for j in 0..start.min(code.len()) {
+        let ins = &code[j];
+        let f = match ins.op {
+            op::NEWCLOSURE => caller.children.get(ins.d().max(0) as usize).copied(),
+            op::DUPCLOSURE => match caller.k.get(ins.d().max(0) as usize) {
+                Some(K::Closure(c)) => Some(*c),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some(f) = f else { continue };
+        let r = ins.a();
+        let kept = !code[j + 1..start].iter().any(|x| full_effects(x, caller.maxstack).1.has(r));
+        if kept && std::ptr::from_ref(&walk.m.protos[f]) != std::ptr::from_ref(walk.helper) {
+            cands.push((r, ins.pc, f));
+        }
+    }
+    if let Some(m) = walk.map[p.b()] {
+        cands.retain(|x| x.0 == m);
+    }
+    let nargs = call.b() - 1;
+    let mut found: Option<Nested> = None;
+    for (r, at, f) in cands {
+        NESTED.with(|n| n.set(n.get() + 1));
+        let got = match_call(walk.m, caller, f, i);
+        NESTED.with(|n| n.set(n.get() - 1));
+        let Some(n) = got else { continue };
+        // the helper's arguments, as the walk has them, are the copy's
+        let args_fit = (0..nargs.max(n.args.len())).all(|a| {
+            let mine = if a < nargs { walk.map.get(call.a() + 1 + a).copied().flatten() } else { None };
+            match (n.args.get(a).cloned().flatten(), mine) {
+                (Some(Arg::Reg(x, _)), Some(y)) => x == y,
+                (None, None) => true,
+                (None, Some(_)) => n.omitted.get(a).copied().unwrap_or(false),
+                _ => false,
+            }
+        });
+        let result_fits = match call.c() {
+            1 => true,
+            2 | 0 => n.result.is_some() && n.results == 1,
+            _ => false,
+        };
+        if !args_fit || !result_fits {
+            continue;
+        }
+        if found.is_some() {
+            return None; // two functions would do: neither is known to be it
+        }
+        found = Some(Nested { call: n, skip: 1, binds: vec![(p.b(), r, at)] });
+    }
+    found
+}
+
+/// The `DUPCLOSURE t, G; MOVE t+1, x ...; CALL t` form of nested_call.
+fn literal_call(walk: &Walk<'_>, want: &[&Insn], k: usize, caller: &Proto, i: usize) -> Option<Nested> {
+    let helper = walk.helper;
+    let p = want[k];
+    let g = match p.op {
+        op::NEWCLOSURE => helper.children.get(p.d().max(0) as usize).copied()?,
+        _ => match helper.k.get(p.d().max(0) as usize)? {
+            K::Closure(c) => *c,
+            _ => return None,
+        },
+    };
+    let t = p.a();
+    let mut j = k + 1;
+    let mut srcs: Vec<usize> = Vec::new();
+    while let Some(w) = want.get(j) {
+        if w.op == op::MOVE && w.a() == t + 1 + srcs.len() {
+            srcs.push(w.b());
+            j += 1;
+        } else {
+            break;
+        }
+    }
+    let call = want.get(j)?;
+    if plain(call.op) != op::CALL || call.a() != t || call.b() == 0 || call.b() - 1 != srcs.len() {
+        return None;
+    }
+    NESTED.with(|n| n.set(n.get() + 1));
+    let got = match_call(walk.m, caller, g, i);
+    NESTED.with(|n| n.set(n.get() - 1));
+    let n = got?;
+    let mut binds = Vec::new();
+    for (a, &src) in srcs.iter().enumerate() {
+        let given = n.args.get(a).cloned().flatten();
+        match (walk.map.get(src).copied().flatten(), given) {
+            (Some(x), Some(Arg::Reg(y, _))) if x == y => {}
+            // a parameter of the helper nothing read yet: what the copy shows
+            (None, Some(Arg::Reg(y, at))) if src < helper.numparams && walk.args[src].is_none() && !walk.assigned[src] => {
+                binds.push((src, y, at));
+            }
+            _ => return None,
+        }
+    }
+    if n.args.len() > srcs.len() && n.args[srcs.len()..].iter().any(Option::is_some) {
+        return None;
+    }
+    let result_fits = match call.c() {
+        1 => true,
+        2 | 0 => n.result.is_some() && n.results == 1,
+        _ => false,
+    };
+    result_fits.then_some(Nested { call: n, skip: j - k, binds })
 }
 
 /// The register the caller's instruction just before a copy (at index

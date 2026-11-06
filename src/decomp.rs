@@ -1765,9 +1765,10 @@ impl<'c, 'm> Dec<'c, 'm> {
                     .written
                     .iter()
                     .any(|r| !call.holds_result(*r) && self.valid(call.end) && self.live_at(call.end, *r));
-                if !leftover && call.upvals.iter().all(Option::is_some) {
+                // one whose code starts with a copy of another is the call
+                // that covers more, as for named helpers
+                if !leftover && call.upvals.iter().all(Option::is_some) && found.as_ref().is_none_or(|(f, _)| call.end > f.end) {
                     found = Some((Rc::new(call), Rc::from("")));
-                    break;
                 }
             }
         }
@@ -1931,6 +1932,17 @@ impl<'c, 'm> Dec<'c, 'm> {
                 self.assign(out, ind, *r, &e);
             }
         }
+        // arguments are made left to right: one made before an earlier one
+        // was made before the call, a local of its own
+        // (`local cleanup = function() end  run(function() end, cleanup)`)
+        let made: Vec<Option<i32>> = regs.iter().map(|r| self.made_before(pc, *r)).collect();
+        for (k, r) in regs.iter().enumerate() {
+            let early = made[k].is_some_and(|m| made[..k].iter().flatten().any(|e| *e > m));
+            if early && self.pending.contains_key(r) {
+                let e = self.get(*r);
+                self.assign(out, ind, *r, &e);
+            }
+        }
         let unread = self.unread_args(&call);
         let mut args: Vec<String> = Vec::with_capacity(call.args.len());
         for (i, arg) in call.args.iter().enumerate() {
@@ -2052,6 +2064,21 @@ impl<'c, 'm> Dec<'c, 'm> {
             None => out.push(format!("{}{text}", sp(ind))),
         }
         Some(call.end)
+    }
+
+    /// The pc of the last write to r before `before`, in straight code (none
+    /// past a jump landing: another path may have made it).
+    fn made_before(&self, before: i32, r: usize) -> Option<i32> {
+        let end = self.flow.idx(before)?;
+        for ins in self.p.code[..end].iter().rev() {
+            if effects(ins, self.p.maxstack).1.has(r) {
+                return Some(ins.pc);
+            }
+            if self.has_label(ins.pc) {
+                return None;
+            }
+        }
+        None
     }
 
     /// Is the copy's last instruction (at `last`, between `from` and `to`) the
