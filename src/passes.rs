@@ -4995,6 +4995,10 @@ fn interpolation(lines: Vec<String>) -> Vec<String> {
                 text.push_str(&piece.replace("%%", "%").replace('{', "\\{").replace("\\\"", "\""));
                 if k < args.len() {
                     text.push('{');
+                    // `{{` is not allowed: a hole starting with a table constructor gets a space
+                    if args[k].starts_with('{') {
+                        text.push(' ');
+                    }
                     text.push_str(&args[k]);
                     text.push('}');
                 }
