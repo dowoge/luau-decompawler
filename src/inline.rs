@@ -1772,6 +1772,27 @@ fn match_once(
                     i = skip(code, i + 1);
                     stores.insert(c.pc, (code.get(i)?.pc, p.a()));
                 }
+                // `return v` of a parameter nothing read: its argument was made
+                // where the result goes (the compiler puts a returned local in
+                // the caller's result register), by the caller's code just
+                // before the copy; nothing of the copy touches that register
+                2 if p.a() < walk.helper.numparams
+                    && walk.map[p.a()].is_none()
+                    && walk.args[p.a()].is_none()
+                    && walk.assumed[p.a()].is_none()
+                    && !walk.assigned[p.a()]
+                    && !walk.unread.contains_key(&p.a())
+                    && finished
+                    && result.is_none()
+                    && argument_before(walk.helper, caller, start).is_some_and(|(r, _)| {
+                        !walk.written.contains(&r) && !walk.map.iter().flatten().any(|m| *m == r)
+                    }) =>
+                {
+                    let (r, at) = argument_before(walk.helper, caller, start)?;
+                    walk.map[p.a()] = Some(r);
+                    walk.args[p.a()] = Some(Arg::Reg(r, at));
+                    result = Some(r);
+                }
                 _ if p.b() != 1 && walk.map[p.a()].is_none() && !walk.unread.contains_key(&p.a()) => {
                     if result.is_some() {
                         return refuse("a value is used and not used");
@@ -2012,6 +2033,21 @@ fn feeds_return(want: &[&Insn], k: usize) -> bool {
         }
     }
     false
+}
+
+/// The register the caller's instruction just before a copy (at index
+/// `start`) writes, and its pc: an argument made there, on the caller's own
+/// line. One register, by a plain write: no jump, nothing more.
+fn argument_before(helper: &Proto, caller: &Proto, start: usize) -> Option<(usize, i32)> {
+    let prev = caller.code.get(start.checked_sub(1)?)?;
+    if prev.jump_target().is_some() || ignored(prev.op) || !outside(helper, caller, prev.pc) {
+        return None;
+    }
+    let written: Vec<usize> = full_effects(prev, caller.maxstack).1.iter().collect();
+    match written[..] {
+        [r] => Some((r, prev.pc)),
+        _ => None,
+    }
 }
 
 /// Is the caller's instruction at pc on a line outside the helper's? (False
