@@ -2465,12 +2465,18 @@ impl<'c, 'm> Dec<'c, 'm> {
     /// pending already: when it has effects, a constructor below it that made
     /// calls goes before it too.
     fn flush_impure_for(&mut self, out: &mut Vec<String>, ind: usize, r: usize, value: Option<&E>) {
+        self.flush_impure_below(out, ind, r, value, usize::MAX);
+    }
+
+    /// flush_impure_for, but only for the values pending in registers under
+    /// `below`: those above a local's register were made after its value.
+    fn flush_impure_below(&mut self, out: &mut Vec<String>, ind: usize, r: usize, value: Option<&E>, below: usize) {
         if self.pending.is_empty() {
             return;
         }
         let effects = value.is_some_and(|e| !e.borrow().pure_);
         let goes = |q: usize, x: &X| q != r && !x.pure_ && x.fields.is_none() && !x.method && x.text != "<self>" && !x.multret;
-        let keys: Vec<usize> = self.pending.keys().copied().collect();
+        let keys: Vec<usize> = self.pending.range(..below).map(|(q, _)| *q).collect();
         for q in keys {
             let Some(v) = self.pending.get(&q) else { continue }; // written out on the way
             let go = {
@@ -5735,9 +5741,17 @@ impl<'c, 'm> Dec<'c, 'm> {
                 self.declare_named(out, ind, b); // to where copied-in code keeps it, or an argument
                 // read again after this copy (`own = slot and t[slot]`): the
                 // value has to stay where it is, under its own name
-                if self.pending.contains_key(&b) && !self.shared(pc, b) && self.live_after(pc, b) && b != a {
+                // a constructor copied up, above where it was built, was a local
+                // (`print({})` builds the table where the call takes it); copied
+                // down it is a temporary of an assignment (`x = {}`)
+                let local_table = b < a && self.pending.get(&b).is_some_and(|e| e.borrow().fields.is_some());
+                let read_again = self.live_after(pc, b);
+                if self.pending.contains_key(&b) && !self.shared(pc, b) && (read_again || local_table) && b != a {
                     let e = self.get(b);
-                    self.flush_impure_for(out, ind, b, Some(&e));
+                    // a table declared only for this copy goes before what was
+                    // loaded after it (`obj` in `local t = {}; obj:m(t)`)
+                    let below = if read_again { usize::MAX } else { b };
+                    self.flush_impure_below(out, ind, b, Some(&e), below);
                     self.assign(out, ind, b, &e);
                 }
                 let shared = !self.pending.contains_key(&b) && self.shared(pc, b);
