@@ -721,6 +721,15 @@ fn parse_layout(data: &[u8], opcodes: Opcodes, sized: bool) -> R<Module> {
         if let Some(size) = size {
             r.o = start + size; // the size is authoritative
         }
+        // GETIMPORT runs the import constant D names, resolved when the script
+        // loads; its AUX is only read when that failed. The constant is the
+        // truth: AUX naming another path would print a global never read.
+        let mut code = code;
+        for ins in code.iter_mut().filter(|i| i.op == op::GETIMPORT) {
+            if let Some(K::Import(id)) = usize::try_from(ins.d()).ok().and_then(|d| k.get(d)) {
+                ins.aux = *id;
+            }
+        }
         protos.push(Proto {
             maxstack,
             numparams,
