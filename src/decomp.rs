@@ -6182,7 +6182,10 @@ impl<'c, 'm> Dec<'c, 'm> {
                 let (sym, prec) = binop(o);
                 let l = self.get(b);
                 let r = self.get(c);
-                let t = format!("{} {sym} {}", wrap(&l, prec), wrap(&r, prec + 1));
+                // `^` groups to the right: `(a ^ b) ^ c` keeps its parentheses,
+                // `a ^ (b ^ c)` and `a ^ -b` need none
+                let (lp, rp) = if o == op::POW { (prec + 1, 8) } else { (prec, prec + 1) };
+                let t = format!("{} {sym} {}", wrap(&l, lp), wrap(&r, rp));
                 self.put(out, ind, a, ex(t, prec), true);
             }
             op::ADDK | op::SUBK | op::MULK | op::DIVK | op::MODK | op::POWK | op::IDIVK => {
@@ -6190,7 +6193,8 @@ impl<'c, 'm> Dec<'c, 'm> {
                 let l = self.get(b);
                 // `x ^ -k` needs no parentheses: a negation binds there
                 let need = if o == op::POWK { 8 } else { prec + 1 };
-                let t = format!("{} {sym} {}", wrap(&l, prec), kwrap(kexpr(m, p, c as i64), need));
+                let lp = if o == op::POWK { prec + 1 } else { prec };
+                let t = format!("{} {sym} {}", wrap(&l, lp), kwrap(kexpr(m, p, c as i64), need));
                 self.put(out, ind, a, ex(t, prec), true);
             }
             op::SUBRK | op::DIVRK => {
