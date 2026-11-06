@@ -110,9 +110,11 @@ static KEEP_LINES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 /// minified script. (Some check their own line numbers through `debug`.)
 fn one_line(m: &Module) -> Option<u32> {
     let mut found: Option<u32> = None;
-    for p in &m.protos {
-        // (the main function's PREPVARARGS is on the chunk's first line)
-        let code = p.code.iter().filter(|i| i.op != bytecode::op::PREPVARARGS);
+    for (k, p) in m.protos.iter().enumerate() {
+        // the main function's PREPVARARGS is on the chunk's first line, and
+        // its closing `return` on the last (after the code's newline)
+        let closing = (k == m.main).then(|| p.code.last()).flatten().filter(|i| i.op == bytecode::op::RETURN && i.b() == 1);
+        let code = p.code.iter().filter(|i| i.op != bytecode::op::PREPVARARGS && Some(i.pc) != closing.map(|c| c.pc));
         for l in code.filter_map(|i| p.lines.get(i.pc as usize).copied()) {
             match found {
                 None => found = Some(l),
