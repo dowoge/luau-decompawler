@@ -438,7 +438,17 @@ pub fn saved_text(data: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Reads a whole bytecode blob whose opcodes are stored as `opcodes` says.
+/// A Roblox client writes its own scripts with a low version byte but each
+/// proto led by its byte size, as v12+ does; such a blob reads with sizes
+/// (the strict end, nothing but the main proto and a trailer, tells which).
 pub fn parse_as(data: &[u8], opcodes: Opcodes) -> R<Module> {
+    let sized = data.first().is_some_and(|v| *v >= 12);
+    parse_layout(data, opcodes, sized).or_else(|e| {
+        if sized { Err(e) } else { parse_layout(data, opcodes, true).map_err(|_| e) }
+    })
+}
+
+fn parse_layout(data: &[u8], opcodes: Opcodes, sized: bool) -> R<Module> {
     let mut r = Reader { d: data, o: 0 };
     let version = r.u8()?;
     if version == 0 {
@@ -471,7 +481,7 @@ pub fn parse_as(data: &[u8], opcodes: Opcodes) -> R<Module> {
     let nprotos = r.varint()? as usize;
     let mut protos = Vec::with_capacity(nprotos.min(1 << 16));
     for _ in 0..nprotos {
-        let size = if version >= 12 { Some(r.varint()? as usize) } else { None };
+        let size = if sized { Some(r.varint()? as usize) } else { None };
         let start = r.o;
         let head = r.take(4)?;
         let (maxstack, numparams, nups, vararg) =
@@ -619,7 +629,7 @@ pub fn parse_as(data: &[u8], opcodes: Opcodes) -> R<Module> {
             }
         }
         if let Some(size) = size {
-            r.o = start + size; // v12+: the size is authoritative
+            r.o = start + size; // the size is authoritative
         }
         protos.push(Proto {
             maxstack,
@@ -723,4 +733,34 @@ pub fn validate(m: &Module, regs_fit: impl Fn(&Insn, usize) -> bool) -> R<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One vararg proto that returns: version 6, types version 3.
+    fn blob(sized: bool, trailer: usize) -> Vec<u8> {
+        let proto = [1, 0, 0, 1, 0, 0, 1, 22, 0, 1, 0, 0, 0, 0, 0, 0, 0];
+        let mut b = vec![6, 3, 0, 0, 1];
+        if sized {
+            b.push(proto.len() as u8);
+        }
+        b.extend(proto);
+        b.push(0);
+        b.extend(std::iter::repeat_n(0xAB, trailer));
+        b
+    }
+
+    #[test]
+    fn low_version_reads_with_or_without_proto_sizes() {
+        for (sized, trailer) in [(false, 0), (true, 0), (true, 24)] {
+            let m = parse_as(&blob(sized, trailer), Opcodes::Stock).unwrap();
+            assert_eq!((m.protos.len(), m.main), (1, 0));
+            let p = &m.protos[0];
+            assert_eq!((p.maxstack, p.vararg, p.code.len(), p.code[0].op), (1, 1, 1, 22));
+        }
+        // neither reading leaves nothing but a trailer
+        assert!(parse_as(&blob(true, 5), Opcodes::Stock).is_err());
+    }
 }
