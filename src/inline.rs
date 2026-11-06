@@ -1553,6 +1553,32 @@ fn match_once(
             }
             continue;
         }
+        // the other way round: the helper's own code has a copy of a function
+        // literal the copy calls for real (past the compiler's inline depth)
+        if let Some(back) = real_call(&walk, &want, k, caller, i) {
+            for &(param, r, at) in &back.binds {
+                match walk.args[param] {
+                    None => {
+                        walk.args[param] = Some(Arg::Reg(r, at));
+                        walk.map[param] = Some(r);
+                    }
+                    Some(Arg::Reg(x, _)) if x == r => {}
+                    _ => return refuse("a parameter given two values"),
+                }
+            }
+            if let Some(hr) = back.result {
+                walk.map[hr] = Some(back.target);
+            }
+            walk.written.extend(back.target..back.target + back.width);
+            let at = code.get(i)?.pc;
+            for w in &want[k..k + back.skip] {
+                landing.insert(w.pc, at);
+            }
+            last = code[back.call_at].pc;
+            i = skip(code, back.call_at + 1);
+            folded = back.skip - 1;
+            continue;
+        }
         // a test of a constant argument: no code in the copy, one way taken.
         // A parameter not known yet is a constant only if the copy does not
         // test something there itself.
@@ -1664,11 +1690,19 @@ fn match_once(
                     _ => return refuse("a parameter given two values"),
                 }
             }
+            for &(u, up) in &nested.ups {
+                walk.upvalue(u, up)?;
+            }
             let call = want[k + nested.skip];
             if call.c() != 1 {
                 walk.map[call.a()] = nested.call.result;
             }
-            walk.written.extend(nested.call.written.iter().copied());
+            // what it wrote through its own upvalues is the caller's locals,
+            // written by the closure it was given: not the copy's scratch
+            walk.written.extend(nested.call.written.iter().copied().filter(|r| !nested.call.upval_writes.contains(r)));
+            walk.upval_writes.extend(nested.call.upval_writes.iter().copied());
+            // its result was made in the copy too
+            walk.written.extend(nested.call.result);
             for w in &want[k..=k + nested.skip] {
                 landing.insert(w.pc, c.pc);
             }
@@ -1693,7 +1727,15 @@ fn match_once(
         }
         // a value nobody asked for: the compiler left its load out
         let simple = matches!(plain(p.op), op::MOVE | op::LOADN | op::LOADB | op::LOADK | op::LOADNIL);
-        let fits = plain(p.op) == plain(c.op) && (p.op != op::MOVE || walk.map[p.b()] == Some(c.b()));
+        // (a load of another constant is no load of this one: `return 5, 6`
+        // for one value leaves the 6 out, and what follows may load a 5)
+        let same_load = match (walk.fold(p), walk.load_text(c).and_then(|t| Val::parse(&t))) {
+            // (any NaN loads as `0/0`, whatever its bits)
+            (Some(Val::Num(a)), Some(Val::Num(b))) if a.is_nan() && b.is_nan() => true,
+            (Some(a), Some(b)) => a.identical(&b),
+            _ => true,
+        };
+        let fits = plain(p.op) == plain(c.op) && (p.op != op::MOVE || walk.map[p.b()] == Some(c.b())) && same_load;
         if simple && !fits && feeds_return(&want, k) {
             walk.map[p.a()] = if p.op == op::MOVE { walk.map[p.b()] } else { None };
             continue;
@@ -2062,7 +2104,9 @@ fn feeds_return(want: &[&Insn], k: usize) -> bool {
 }
 
 thread_local! {
-    /// How deep nested_call has gone: copies within copies within copies.
+    /// How deep nested_call and real_call have gone: copies within copies (the
+    /// compiler copies in up to LuauCompileInlineDepth, 5, deep, and the
+    /// functions given as arguments with them).
     static NESTED: Cell<u32> = const { Cell::new(0) };
 }
 
@@ -2073,6 +2117,8 @@ struct Nested {
     call: Inlined,
     skip: usize,
     binds: Vec<(usize, usize, i32)>,
+    /// upvalues of the helper's that a capture shows: (helper upvalue, what)
+    ups: Vec<(usize, Up)>,
 }
 
 /// A call of the helper's where the copy has the called function's code: the
@@ -2086,15 +2132,16 @@ struct Nested {
 /// parameter of the helper takes the copy's), the result where it wants one.
 fn nested_call(walk: &Walk<'_>, want: &[&Insn], k: usize, caller: &Proto, start: usize, i: usize) -> Option<Nested> {
     let code = &caller.code;
-    if code.get(i).is_none_or(|c| c.op == op::MOVE || plain(c.op) == op::CALL) {
-        return None; // a plain call: the function moved into place
-    }
-    if NESTED.with(Cell::get) >= 3 {
+    if NESTED.with(Cell::get) >= 8 || code.get(i).is_none() {
         return None;
     }
     let p = want[k];
     if matches!(p.op, op::DUPCLOSURE | op::NEWCLOSURE) {
+        // (a copy may start with a move: `return f()` of an upvalue f)
         return literal_call(walk, want, k, caller, i);
+    }
+    if code.get(i).is_none_or(|c| c.op == op::MOVE || plain(c.op) == op::CALL) {
+        return None; // a plain call: the function moved into place
     }
     if p.op != op::MOVE || p.b() >= walk.helper.numparams || walk.assigned[p.b()] {
         return None;
@@ -2128,9 +2175,13 @@ fn nested_call(walk: &Walk<'_>, want: &[&Insn], k: usize, caller: &Proto, start:
     let mut found: Option<Nested> = None;
     for (r, at, f) in cands {
         NESTED.with(|n| n.set(n.get() + 1));
+    let saved = (REACHED.with(Cell::get), CHECK.with(Cell::get));
         let got = match_call(walk.m, caller, f, i);
         NESTED.with(|n| n.set(n.get() - 1));
-        let Some(n) = got else { continue };
+    REACHED.with(|r| r.set(saved.0));
+    CHECK.with(|c| c.set(saved.1));
+        let here = code[i].pc;
+        let Some(n) = got.filter(|n| on_lines_of(walk.m, caller, here, n.end, f)) else { continue };
         // the helper's arguments, as the walk has them, are the copy's
         let args_fit = (0..nargs.max(n.args.len())).all(|a| {
             let mine = if a < nargs { walk.map.get(call.a() + 1 + a).copied().flatten() } else { None };
@@ -2152,9 +2203,119 @@ fn nested_call(walk: &Walk<'_>, want: &[&Insn], k: usize, caller: &Proto, start:
         if found.is_some() {
             return None; // two functions would do: neither is known to be it
         }
-        found = Some(Nested { call: n, skip: 1, binds: vec![(p.b(), r, at)] });
+        found = Some(Nested { call: n, skip: 1, binds: vec![(p.b(), r, at)], ups: Vec::new() });
     }
     found
+}
+
+/// A real call in the copy of a function the helper's own code has a copy
+/// of: the call's register and its width, where the call is (an index), how
+/// many of the helper's instructions the helper's copy covers, the helper
+/// register its result is in, and the parameters it shows the values of.
+struct RealCall {
+    target: usize,
+    width: usize,
+    call_at: usize,
+    skip: usize,
+    result: Option<usize>,
+    binds: Vec<(usize, usize, i32)>,
+}
+
+/// `DUPCLOSURE t, G; MOVE t+1, x ... (or constants); CALL t` in the copy,
+/// where the helper's code at this point is a copy of G: the compiler stops
+/// copying in at a depth (LuauCompileInlineDepth), so the deeper the copy,
+/// the more it keeps as calls that the helper, copied from less deep, has
+/// copied in. G's copy is found in the helper's code as any copy is; its
+/// arguments must be the call's, as the walk has them.
+fn real_call(walk: &Walk<'_>, want: &[&Insn], k: usize, caller: &Proto, i: usize) -> Option<RealCall> {
+    let code = &caller.code;
+    let c = code.get(i)?;
+    let g = match c.op {
+        op::NEWCLOSURE => caller.children.get(c.d().max(0) as usize).copied()?,
+        op::DUPCLOSURE => match caller.k.get(c.d().max(0) as usize)? {
+            K::Closure(x) => *x,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let p = want[k];
+    let gp = &walk.m.protos[g];
+    if matches!(p.op, op::NEWCLOSURE | op::DUPCLOSURE) || std::ptr::from_ref(gp) == std::ptr::from_ref(walk.helper) {
+        return None;
+    }
+    if NESTED.with(Cell::get) >= 8 {
+        return None;
+    }
+    let t = c.a();
+    // what the closure captures: caller registers, by value or reference
+    let caps: Vec<&Insn> = code[i + 1..].iter().take_while(|x| x.op == op::CAPTURE).collect();
+    if caps.len() != gp.nups || caps.iter().any(|x| x.a() == 2) {
+        return None;
+    }
+    // the arguments, into the registers after the function
+    let mut j = i + 1 + caps.len();
+    let mut given: Vec<&Insn> = Vec::new();
+    while let Some(x) = code.get(j) {
+        if x.a() == t + 1 + given.len() && (x.op == op::MOVE || walk.load_text(x).is_some()) && x.jump_target().is_none() {
+            given.push(x);
+            j += 1;
+        } else {
+            break;
+        }
+    }
+    let call = code.get(j)?;
+    if plain(call.op) != op::CALL || call.a() != t || call.b() == 0 || call.b() - 1 != given.len() || given.len() > gp.numparams {
+        return None;
+    }
+    let helper = walk.helper;
+    let hidx = helper.code.partition_point(|x| x.pc < p.pc);
+    NESTED.with(|n| n.set(n.get() + 1));
+    let saved = (REACHED.with(Cell::get), CHECK.with(Cell::get));
+    let got = match_call(walk.m, helper, g, hidx);
+    NESTED.with(|n| n.set(n.get() - 1));
+    REACHED.with(|r| r.set(saved.0));
+    CHECK.with(|c| c.set(saved.1));
+    let hc = got.filter(|h| on_lines_of(walk.m, helper, p.pc, h.end, g))?;
+    let mut binds = Vec::new();
+    for a in 0..gp.numparams {
+        let mine = hc.args.get(a).cloned().flatten();
+        match (mine, given.get(a)) {
+            (Some(Arg::Reg(hr, _)), Some(x)) if x.op == op::MOVE => match walk.map.get(hr).copied().flatten() {
+                Some(cr) if cr == x.b() => {}
+                None if hr < helper.numparams && walk.args[hr].is_none() && !walk.assigned[hr] => binds.push((hr, x.b(), x.pc)),
+                _ => return None,
+            },
+            (Some(Arg::Const(text)), Some(x)) if walk.load_text(x).as_deref() == Some(text.as_str()) => {}
+            (None, None) => {}
+            _ => return None,
+        }
+    }
+    // each captured register is what the helper's copy reads for that upvalue
+    for (u, cap) in caps.iter().enumerate() {
+        match hc.upvals.get(u).copied().flatten() {
+            Some(Up::Reg(hr)) => match walk.map.get(hr).copied().flatten() {
+                Some(cr) if cr == cap.b() => {}
+                None if hr < helper.numparams && walk.args[hr].is_none() && !walk.assigned[hr] => {
+                    if binds.iter().any(|b: &(usize, usize, i32)| b.0 == hr && b.1 != cap.b()) {
+                        return None;
+                    }
+                    binds.push((hr, cap.b(), cap.pc));
+                }
+                _ => return None,
+            },
+            _ => return None,
+        }
+    }
+    let result = match call.c() {
+        1 => None,
+        2 | 0 if hc.results == 1 => Some(hc.result?),
+        _ => return None,
+    };
+    let skip = want[k..].iter().take_while(|w| w.pc < hc.end).count();
+    if skip == 0 {
+        return None;
+    }
+    Some(RealCall { target: t, width: (call.c() as usize).saturating_sub(1).max(1), call_at: j, skip, result, binds })
 }
 
 /// The `DUPCLOSURE t, G; MOVE t+1, x ...; CALL t` form of nested_call.
@@ -2170,6 +2331,12 @@ fn literal_call(walk: &Walk<'_>, want: &[&Insn], k: usize, caller: &Proto, i: us
     };
     let t = p.a();
     let mut j = k + 1;
+    // what the closure captures (as the helper's code says it)
+    let mut caps: Vec<&Insn> = Vec::new();
+    while let Some(w) = want.get(j).filter(|w| w.op == op::CAPTURE) {
+        caps.push(w);
+        j += 1;
+    }
     let mut srcs: Vec<usize> = Vec::new();
     while let Some(w) = want.get(j) {
         if w.op == op::MOVE && w.a() == t + 1 + srcs.len() {
@@ -2184,9 +2351,13 @@ fn literal_call(walk: &Walk<'_>, want: &[&Insn], k: usize, caller: &Proto, i: us
         return None;
     }
     NESTED.with(|n| n.set(n.get() + 1));
+    let saved = (REACHED.with(Cell::get), CHECK.with(Cell::get));
     let got = match_call(walk.m, caller, g, i);
     NESTED.with(|n| n.set(n.get() - 1));
-    let n = got?;
+    REACHED.with(|r| r.set(saved.0));
+    CHECK.with(|c| c.set(saved.1));
+    let here = caller.code.get(i)?.pc;
+    let n = got.filter(|n| on_lines_of(walk.m, caller, here, n.end, g))?;
     let mut binds = Vec::new();
     for (a, &src) in srcs.iter().enumerate() {
         let given = n.args.get(a).cloned().flatten();
@@ -2202,12 +2373,49 @@ fn literal_call(walk: &Walk<'_>, want: &[&Insn], k: usize, caller: &Proto, i: us
     if n.args.len() > srcs.len() && n.args[srcs.len()..].iter().any(Option::is_some) {
         return None;
     }
+    // each capture is what the copy reads for that upvalue
+    let mut ups = Vec::new();
+    for (u, cap) in caps.iter().enumerate() {
+        let seen = n.upvals.get(u).copied().flatten()?;
+        match cap.a() {
+            2 => ups.push((cap.b(), seen)),
+            _ => match (walk.map.get(cap.b()).copied().flatten(), seen) {
+                (Some(x), Up::Reg(y)) if x == y => {}
+                (None, Up::Reg(y)) if cap.b() < helper.numparams && walk.args[cap.b()].is_none() && !walk.assigned[cap.b()] => {
+                    binds.push((cap.b(), y, caller.code.get(i)?.pc));
+                }
+                _ => return None,
+            },
+        }
+    }
     let result_fits = match call.c() {
         1 => true,
         2 | 0 => n.result.is_some() && n.results == 1,
         _ => false,
     };
-    result_fits.then_some(Nested { call: n, skip: j - k, binds })
+    result_fits.then_some(Nested { call: n, skip: j - k, binds, ups })
+}
+
+/// Is some instruction of `code_of` from pc `from` up to `to` on a line of
+/// function `g`'s own? Copied-in code keeps the copied function's lines (and
+/// copies within it theirs), so a copy found by the walk alone is a copy only
+/// so: a lone constant elsewhere that the walk took for g is not. (True
+/// without lines.)
+fn on_lines_of(m: &Module, code_of: &Proto, from: i32, to: i32, g: usize) -> bool {
+    let gp = &m.protos[g];
+    let (lo, hi) = gp
+        .code
+        .iter()
+        .filter_map(|c| gp.lines.get(c.pc as usize).copied())
+        .fold((u32::MAX, 0), |(lo, hi), l| (lo.min(l), hi.max(l)));
+    if lo > hi || code_of.lines.is_empty() {
+        return true;
+    }
+    code_of
+        .code
+        .iter()
+        .filter(|c| c.pc >= from && c.pc < to && !ignored(c.op))
+        .any(|c| code_of.lines.get(c.pc as usize).is_some_and(|l| (lo..=hi).contains(l)))
 }
 
 /// The register the caller's instruction just before a copy (at index
