@@ -496,6 +496,10 @@ struct Dec<'c, 'm> {
     joined_value: Option<usize>,
     /// Per pc: the helper inlined there, and its name.
     inlined: RefCell<Vec<Option<Option<(Rc<Inlined>, Rc<str>)>>>>,
+    /// match_call's answer per (helper, code index): inlined is forgotten
+    /// whenever a helper is named, and asking again for every instruction of
+    /// a script of many helpers took most of its time.
+    match_memo: RefCell<HashMap<(usize, usize), Option<Rc<Inlined>>>>,
     /// Definitions written for closures copies made that nothing read.
     unused_copies: Vec<Rc<str>>,
     refusals: RefCell<Vec<(usize, String)>>,
@@ -1088,6 +1092,7 @@ impl<'c, 'm> Dec<'c, 'm> {
             skip_to: None,
             joined_value: None,
             inlined: RefCell::new(vec![None; p.lines.len()]),
+            match_memo: RefCell::new(HashMap::default()),
             unused_copies: Vec::new(),
             refusals: RefCell::new(Vec::new()),
             defs_left: Vec::new(),
@@ -1730,6 +1735,21 @@ impl<'c, 'm> Dec<'c, 'm> {
             if idx == self.idx || !its_line(idx) || (from <= own.0 && own.1 <= to) {
                 continue; // not its lines, or it encloses this function
             }
+            // what the helper's copy at this point is depends on the code alone:
+            // asked once (names made later only change whether it is taken)
+            let known = self.match_memo.borrow().get(&(idx, start)).cloned();
+            let got = match known {
+                Some(got) => got,
+                None => {
+                    let got = match_call(self.m, self.p, idx, start).map(Rc::new);
+                    if got.is_none() {
+                        self.note_refusal(idx, last_refusal());
+                    }
+                    self.match_memo.borrow_mut().insert((idx, start), got.clone());
+                    got
+                }
+            };
+            let Some(call) = got else { continue };
             // another local of this function under that name would take the
             // call; one is the helper itself, when it is defined here
             let same = self.regname.iter().flatten().filter(|n| **n == name).count();
@@ -1737,10 +1757,6 @@ impl<'c, 'm> Dec<'c, 'm> {
             if same > usize::from(here) {
                 continue;
             }
-            let Some(call) = match_call(self.m, self.p, idx, start) else {
-                self.note_refusal(idx, last_refusal());
-                continue;
-            };
             // made here, its upvalues are what it captured: code reading some
             // other register only looks like it (a line after a copy keeps
             // the helper's line too)
@@ -1782,7 +1798,7 @@ impl<'c, 'm> Dec<'c, 'm> {
                 // that copy: the one that covers more is the call
                 let longer = found.as_ref().is_none_or(|(f, _): &(Rc<Inlined>, Rc<str>)| call.end > f.end);
                 if longer {
-                    found = Some((Rc::new(call), name));
+                    found = Some((call, name));
                 }
                 continue;
             }
@@ -2936,6 +2952,7 @@ impl<'c, 'm> Dec<'c, 'm> {
         self.decl_log = Vec::new();
         self.flat_used = None;
         self.inlined = RefCell::new(Vec::new());
+        self.match_memo = RefCell::new(HashMap::default());
         self.refusals = RefCell::new(Vec::new());
         self.defs_left = Vec::new();
     }
