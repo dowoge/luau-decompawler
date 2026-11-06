@@ -829,9 +829,66 @@ pub fn validate(m: &Module, regs_fit: impl Fn(&Insn, usize) -> bool) -> R<()> {
             if !fits {
                 return bad("an operand of the wrong kind", pc);
             }
+            if builtin_mismatch(m, p, ins) {
+                return bad("a builtin call names another function", pc);
+            }
         }
     }
     Ok(())
+}
+
+/// Builtins by the global the compiler reads them from (Luau's LBF_ ids).
+/// A path not here is never judged.
+const BUILTINS: [(&str, u8); 77] = [
+    ("assert", 1), ("math.abs", 2), ("math.acos", 3), ("math.asin", 4), ("math.atan2", 5), ("math.atan", 6),
+    ("math.ceil", 7), ("math.cosh", 8), ("math.cos", 9), ("math.deg", 10), ("math.exp", 11), ("math.floor", 12),
+    ("math.fmod", 13), ("math.frexp", 14), ("math.ldexp", 15), ("math.log10", 16), ("math.log", 17),
+    ("math.max", 18), ("math.min", 19), ("math.modf", 20), ("math.pow", 21), ("math.rad", 22), ("math.sinh", 23),
+    ("math.sin", 24), ("math.sqrt", 25), ("math.tanh", 26), ("math.tan", 27), ("bit32.arshift", 28),
+    ("bit32.band", 29), ("bit32.bnot", 30), ("bit32.bor", 31), ("bit32.bxor", 32), ("bit32.btest", 33),
+    ("bit32.extract", 34), ("bit32.lrotate", 35), ("bit32.lshift", 36), ("bit32.replace", 37),
+    ("bit32.rrotate", 38), ("bit32.rshift", 39), ("type", 40), ("string.byte", 41), ("string.char", 42),
+    ("string.len", 43), ("typeof", 44), ("string.sub", 45), ("math.clamp", 46), ("math.sign", 47),
+    ("math.round", 48), ("rawset", 49), ("rawget", 50), ("rawequal", 51), ("table.insert", 52),
+    ("table.unpack", 53), ("unpack", 53), ("bit32.countlz", 55), ("bit32.countrz", 56), ("select", 57),
+    ("rawlen", 58), ("bit32.extract", 59), ("getmetatable", 60), ("setmetatable", 61), ("tonumber", 62),
+    ("tostring", 63), ("bit32.byteswap", 64), ("buffer.readi8", 65), ("buffer.readu8", 66),
+    ("buffer.writeu8", 67), ("buffer.readi16", 68), ("buffer.readu16", 69), ("buffer.writeu16", 70),
+    ("buffer.readi32", 71), ("buffer.readu32", 72), ("buffer.writeu32", 73), ("buffer.readf32", 74),
+    ("buffer.writef32", 75), ("buffer.readf64", 76), ("buffer.writef64", 77),
+];
+
+/// A fast call runs the builtin it names and skips its CALL, whatever the
+/// called register holds; only when the builtin fails does the call happen.
+/// When that register is loaded from a known builtin's global and the ids
+/// differ, no source writes the call: what runs is neither text.
+fn builtin_mismatch(m: &Module, p: &Proto, ins: &Insn) -> bool {
+    if !matches!(ins.op, op::FASTCALL | op::FASTCALL1 | op::FASTCALL2 | op::FASTCALL2K | op::FASTCALL3) {
+        return false;
+    }
+    // C counts from the word after the opcode's, an AUX word included
+    let call_pc = ins.pc + 1 + ins.c() as i32;
+    let Some(at) = p.code.iter().position(|i| i.pc == call_pc).filter(|&j| p.code[j].op == op::CALL) else {
+        return false;
+    };
+    let f = p.code[at].a();
+    // the register's last load before the call (the compiler loads the
+    // function between the fast call and its CALL, or just before)
+    let Some(load) = p.code[..at].iter().rev().find(|i| i.a() == f && i.op != op::CAPTURE) else { return false };
+    if load.op != op::GETIMPORT {
+        return false;
+    }
+    let count = (load.aux >> 30) as usize;
+    let parts: Option<Vec<&str>> = (0..count.min(3))
+        .map(|j| match p.k.get(((load.aux >> (20 - 10 * j)) & 1023) as usize) {
+            Some(K::Str(Some(s))) => m.text.get(*s).map(String::as_str),
+            _ => None,
+        })
+        .collect();
+    let Some(parts) = parts else { return false };
+    let path = parts.join(".");
+    let ids: Vec<u8> = BUILTINS.iter().filter(|(n, _)| *n == path).map(|(_, id)| *id).collect();
+    !ids.is_empty() && !ids.contains(&(ins.a() as u8))
 }
 
 #[cfg(test)]

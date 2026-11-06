@@ -2,8 +2,10 @@
 //! (a Roblox client's form) or NAME.bc (stock). Its decompiled text must stay
 //! NAME.luau, and where NAME.out holds what the original printed (its output
 //! and the `=== ok` or `=== error: ...` line), the decompiled program must print
-//! that. `--bless` writes the decompiled text over each NAME.luau after a change
-//! meant to alter it; NAME.out is never written, it comes from the original.
+//! that. Where NAME.refused holds a reason, the decompiler must refuse the file
+//! with it instead. `--bless` writes the decompiled text over each NAME.luau
+//! after a change meant to alter it; NAME.out is never written, it comes from
+//! the original.
 //! `--bin` tries another decompiler binary.
 
 use std::path::{Path, PathBuf};
@@ -46,6 +48,19 @@ pub fn run(tools: &Tools, bless: bool) -> bool {
         }
         cmd.arg(file);
         let ran = run_limited(&mut cmd, None, 120);
+        // NAME.refused: bytecode no source compiles to that must be turned
+        // down, the file holding the reason it gives
+        let refused = dir.join(format!("{stem}.refused"));
+        if refused.exists() {
+            let want = read_text(&refused.to_string_lossy());
+            let err = text_of(&ran.stderr);
+            if ran.status.is_some_and(|s| s.success()) {
+                bad.push(format!("{stem}: decompiled, but should be refused ({})", want.trim()));
+            } else if !err.contains(want.trim()) {
+                bad.push(format!("{stem}: refused otherwise:\n    kept: {}\n    now:  {}", want.trim(), err.trim()));
+            }
+            continue;
+        }
         if !ran.status.is_some_and(|s| s.success()) {
             let err = text_of(&ran.stderr);
             bad.push(format!("{stem}: not decompiled: {}", err.trim().lines().last().unwrap_or("timed out")));
