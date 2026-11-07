@@ -1646,6 +1646,8 @@ impl<'c, 'm> Dec<'c, 'm> {
             self.declare(key);
             match self.definition_rest(&x, None) {
                 Some(rest) => out.push(format!("{pad}local function {name}{rest}")),
+                // only `local t = {}` is sized by the stores after it
+                None if x.unsized_table && x.text == "{}" => out.push(format!("{pad}local {name} = ({{}})")),
                 None => out.push(format!("{pad}local {name} = {}", x.text)),
             }
             if x.unused_copy {
@@ -3934,6 +3936,90 @@ impl<'c, 'm> Dec<'c, 'm> {
             i += 1;
         }
         regs
+    }
+
+    /// A NEWTABLE with no hash or array size that stores fill straight after:
+    /// whether Luau would size `local t = {}` for the stores as they are
+    /// printed (TableShape: distinct `t.name` stores, and `t[1]`, `t[2]` ...
+    /// in order, through that local anywhere in the function). None: it has
+    /// a size, or nothing is stored into it first.
+    fn unsized_with_stores(&self, pc: i32, r: usize) -> Option<bool> {
+        let p = self.p;
+        let made = self.insn(pc);
+        if made.b() != 0 || made.aux != 0 {
+            return None;
+        }
+        // the first instruction after it to touch the table
+        let from = self.flow.idx(pc)? + 1;
+        let first = (from..p.code.len()).find(|&i| {
+            let (rd, wr, _) = self.effects_at(i);
+            !is_fastcall(p.code[i].op) && (rd.has(r) || wr.has(r))
+        })?;
+        let next = p.code[first];
+        let stored = |i: usize| {
+            let s = p.code.get(i).copied();
+            s.is_some_and(|s| matches!(s.op, op::SETTABLEKS | op::SETTABLE | op::SETTABLEN) && s.b() == r && s.a() != r)
+        };
+        // `local t = setmetatable({}, mt)` is sized for the stores into t too
+        let (r, web) = if stored(first) {
+            (r, self.flow.def_web(pc, r)?)
+        } else if self.setmetatable_of(first, r) {
+            let (mut got, mut at) = (next.a(), first);
+            let touch = |reg: usize, from: usize| {
+                (from + 1..p.code.len()).find(|&i| {
+                    let (rd, wr, _) = self.effects_at(i);
+                    rd.has(reg) || wr.has(reg)
+                })
+            };
+            let mut after = touch(got, at)?;
+            // the result moved into its local first
+            if p.code[after].op == op::MOVE && p.code[after].b() == got {
+                (got, at) = (p.code[after].a(), after);
+                after = touch(got, at)?;
+            }
+            let s = p.code[after];
+            if !(matches!(s.op, op::SETTABLEKS | op::SETTABLE | op::SETTABLEN) && s.b() == got && s.a() != got) {
+                return None;
+            }
+            (got, self.flow.def_web(p.code[at].pc, got)?)
+        } else {
+            return None;
+        };
+        let _ = r;
+        let name_of = |s: &Insn| kstr(self.m, p, s.aux as usize).filter(|k| is_ident(k) && !is_keyword(k));
+        // `for i = 1, K` with K up to 16 sizes it by K for `t[i] = ...` in it
+        let counted_index = |s: &Insn| {
+            let key = s.c();
+            p.code.iter().enumerate().any(|(i, f)| {
+                f.op == op::FORNPREP && f.a() + 2 == key && f.pc < s.pc && s.pc <= f.pc + f.d() && {
+                    let loaded = |reg: usize| {
+                        p.code[..i].iter().rev().find(|x| full_effects(x, p.maxstack).1.has(reg)).filter(|x| x.op == op::LOADN && x.a() == reg).map(|x| x.d())
+                    };
+                    let (limit, step, start) = (loaded(f.a()), loaded(f.a() + 1), loaded(f.a() + 2));
+                    start == Some(1) && step == Some(1) && limit.is_some_and(|k| (1..=16).contains(&k))
+                }
+            })
+        };
+        let predicted = p.code.iter().any(|s| {
+            let through = s.a() != s.b() && self.flow.use_web(s.pc, s.b()) == Some(web);
+            through
+                && ((s.op == op::SETTABLEKS && name_of(s).is_some())
+                    || (s.op == op::SETTABLEN && s.c() == 0)
+                    || (s.op == op::SETTABLE && counted_index(s)))
+        });
+        Some(predicted)
+    }
+
+    /// Is code[i] `setmetatable(t, mt)` with t in register r, one result?
+    fn setmetatable_of(&self, i: usize, r: usize) -> bool {
+        let p = self.p;
+        let call = p.code[i];
+        if call.op != op::CALL || call.b() != 3 || call.c() != 2 || call.a() + 1 != r {
+            return false;
+        }
+        let f = call.a();
+        let load = p.code[..i].iter().rev().find(|x| full_effects(x, p.maxstack).1.has(f));
+        load.is_some_and(|l| l.op == op::GETIMPORT && l.a() == f && import_expr(self.m, p, l.aux) == "setmetatable")
     }
 
     /// The last store after the table made at pc that still belongs in its
@@ -6348,6 +6434,25 @@ impl<'c, 'm> Dec<'c, 'm> {
                 }
                 let fills = self.table_fills(pc, a);
                 let mut limit = self.constructor_limit(pc, a);
+                // made with no size at all though stores follow: no item of a
+                // constructor was one of them (any item sizes it), and where
+                // the stores as printed would have Luau size `local t = {}`,
+                // the source kept it from that: `local t = ({})` (see assign)
+                let no_size = if o == op::NEWTABLE { self.unsized_with_stores(pc, a) } else { None };
+                if let Some(predicted) = no_size {
+                    // as setmetatable's argument the table is no local's value
+                    let argument = predicted && self.flow.idx(pc).is_some_and(|i| {
+                        let next = (i + 1..p.code.len()).find(|&j| {
+                            let (rd, wr, _) = self.effects_at(j);
+                            !is_fastcall(p.code[j].op) && (rd.has(a) || wr.has(a))
+                        });
+                        next.is_some_and(|j| self.setmetatable_of(j, a))
+                    });
+                    let e = ex(if argument { "({})" } else { "{}" }, 100);
+                    e.borrow_mut().unsized_table = predicted && !argument;
+                    self.put(out, ind, a, e, false);
+                    return self.skip_to.take().unwrap_or(pc + ins.n);
+                }
                 if limit.is_none() {
                     if let Some((last, list)) = self.index_keys_end(pc, a) {
                         if list {
@@ -6716,6 +6821,11 @@ fn hash_class(n: usize) -> u8 {
         log2 += 1;
     }
     log2 as u8 + 1
+}
+
+/// A fast call: it runs before its CALL, and reads the arguments that does.
+fn is_fastcall(o: u8) -> bool {
+    matches!(o, op::FASTCALL | op::FASTCALL1 | op::FASTCALL2 | op::FASTCALL2K | op::FASTCALL3)
 }
 
 fn binop(o: u8) -> (&'static str, i32) {

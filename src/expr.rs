@@ -61,6 +61,9 @@ pub struct X {
     /// Made by an inlined copy, of a function written further in, and read by
     /// nothing: its definition goes unless a call by name needs it.
     pub unused_copy: bool,
+    /// `{}` made with no size though stores follow that would size `local
+    /// t = {}`: declared so, it is written `({})`.
+    pub unsized_table: bool,
     /// A copy of a variable a closure shares: a call may change the variable,
     /// and Luau reads a local operand where it is used, so the copy is a
     /// local of its own before any call.
@@ -111,6 +114,7 @@ pub fn ex(text: impl Into<String>, prec: i32) -> E {
         closure: None,
         calls_itself: false,
         unused_copy: false,
+        unsized_table: false,
         snapshot: false,
         constructor: false,
         newtable: false,
