@@ -197,6 +197,9 @@ pub struct Flow {
     /// Per instruction: its (register, web root) writes and reads.
     def_at: Vec<u32>,
     defs: Vec<(u32, u32)>,
+    /// Per write in `defs`: can a closure see it (made while one shares the
+    /// variable, or the value one captures)?
+    seen_shared: Vec<bool>,
     use_at: Vec<u32>,
     uses: Vec<(u32, u32)>,
     /// Web root of each register's value on entry.
@@ -266,6 +269,13 @@ impl Flow {
         s.iter().find(|d| d.0 as usize == r).map(|d| d.1)
     }
 
+    /// Can a closure sharing the variable see the write at pc to r?
+    pub fn seen_shared(&self, pc: i32, r: usize) -> bool {
+        let Some(i) = self.idx(pc) else { return false };
+        let (lo, hi) = (self.def_at[i] as usize, self.def_at[i + 1] as usize);
+        (lo..hi).any(|k| self.defs[k].0 as usize == r && self.seen_shared[k])
+    }
+
     #[inline]
     pub fn use_web(&self, pc: i32, r: usize) -> Option<u32> {
         let i = self.idx(pc)?;
@@ -276,7 +286,7 @@ impl Flow {
     /// Reaching definitions and liveness for one function.
     /// `foreign` says a source line is not this function's: a helper's, whose
     /// code the compiler copied in.
-    pub fn new(p: &Proto, foreign: &dyn Fn(u32) -> bool) -> Flow {
+    pub fn new(p: &Proto, foreign: &dyn Fn(u32) -> bool, shared_written: &[bool]) -> Flow {
         let code = &p.code;
         let n = code.len();
         let mut pos = vec![-1i32; p.sizecode.max(0) as usize + 1];
@@ -733,7 +743,7 @@ impl Flow {
             level += depth[i];
             in_loop[i] = level > 0;
         }
-        for (new, old, r) in replaced {
+        for &(new, old, r) in &replaced {
             // a constant no one reads, replaced in its turn, is a declaration
             // (`local a`) when what it replaces comes to it only round a loop:
             // `local a, b` in each arm of a loop's `if` is each arm's own, not
@@ -787,6 +797,8 @@ impl Flow {
         // between is to that variable: in a loop, the ones before the capture
         // too, which the next pass runs after it
         let mut byref_groups: Vec<u32> = Vec::new();
+        let mut byref_caps: Vec<(usize, usize, u32)> = Vec::new();
+        let mut in_group = vec![false; ndefs];
         let mut visited = vec![usize::MAX; n];
         let mut pending: Vec<usize> = Vec::new();
         for (k, (c, r, mut group)) in captures.into_iter().enumerate() {
@@ -821,10 +833,52 @@ impl Flow {
             if group.is_empty() {
                 continue; // nothing written to it yet: nothing to share
             }
+            for x in &group {
+                in_group[*x as usize] = true;
+            }
             for x in &group[1..] {
                 union(&mut parent, group[0], *x);
             }
             byref_groups.push(group[0]);
+            byref_caps.push((c, r, group[0]));
+        }
+
+        // a variable a closure captures by reference is one the source writes
+        // after declaring it, here or in a closure sharing it. With one write
+        // here and none there, that write is no declaration: it replaces what
+        // the register held before, the same variable (`p, q = q, p`). Declared
+        // anew, nothing would write it and the closure would capture a value
+        let by_value: Vec<u32> = (0..n)
+            .filter(|i| code[*i].op == op::CAPTURE && code[*i].a() == 0)
+            .filter_map(|i| {
+                let r = code[i].b() as u32;
+                use_first[use_at[i] as usize..use_at[i + 1] as usize].iter().find(|u| u.0 == r).map(|u| u.1)
+            })
+            .collect();
+        for &(c, r, g) in &byref_caps {
+            let root = find(&mut parent, g);
+            let written_there = byref_caps
+                .iter()
+                .any(|(c2, _, g2)| shared_written.get(*c2).copied().unwrap_or(true) && find(&mut parent, *g2) == root);
+            let own: Vec<u32> = def_list.iter().map(|d| d.1).filter(|d| find(&mut parent, *d) == root).collect();
+            let [new] = own[..] else { continue };
+            if written_there {
+                continue;
+            }
+            for &(n2, old, r2) in &replaced {
+                let entry_value = old >= first_entry;
+                if n2 != new || r2 != r || (entry_value && r >= p.numparams) {
+                    continue;
+                }
+                let from = if entry_value { 0 } else { def_idx[old as usize] as usize };
+                let to = def_idx[new as usize] as usize;
+                let closed = closes.iter().any(|x| from < *x && *x < to && code[*x].a() <= r);
+                let old_root = find(&mut parent, old);
+                if closed || c < from || by_value.iter().any(|v| find(&mut parent, *v) == old_root) {
+                    continue;
+                }
+                union(&mut parent, new, old);
+            }
         }
 
         let mut byref_only = vec![false; ndefs];
@@ -850,10 +904,12 @@ impl Flow {
         }
         let mut web_defs = vec![0u32; ndefs];
         let mut defs = Vec::with_capacity(def_list.len());
+        let mut seen_shared = Vec::with_capacity(def_list.len());
         for (r, id) in &def_list {
             let root = find(&mut parent, *id);
             web_defs[root as usize] += 1;
             defs.push((*r, root));
+            seen_shared.push(in_group[*id as usize]);
         }
         let mut used_web = vec![false; ndefs];
         let mut uses = Vec::with_capacity(use_first.len());
@@ -887,6 +943,7 @@ impl Flow {
             nregs,
             def_at,
             defs,
+            seen_shared,
             use_at,
             uses,
             entry,

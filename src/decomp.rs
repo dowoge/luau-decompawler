@@ -243,6 +243,21 @@ fn kindex(p: &Proto, i: i64) -> usize {
     }
 }
 
+/// The function a NEWCLOSURE or DUPCLOSURE makes.
+fn made_by(p: &Proto, ins: &crate::bytecode::Insn) -> Option<usize> {
+    match ins.op {
+        op::NEWCLOSURE => {
+            let d = ins.d();
+            p.children.get(if d < 0 { p.children.len() as i32 + d } else { d } as usize).copied()
+        }
+        op::DUPCLOSURE => match p.k.get(kindex(p, ins.d() as i64)) {
+            Some(K::Closure(c)) => Some(*c),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Fields a DUPTABLE template already holds (type 8 keeps values).
 /// A template's keys in order, as a constructor's fields: those with a value
 /// as `key = value`, the others as slots their stores fill.
@@ -372,6 +387,9 @@ pub struct Ctx<'m> {
     builtins_fold: bool,
     /// Per function, which of its upvalues a closure shares by reference.
     byref_ups: Vec<Vec<bool>>,
+    /// Per function, which of its upvalues it (or a closure it passes them
+    /// to) writes.
+    ups_written: Vec<Vec<bool>>,
     /// Functions no other lists as a child: only ever inlined, like
     /// `(function() ... end)()`, since the compiler adds a child with its closure.
     orphans: Vec<usize>,
@@ -928,6 +946,37 @@ pub fn decompile_lines(m: &Module, noflat: bool) -> Vec<String> {
         }
     }
     defs.values_mut().for_each(|v| v.sort_unstable());
+    // per function, its upvalues it writes, or a closure it makes and passes
+    // them on to does
+    let mut ups_written: Vec<Vec<bool>> = m
+        .protos
+        .iter()
+        .map(|p| {
+            let mut w = vec![false; p.nups];
+            for ins in p.code.iter().filter(|i| i.op == op::SETUPVAL) {
+                if let Some(s) = w.get_mut(ins.b() as usize) {
+                    *s = true;
+                }
+            }
+            w
+        })
+        .collect();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (pi, p) in m.protos.iter().enumerate() {
+            for (i, ins) in p.code.iter().enumerate() {
+                let Some(c) = made_by(p, ins).filter(|c| *c < m.protos.len() && *c != pi) else { continue };
+                for (u, cap) in p.code[i + 1..].iter().take_while(|x| x.op == op::CAPTURE).enumerate() {
+                    let theirs = ups_written[c].get(u).copied().unwrap_or(false);
+                    if cap.a() == 2 && theirs && ups_written[pi].get(cap.b() as usize) == Some(&false) {
+                        ups_written[pi][cap.b() as usize] = true;
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
     // per function, its upvalues some closure creating it shares by reference
     let mut byref_ups: Vec<Vec<bool>> = m.protos.iter().map(|p| vec![false; p.nups]).collect();
     for p in &m.protos {
@@ -971,6 +1020,7 @@ pub fn decompile_lines(m: &Module, noflat: bool) -> Vec<String> {
         m,
         home,
         byref_ups,
+        ups_written,
         globals: module_globals(m),
         memo: RefCell::new(HashMap::default()),
         helper_names: std::cell::Cell::new(0),
@@ -1013,7 +1063,17 @@ impl<'c, 'm> Dec<'c, 'm> {
             let inside = |s: &(u32, u32)| own.0 <= s.0 && s.1 <= own.1 && *s != own;
             line < own.0 || line > own.1 || ctx.spans.iter().any(|s| inside(s) && s.0 <= line && line <= s.1)
         };
-        let flow = flow.unwrap_or_else(|| Flow::new(p, &foreign));
+        let flow = flow.unwrap_or_else(|| {
+            // per instruction: a capture whose closure writes what it captures
+            let mut shared_written = vec![false; p.code.len()];
+            for (i, ins) in p.code.iter().enumerate() {
+                let Some(c) = made_by(p, ins).and_then(|c| ctx.ups_written.get(c)) else { continue };
+                for (u, cap) in p.code[i + 1..].iter().take_while(|x| x.op == op::CAPTURE).enumerate() {
+                    shared_written[i + 1 + u] = cap.a() == 1 && c.get(u).copied().unwrap_or(false);
+                }
+            }
+            Flow::new(p, &foreign, &shared_written)
+        });
         let mut foreign_lines: Vec<u32> = p.lines.clone();
         foreign_lines.sort_unstable();
         foreign_lines.dedup();
@@ -1282,7 +1342,27 @@ impl<'c, 'm> Dec<'c, 'm> {
     /// (captured by reference, before its upvalue is closed)?
     fn shared(&self, pc: i32, r: usize) -> bool {
         let w = self.flow.def_web(pc, r).or_else(|| self.flow.use_web(pc, r));
-        w.is_some_and(|w| self.flow.byref_only[w as usize])
+        w.is_some_and(|w| self.flow.byref_only[w as usize]) && !self.callee_unseen(pc, r)
+    }
+
+    /// Is the write at pc to r a function the call right after replaces with
+    /// its result, where no closure sees it? (`local x = f()` puts f in x's
+    /// register first: x, shared later, is not written f.)
+    fn callee_unseen(&self, pc: i32, r: usize) -> bool {
+        let Some(i) = self.flow.idx(pc) else { return false };
+        if self.flow.def_web(pc, r).is_none() || self.flow.seen_shared(pc, r) {
+            return false;
+        }
+        for ins in self.p.code[i + 1..].iter().take(64) {
+            if ins.jump_target().is_some() {
+                return false;
+            }
+            let (reads, writes, _) = effects(ins, self.p.maxstack);
+            if reads.has(r) || writes.has(r) {
+                return matches!(ins.op, op::CALL | op::CALLFB) && ins.a() == r && writes.has(r);
+            }
+        }
+        false
     }
 
     fn is_used(&self, s: &str) -> bool {
