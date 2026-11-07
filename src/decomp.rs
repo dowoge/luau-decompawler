@@ -415,6 +415,8 @@ enum Undo {
     Field(E, usize, String),
     /// A constructor was complete: its fields and text before that.
     Sealed(E, Vec<String>, String),
+    /// A closure loaded again was declared under a name (twin_names).
+    Twin(usize),
 }
 
 /// A point to roll back to. While one lives, the trail behind it stays.
@@ -470,6 +472,10 @@ struct Dec<'c, 'm> {
     /// Closure constants with no upvalues loaded at several places: one
     /// closure in Luau, declared once at the top under this name.
     shared_closures: HashMap<usize, Rc<str>>,
+    /// Closures with upvalues loaded at several places of one stretch of code
+    /// capturing the same (constant k -> declared at the first, under a name).
+    twin_closures: HashSet<usize>,
+    twin_names: HashMap<usize, Rc<str>>,
     exits: Vec<i32>,
     /// The [start, end) of the blocks being printed, innermost last.
     ranges: Vec<(i32, i32)>,
@@ -1119,6 +1125,8 @@ impl<'c, 'm> Dec<'c, 'm> {
             hoisted: Vec::new(),
             hoisted_set: HashSet::default(),
             shared_closures: HashMap::default(),
+            twin_closures: HashSet::default(),
+            twin_names: HashMap::default(),
             exits: Vec::new(),
             ranges: Vec::new(),
             loops: Vec::new(),
@@ -1437,6 +1445,9 @@ impl<'c, 'm> Dec<'c, 'm> {
                             f[at] = old;
                         }
                     }
+                }
+                Undo::Twin(k) => {
+                    self.twin_names.remove(&k);
                 }
                 Undo::Sealed(e, fields, text) => {
                     let mut x = e.borrow_mut();
@@ -2887,6 +2898,7 @@ impl<'c, 'm> Dec<'c, 'm> {
                 mixed.insert(k);
             }
         }
+        self.twin_closures = self.twin_closures(&mixed);
         let mut keys: Vec<usize> = sites.iter().filter(|(k, v)| v.0 > 1 && !mixed.contains(*k)).map(|(k, _)| *k).collect();
         keys.sort_unstable();
         let mut lines = Vec::new();
@@ -2913,6 +2925,51 @@ impl<'c, 'm> Dec<'c, 'm> {
             self.shared_closures.insert(k, name);
         }
         lines
+    }
+
+    /// One with upvalues is one closure too while what it captures stays the
+    /// same (DUPCLOSURE compares): loaded again further on in the same run of
+    /// code (an unrolled loop), capturing the same variables, it is the same
+    /// function. Those, of the constants in `candidates`.
+    fn twin_closures(&self, candidates: &HashSet<usize>) -> HashSet<usize> {
+        let code = &self.p.code;
+        let landing: HashSet<i32> = code.iter().filter_map(|c| c.jump_target()).collect();
+        // per constant: its captures, the index of its last load, and whether
+        // every load since the first is alike and in one run of code
+        let mut seen: HashMap<usize, (Vec<(u8, u32)>, usize, u32, bool)> = HashMap::default();
+        for (i, ins) in code.iter().enumerate() {
+            if ins.op != op::DUPCLOSURE {
+                continue;
+            }
+            let k = kindex(self.p, ins.d() as i64);
+            if !candidates.contains(&k) {
+                continue;
+            }
+            let mut caps = Vec::new();
+            let mut fine = true;
+            for c in code[i + 1..].iter().take_while(|c| c.op == op::CAPTURE) {
+                match c.a() {
+                    2 => caps.push((2, c.b() as u32)),
+                    0 if c.b() != ins.a() => match self.flow.use_web(c.pc, c.b()) {
+                        Some(w) => caps.push((0, w)),
+                        None => fine = false,
+                    },
+                    _ => fine = false,
+                }
+            }
+            match seen.get_mut(&k) {
+                None => {
+                    seen.insert(k, (caps, i, 1, fine));
+                }
+                Some(e) => {
+                    let straight = code[e.1 + 1..=i].iter().all(|c| c.jump_target().is_none() && !landing.contains(&c.pc));
+                    e.3 = e.3 && fine && straight && e.0 == caps;
+                    e.1 = i;
+                    e.2 += 1;
+                }
+            }
+        }
+        seen.into_iter().filter(|(_, e)| e.2 > 1 && e.3 && !e.0.is_empty()).map(|(k, _)| k).collect()
     }
 
     fn decompile_body(&mut self) -> (Vec<String>, Vec<String>) {
@@ -3023,6 +3080,8 @@ impl<'c, 'm> Dec<'c, 'm> {
         self.hoisted = Vec::new();
         self.hoisted_set = HashSet::default();
         self.shared_closures = HashMap::default();
+        self.twin_closures = HashSet::default();
+        self.twin_names = HashMap::default();
         self.goto_targets = BTreeSet::new();
         self.label_pcs = BTreeSet::new();
         self.backward = Vec::new();
@@ -3118,6 +3177,7 @@ impl<'c, 'm> Dec<'c, 'm> {
             self.label_pcs.extend(targets);
             self.hoisted.clear();
             self.hoisted_set.clear();
+            self.twin_names.clear();
             self.watch_used = true;
             out.clear();
             self.reset_defs();
@@ -6720,7 +6780,8 @@ impl<'c, 'm> Dec<'c, 'm> {
         let (a, d) = (ins.a(), ins.d());
         let (m, p) = (self.m, self.p);
         if ins.op == op::DUPCLOSURE {
-            if let Some(name) = self.shared_closures.get(&kindex(p, d as i64)).cloned() {
+            let k = kindex(p, d as i64);
+            if let Some(name) = self.shared_closures.get(&k).or_else(|| self.twin_names.get(&k)).cloned() {
                 self.put(out, ind, a, ex_pure(name.to_string()), true);
                 return pc + ins.n;
             }
@@ -6807,6 +6868,25 @@ impl<'c, 'm> Dec<'c, 'm> {
         closure.borrow_mut().calls_itself = calls_itself;
         closure.borrow_mut().unused_copy = unused_copy;
         closure.borrow_mut().names_read = captured;
+        let k = kindex(p, d as i64);
+        if ins.op == op::DUPCLOSURE && self.twin_closures.contains(&k) && !self.in_region && !self.in_value && !unused_copy {
+            // loaded again further on: one function, declared here
+            let stem = m.protos[child].name.clone().filter(|n| is_ident(n) && !is_keyword(n)).unwrap_or_else(|| "shared".to_string());
+            let mut name = stem.clone();
+            let mut n = 1;
+            while self.is_used(&name) {
+                n += 1;
+                name = format!("{stem}{n}");
+            }
+            let name: Rc<str> = Rc::from(name.as_str());
+            self.add_used(&name);
+            let text = closure.borrow().text.clone();
+            out.push(format!("{}local {name} = {text}", sp(ind)));
+            self.twin_names.insert(k, name.clone());
+            self.trail.push(Undo::Twin(k));
+            self.put(out, ind, a, ex_pure(name.to_string()), true);
+            return q;
+        }
         self.put(out, ind, a, closure, true);
         q
     }
