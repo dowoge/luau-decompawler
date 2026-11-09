@@ -6155,7 +6155,8 @@ impl<'c, 'm> Dec<'c, 'm> {
                 let here = self.reg(a);
                 if o == op::FORGPREP_INEXT && (gen[0] == "ipairs" || gen[0] == *here) {
                     head = format!("ipairs({})", gen[1]);
-                } else if o == op::FORGPREP_NEXT && gen[0] == "next" {
+                } else if o == op::FORGPREP_NEXT && gen[0] == "next" && gen[2] == "nil" {
+                    // (a control value that is not nil stays: it is where `next` starts)
                     head = format!("next, {}", gen[1]);
                 } else if o == op::FORGPREP_NEXT && (gen[0] == "pairs" || gen[0] == *here) {
                     head = format!("pairs({})", gen[1]);
@@ -6467,6 +6468,19 @@ impl<'c, 'm> Dec<'c, 'm> {
                     && self.insn(nxt).a() == a
                 {
                     self.iter_call = Some((a, call.borrow().text.clone())); // the loop header says it
+                } else if c == 3
+                    && !self.flat
+                    && a >= 1
+                    && self.valid(nxt)
+                    && is_forgprep(self.insn(nxt).op)
+                    && self.insn(nxt).a() == a - 1
+                    && self.pending.contains_key(&(a - 1))
+                {
+                    // `for k, v in next, t:GetChildren() do`: the call gives the
+                    // state and the first control value, after the generator
+                    let gen = self.get(a - 1);
+                    let text = format!("{}, {}", gen.borrow().text, call.borrow().text);
+                    self.iter_call = Some((a - 1, text));
                 } else {
                     let text = call.borrow().text.clone();
                     self.results(out, ind, a, c - 1, &text);
