@@ -6164,11 +6164,16 @@ pub fn module_table(lines: Vec<String>, path: Option<&str>) -> Vec<String> {
     };
     let var = var.to_string();
     let head = format!("local {var} = ");
+    // a table, or whatever value the script gives methods of its own (a class
+    // made by a constructor call: `local v = Class()`, `function v:Enter()`)
+    let methods = |l: &String| {
+        l.strip_prefix("function ").and_then(|r| r.strip_prefix(var.as_str())).is_some_and(|r| r.starts_with([':', '.']))
+    };
     let declared = lines.iter().any(|l| {
         l.strip_prefix(head.as_str()).is_some_and(|r| {
             (r.starts_with('{') && r.ends_with('}') && r.len() >= 2) || r.starts_with("setmetatable(")
         })
-    });
+    }) || lines.iter().any(|l| l.starts_with(head.as_str())) && lines.iter().any(methods);
     if !declared {
         return lines;
     }
@@ -6338,6 +6343,15 @@ fn usage_members() -> &'static HashMap<&'static str, Vec<(usize, i32)>> {
 fn usage_name(name: &str, out: &[String], at: &[u32]) -> Option<String> {
     let mut seen: HashSet<&str> = HashSet::default();
     let n = name.as_bytes();
+    // a table the script gives methods of its own (`function x:GetState()`)
+    // is its own class, whatever Roblox type has members of those names
+    let defines = |l: &str| {
+        let s = l.trim_start();
+        s.strip_prefix("function ").is_some_and(|r| r.strip_prefix(name).is_some_and(|r| r.starts_with([':', '.'])))
+    };
+    if at.iter().any(|j| defines(&out[*j as usize])) {
+        return None;
+    }
     for j in at {
         let l = &out[*j as usize];
         let b = l.as_bytes();
