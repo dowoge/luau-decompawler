@@ -5014,6 +5014,12 @@ fn interpolation(lines: Vec<String>) -> Vec<String> {
             {
                 from = m0 - 1;
                 to = close + 2;
+            } else if line[close + 1..].starts_with([':', '[', '(', '"', '\'', '{', '`'])
+                || line[close + 1..].starts_with('.') && !line[close + 1..].starts_with("..")
+            {
+                // indexed or called, as `("%*"):format(x):lower()` was: a
+                // string literal is no prefix expression, `(`{x}`):lower()`
+                text = format!("({text})");
             }
             let new = format!("{}{}{}", &line[..from], text, &line[to..]);
             pos = from + text.len();
@@ -5275,7 +5281,7 @@ fn call_name(rhs: &str) -> Option<String> {
     if rhs.starts_with("tonumber(") {
         return r("num");
     }
-    if rhs.starts_with("string.format(") || rhs.starts_with('`') {
+    if rhs.starts_with("string.format(") || rhs.starts_with('`') || rhs.starts_with("(`") {
         return r("text");
     }
     if rhs.starts_with("math.random(") {
