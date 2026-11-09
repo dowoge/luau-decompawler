@@ -950,6 +950,26 @@ mod tests {
     use crate::passes::{self, CallMap};
 
     #[test]
+    fn a_required_module_names_its_local_and_a_taken_name_gets_a_number() {
+        let lines: Vec<String> = [
+            "local lazyRequire = makeRequire(script)",
+            "local v1 = lazyRequire(game.ReplicatedStorage.Shared.Settings)",
+            "local v2 = require(script.Parent:WaitForChild(\"string-utils\"))",
+            "local tween = TweenService:Create(a, info, {})",
+            "local v4 = TweenService:Create(b, info, {})",
+            "print(v1, v2, tween, v4)",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let out = passes::tidy_before_names(lines);
+        assert_eq!(out[1], "local Settings = lazyRequire(game.ReplicatedStorage.Shared.Settings)");
+        assert_eq!(out[2], "local stringUtils = require(script.Parent:WaitForChild(\"string-utils\"))");
+        assert_eq!(out[4], "local tween2 = TweenService:Create(b, info, {})");
+        assert_eq!(out[5], "print(Settings, stringUtils, tween, tween2)");
+    }
+
+    #[test]
     fn call_sites_kept_as_bytes_read_back_as_those_asked_for() {
         let lines: Vec<String> = [
             "local x = M.f(alpha, beta)",

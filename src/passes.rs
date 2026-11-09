@@ -5352,6 +5352,40 @@ fn camel(v: &str) -> String {
     }
 }
 
+/// The module `require(PATH)` loads, as a name: PATH's last field, or the
+/// child it waits for (`string-utils` as `stringUtils`). A local function
+/// whose name says it requires (`lazyRequire(PATH)`) loads one too.
+pub(crate) fn required_module(rhs: &str) -> Option<String> {
+    let open = rhs.find('(')?;
+    let callee = &rhs[..open];
+    let requires = callee == "require"
+        || is_token(callee) && callee.bytes().all(is_word) && callee.to_ascii_lowercase().contains("require");
+    if !requires || matching_paren(rhs.as_bytes(), open) != Some(rhs.len() - 1) {
+        return None;
+    }
+    let path = &rhs[open + 1..rhs.len() - 1];
+    if let Some((before, g)) = ends_quoted_call(path) {
+        if [":WaitForChild", ".WaitForChild", ":FindFirstChild", ".FindFirstChild"].iter().any(|f| before.ends_with(f)) {
+            if is_token(g) {
+                return Some(g.to_string());
+            }
+            let parts: Vec<&str> = g.split('-').collect();
+            let fits = |p: &&str| !p.is_empty() && p.bytes().all(|c| c.is_ascii_alphanumeric());
+            if parts.len() > 1 && parts.iter().all(fits) && parts[0].as_bytes()[0].is_ascii_alphabetic() {
+                let mut name = parts[0].to_string();
+                for p in &parts[1..] {
+                    name.push(p.as_bytes()[0].to_ascii_uppercase() as char);
+                    name.push_str(&p[1..]);
+                }
+                return Some(name);
+            }
+            return None;
+        }
+    }
+    let tail = &path[path.rfind('.')? + 1..];
+    is_token(tail).then(|| tail.to_string())
+}
+
 /// A natural variable name for a value, from how it was computed.
 fn derive_name(rhs: &str) -> Option<String> {
     let rhs = strip(rhs);
@@ -5388,6 +5422,9 @@ fn derive_name(rhs: &str) -> Option<String> {
                 }
             }
         }
+    }
+    if let Some(n) = required_module(rhs) {
+        return Some(n);
     }
     // ^.*[.:](?:WaitForChild|...)\("(IDENT)"(, [^()]*)?\)$
     if let Some(s) = rhs.strip_suffix(')') {
@@ -5835,18 +5872,21 @@ fn rename_variables(lines: Vec<String>) -> Vec<String> {
                 s_lo = lo; // used outside that block after all
                 s_hi = hi;
             }
-            if new != "_" {
-                let mut taken = false;
-                for j in s_lo..s_hi {
-                    if has_word(&out[j], &new) {
-                        taken = true;
-                        break;
-                    }
+            // a name taken gets a number, as the declared ones do
+            let free = |c: &str| {
+                !(s_lo..s_hi).any(|j| has_word(&out[j], c))
+                    && !((s_lo, s_hi) == (lo, hi) && used.contains(&key(c.as_bytes())))
+            };
+            let new = if new == "_" || free(&new) {
+                new
+            } else if new.ends_with(|c: char| c.is_ascii_digit()) {
+                continue;
+            } else {
+                match (2..=9).map(|k| format!("{new}{k}")).find(|c| free(c)) {
+                    Some(c) => c,
+                    None => continue,
                 }
-                if taken || ((s_lo, s_hi) == (lo, hi) && used.contains(&key(new.as_bytes()))) {
-                    continue;
-                }
-            }
+            };
             let hits: Vec<u32> = at.iter().filter(|j| (s_lo..s_hi).contains(*j)).map(|j| *j as u32).collect();
             for j in &hits {
                 replace_token(&mut out[*j as usize], name, &new);
