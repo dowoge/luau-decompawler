@@ -860,7 +860,7 @@ fn ask(o: &Options, request: &str) -> Result<Reply, String> {
         run_piped(&mut cmd, &args, request.as_bytes().to_vec()).map_err(|e| format!("{}: {e}", o.claude.display()))?;
     let seconds = t.elapsed().as_secs_f64();
     let stdout = String::from_utf8_lossy(&out).into_owned();
-    let Some(j) = Json::parse(stdout.trim()) else {
+    let Some(j) = Json::parse(stdout.trim()).map(Json::result) else {
         if !ok {
             let why = String::from_utf8_lossy(&err);
             return Err(format!("the model failed: {}", why.trim().lines().last().unwrap_or("no reason given")));
@@ -979,8 +979,7 @@ enum Json {
     Bool(bool),
     Num(f64),
     Str(String),
-    /// (what an array holds is never needed)
-    Arr,
+    Arr(Vec<Json>),
     Obj(Vec<(String, Json)>),
 }
 
@@ -990,6 +989,16 @@ impl Json {
         let v = p.value()?;
         p.ws();
         (p.i == p.b.len()).then_some(v)
+    }
+
+    /// `verbose` in the user's settings makes the output every event, the result last.
+    fn result(self) -> Json {
+        match self {
+            Json::Arr(items) => {
+                items.into_iter().rev().find(|e| e.get("type").and_then(Json::string) == Some("result")).unwrap_or(Json::Null)
+            }
+            j => j,
+        }
     }
 
     fn get(&self, key: &str) -> Option<&Json> {
@@ -1069,13 +1078,14 @@ impl Parser<'_> {
             }
             b'[' => {
                 self.i += 1;
+                let mut items = Vec::new();
                 if self.eat(b']') {
-                    return Some(Json::Arr);
+                    return Some(Json::Arr(items));
                 }
                 loop {
-                    self.value()?;
+                    items.push(self.value()?);
                     if self.eat(b']') {
-                        return Some(Json::Arr);
+                        return Some(Json::Arr(items));
                     }
                     if !self.eat(b',') {
                         return None;
