@@ -12,6 +12,7 @@
 //!   harness same A B              are two output trees identical?
 //!   harness gen SEED SIZE         prints one generated program
 //!   harness validate DIR...       every file in an output tree compiles
+//!   harness assist                renames from a model, wrong on purpose: none may change a program
 //!
 //! `luau_check` and `luau_run` (see CMakeLists.txt) are the real compiler and
 //! VM; they are looked for in build/Release, or in $LUAU_BIN.
@@ -20,6 +21,7 @@
 #[path = "../../bytecode.rs"]
 mod bytecode;
 
+mod assist;
 mod cases;
 mod check;
 mod craft;
@@ -53,9 +55,14 @@ harness undeclared DIR...
 harness same A B
 harness gen SEED SIZE
 harness validate DIR... [--level N]
+harness assist [--seed S] [--rounds N]
 ";
 
 fn main() -> ExitCode {
+    // run by the decompiler as its model, for `harness assist`
+    if let Some(seed) = std::env::var_os("LUAU_FAKE_MODEL") {
+        return ExitCode::from(assist::fake_model(seed.to_string_lossy().parse().unwrap_or(1)));
+    }
     let mut argv: Vec<String> = std::env::args().skip(1).collect();
     if argv.is_empty() {
         eprint!("{USAGE}");
@@ -76,6 +83,7 @@ fn main() -> ExitCode {
         "golden" => golden::main(&args),
         "gen" => gen::main(&args),
         "validate" => validate::main(&args),
+        "assist" => assist::main(&args),
         _ => {
             eprint!("{USAGE}");
             2

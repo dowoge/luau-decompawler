@@ -228,6 +228,9 @@ pub fn main(args: &Args) -> u8 {
             binary: tools.decompiler.clone(),
         };
         ok = crate::craft::run(&tools, &craft) && ok;
+        // --assist: renames a model might give, right and wrong, may change
+        // no program's bytecode or output
+        ok = crate::assist::run(&tools, 1, 2) && ok;
     }
     if let Ok(dumps) = std::env::var("LUAU_RUN") {
         ok = real_scripts(&tools, &dumps) && ok;

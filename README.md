@@ -14,6 +14,7 @@ target/release/luau_decompile --key 203 saved.lua
 target/release/luau_decompile --info script.wire
 target/release/luau_decompile --return-types script.wire
 target/release/luau_decompile --dir dumps --out decompiled
+target/release/luau_decompile --assist --dir dumps --out decompiled
 cargo harness validate decompiled
 cargo harness check --full
 ```

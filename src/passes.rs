@@ -70,7 +70,7 @@ fn rstrip(s: &str) -> &str {
 }
 
 #[inline]
-fn is_blank(s: &str) -> bool {
+pub(crate) fn is_blank(s: &str) -> bool {
     strip(s).is_empty()
 }
 
@@ -83,7 +83,7 @@ fn spaces(n: usize) -> String {
 }
 
 /// `^[A-Za-z_][A-Za-z0-9_]*$`
-fn is_token(s: &str) -> bool {
+pub(crate) fn is_token(s: &str) -> bool {
     let b = s.as_bytes();
     !b.is_empty() && is_start(b[0]) && b.iter().all(|&c| is_word(c))
 }
@@ -144,7 +144,7 @@ fn find_from(hay: &[u8], needle: &[u8], start: usize) -> Option<usize> {
 
 /// Byte length of the character at `i` when it is a letter or `_`, else 0.
 #[inline]
-fn alpha_len(s: &str, i: usize) -> usize {
+pub(crate) fn alpha_len(s: &str, i: usize) -> usize {
     let b = s.as_bytes()[i];
     if b < 0x80 {
         return usize::from(is_start(b));
@@ -161,7 +161,7 @@ fn alpha_len(s: &str, i: usize) -> usize {
 }
 
 #[inline]
-fn alnum_len(s: &str, i: usize) -> usize {
+pub(crate) fn alnum_len(s: &str, i: usize) -> usize {
     let b = s.as_bytes()[i];
     if b < 0x80 {
         return usize::from(is_word(b));
@@ -225,7 +225,7 @@ fn for_each_word<'a>(s: &'a str, mut f: impl FnMut(&'a str) -> bool) {
 /// Which bytes of a line are code rather than string text: text is inside
 /// "..." and '...', and inside `...` but for its {} interpolations, which
 /// are code again, strings and all.
-fn code_mask(s: &str) -> Vec<bool> {
+pub(crate) fn code_mask(s: &str) -> Vec<bool> {
     if !s.bytes().any(|c| matches!(c, b'"' | b'\'' | b'`')) {
         return vec![true; s.len()];
     }
@@ -318,7 +318,7 @@ fn has_word(line: &str, name: &str) -> bool {
 
 /// Is the word at byte p (n long) a key of a table constructor, `{k = v}`?
 /// It is followed by ` = `, and the innermost bracket open before it is `{`.
-fn table_key_at(line: &str, p: usize, n: usize) -> bool {
+pub(crate) fn table_key_at(line: &str, p: usize, n: usize) -> bool {
     if !line[p + n..].starts_with(" = ") {
         return false;
     }
@@ -336,7 +336,7 @@ fn table_key_at(line: &str, p: usize, n: usize) -> bool {
 }
 
 /// has_word, but not as a constructor's key: that names no variable.
-fn has_var_word(line: &str, name: &str) -> bool {
+pub(crate) fn has_var_word(line: &str, name: &str) -> bool {
     if !line.contains(name) {
         return false;
     }
@@ -559,7 +559,7 @@ fn is_depth_name(s: &str, depth: usize) -> bool {
     }
 }
 
-fn pass_keyword(s: &str) -> bool {
+pub(crate) fn pass_keyword(s: &str) -> bool {
     matches!(
         s,
         "and" | "break" | "do" | "else" | "elseif" | "end" | "false" | "for" | "function" | "if"
@@ -602,7 +602,7 @@ fn str_isupper_char(c: char) -> bool {
 
 /// `^local (TOKEN(, TOKEN)*)( = .*)?$` on text starting at "local ": the name
 /// list and the ` = ...` part.
-fn parse_local_list(s: &str) -> Option<(&str, Option<&str>)> {
+pub(crate) fn parse_local_list(s: &str) -> Option<(&str, Option<&str>)> {
     let r = s.strip_prefix("local ")?;
     let b = r.as_bytes();
     if b.is_empty() || !is_start(b[0]) {
@@ -624,7 +624,7 @@ fn parse_local_list(s: &str) -> Option<(&str, Option<&str>)> {
 
 /// `function(?: [A-Za-z_][A-Za-z0-9_.:]*)?\(([^()]*)\)$` searched in a
 /// right-stripped line: the parameter text.
-fn func_open(line: &str) -> Option<&str> {
+pub(crate) fn func_open(line: &str) -> Option<&str> {
     let s = rstrip(line);
     let body = s.strip_suffix(')')?;
     let open = body.rfind('(')?;
@@ -651,7 +651,7 @@ fn func_open(line: &str) -> Option<&str> {
     }
 }
 
-fn block_end(lines: &[String], i: usize) -> usize {
+pub(crate) fn block_end(lines: &[String], i: usize) -> usize {
     let pad = indent_of(&lines[i]);
     for (j, l) in lines.iter().enumerate().skip(i + 1) {
         if !is_blank(l) && indent_of(l) <= pad {
@@ -662,7 +662,7 @@ fn block_end(lines: &[String], i: usize) -> usize {
 }
 
 /// The parameters' names, without the types some are annotated with.
-fn split_params(s: &str) -> Vec<String> {
+pub(crate) fn split_params(s: &str) -> Vec<String> {
     split_params_typed(s).iter().map(|p| strip(p.split(':').next().unwrap_or("")).to_string()).collect()
 }
 
@@ -5638,7 +5638,7 @@ fn is_skip_type(s: &str) -> bool {
 }
 
 /// `^ *for (.+) in (.+) do$`: the variables and the source, group 1 greedy.
-fn parse_for_in(line: &str) -> Option<(&str, &str)> {
+pub(crate) fn parse_for_in(line: &str) -> Option<(&str, &str)> {
     let s = line.trim_start_matches(' ').strip_prefix("for ")?.strip_suffix(" do")?;
     if s.contains('\n') {
         return None;
@@ -5655,7 +5655,7 @@ fn parse_for_in(line: &str) -> Option<(&str, &str)> {
 }
 
 /// `^ *for (TOKEN) = .+ do$`: the variable.
-fn parse_for_num(line: &str) -> Option<&str> {
+pub(crate) fn parse_for_num(line: &str) -> Option<&str> {
     let s = line.trim_start_matches(' ').strip_prefix("for ")?;
     let b = s.as_bytes();
     if b.is_empty() || !is_start(b[0]) {

@@ -31,6 +31,7 @@
 
 mod alloc;
 mod analysis;
+mod assist;
 mod bytecode;
 mod cache;
 mod decomp;
@@ -159,6 +160,211 @@ static CACHE_MAX_MIB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 
 /// `--stats-json PATH`: with --dir, what the run came to, as JSON.
 static STATS_JSON: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// `--assist`: names from a model, each checked by compiling (assist.rs).
+static ASSIST: std::sync::OnceLock<assist::Options> = std::sync::OnceLock::new();
+
+/// The value after `flag`, taken out of args with it.
+fn take_value(args: &mut Vec<String>, flag: &str) -> Result<Option<String>, i32> {
+    match args.iter().position(|a| a == flag) {
+        Some(i) if i + 1 < args.len() => Ok(args.drain(i..i + 2).nth(1)),
+        Some(_) => {
+            eprintln!("{flag} needs a value");
+            Err(2)
+        }
+        None => Ok(None),
+    }
+}
+
+/// The `--assist` options taken out of args, and the path `--assist-text`
+/// gives; None when no assist is asked for. Err: the exit code.
+fn assist_options(args: &mut Vec<String>) -> Result<Option<(assist::Options, Option<String>)>, i32> {
+    let text = take_value(args, "--assist-text")?;
+    let model = take_value(args, "--assist-model")?;
+    let effort = take_value(args, "--assist-effort")?;
+    let batch = take_value(args, "--assist-batch")?;
+    let jobs = take_value(args, "--assist-jobs")?;
+    let claude = take_value(args, "--assist-claude")?;
+    let check = take_value(args, "--luau-check")?;
+    let asked = args.iter().any(|a| a == "--assist");
+    let edits = args.iter().any(|a| a == "--assist-edits");
+    let comments = args.iter().any(|a| a == "--assist-comments");
+    args.retain(|a| a != "--assist" && a != "--assist-edits" && a != "--assist-comments");
+    if text.is_none() && !asked {
+        if [&model, &effort, &batch, &jobs, &claude].iter().any(|v| v.is_some()) || edits || comments {
+            eprintln!("the --assist-... options go with --assist or --assist-text");
+            return Err(2);
+        }
+        return Ok(None);
+    }
+    let count = |v: Option<String>, default: usize, flag: &str| -> Result<usize, i32> {
+        match v {
+            None => Ok(default),
+            Some(s) => s.parse::<usize>().ok().filter(|n| *n > 0).ok_or_else(|| {
+                eprintln!("{flag}: a count above 0");
+                2
+            }),
+        }
+    };
+    let effort = effort.unwrap_or_else(|| assist::EFFORT.to_string());
+    if !["low", "medium", "high", "xhigh", "max"].contains(&effort.as_str()) {
+        eprintln!("--assist-effort: low, medium, high, xhigh or max");
+        return Err(2);
+    }
+    let Some(check) = assist::find_check(check.as_deref()) else {
+        eprintln!("--assist checks every rename by compiling: give luau_check with --luau-check PATH, or its folder in $LUAU_BIN");
+        return Err(2);
+    };
+    let claude = claude.or_else(|| std::env::var("LUAU_CLAUDE").ok()).unwrap_or_else(|| "claude".to_string());
+    let options = assist::Options {
+        model: model.unwrap_or_else(|| assist::MODEL.to_string()),
+        effort,
+        batch: count(batch, assist::BATCH, "--assist-batch")?,
+        jobs: count(jobs, assist::JOBS, "--assist-jobs")?,
+        claude: PathBuf::from(claude),
+        check,
+        edits,
+        comments,
+        progress: true,
+    };
+    Ok(Some((options, text)))
+}
+
+/// The leading comment lines of a decompiled file (its path, `--!native`),
+/// which stay as they are, and the rest.
+fn split_head(text: &str) -> (&str, &str) {
+    let mut at = 0;
+    while text[at..].starts_with("--") {
+        match text[at..].find('\n') {
+            Some(e) => at += e + 1,
+            None => return (text, ""),
+        }
+    }
+    text.split_at(at)
+}
+
+/// Names from the model for each (input, output) text file, written to its
+/// output; a summary goes to standard error.
+fn assist_files(pairs: &[(PathBuf, PathBuf)], o: &assist::Options) -> i32 {
+    let mut heads: Vec<String> = Vec::with_capacity(pairs.len());
+    let mut scripts: Vec<assist::Script> = Vec::with_capacity(pairs.len());
+    for (input, _) in pairs {
+        let text = match fs::read_to_string(input) {
+            Ok(t) => t.replace("\r\n", "\n"),
+            Err(e) => {
+                eprintln!("{}: {e}", input.display());
+                return 1;
+            }
+        };
+        let (head, body) = split_head(&text);
+        // the path the decompiler wrote in its first line, else the file's name
+        let name = head
+            .lines()
+            .next()
+            .and_then(|l| l.strip_prefix("-- "))
+            .map(|l| l.split(" (script ").next().unwrap_or(l).to_string())
+            .filter(|n| !n.starts_with('!'))
+            .unwrap_or_else(|| input.file_stem().map_or_else(String::new, |s| s.to_string_lossy().into_owned()));
+        heads.push(head.to_string());
+        scripts.push(assist::Script { name, text: body.to_string() });
+    }
+    let t0 = std::time::Instant::now();
+    let (done, totals) = assist::run(&scripts, o);
+    let mut bad = 0;
+    for (i, (input, output)) in pairs.iter().enumerate() {
+        if done[i].text.is_none() && input == output {
+            continue;
+        }
+        let body = done[i].text.as_deref().unwrap_or(&scripts[i].text);
+        if let Some(dir) = output.parent() {
+            let _ = fs::create_dir_all(dir);
+        }
+        if let Err(e) = fs::write(output, format!("{}{body}", heads[i])) {
+            eprintln!("{}: {e}", output.display());
+            bad += 1;
+        }
+    }
+    assist_summary(&done, &totals, t0.elapsed().as_secs_f64());
+    i32::from(bad > 0)
+}
+
+fn assist_summary(done: &[assist::Done], t: &assist::Totals, wall: f64) {
+    let proposed: usize = done.iter().map(|d| d.proposed).sum();
+    let kept: usize = done.iter().map(|d| d.kept).sum();
+    let edits: usize = done.iter().map(|d| d.edits_proposed).sum();
+    let edits_kept: usize = done.iter().map(|d| d.edits_kept).sum();
+    let comments: usize = done.iter().map(|d| d.comments_proposed).sum();
+    let comments_kept: usize = done.iter().map(|d| d.comments_kept).sum();
+    let changed = done.iter().filter(|d| d.text.is_some()).count();
+    let errors: Vec<&String> = done.iter().filter_map(|d| d.error.as_ref()).collect();
+    let n = done.len().max(1);
+    eprintln!(
+        "assist: {} scripts, {} requests ({} failed): {kept} of {proposed} renames kept, {edits_kept} of {edits} edits kept, {comments_kept} of {comments} comments kept, {changed} scripts changed, {} not",
+        done.len(),
+        t.requests,
+        t.failed,
+        errors.len()
+    );
+    eprintln!(
+        "assist: {wall:.1}s ({:.2}s a script; requests {:.1}s in all); tokens: {} in, {} cached, {} cache written, {} out",
+        wall / n as f64,
+        t.busy,
+        t.input,
+        t.cache_read,
+        t.cache_write,
+        t.output
+    );
+    if let Some(e) = errors.first() {
+        eprintln!("assist: for one: {e}");
+    }
+    // LUAU_ASSIST_WHY=1: every rename not kept, and why
+    if std::env::var_os("LUAU_ASSIST_WHY").is_some() {
+        for (i, d) in done.iter().enumerate() {
+            for r in &d.refused {
+                eprintln!("assist: script {}: not {r}", i + 1);
+            }
+        }
+    }
+}
+
+/// `--assist-text PATH`: names for decompiled text already written, a file or
+/// every .lua and .luau file under a folder, into `--out` (a file's text goes
+/// to standard output without it).
+fn run_assist_text(path: &Path, out: Option<&Path>, o: &assist::Options) -> i32 {
+    if path.is_file() {
+        let Some(out) = out else {
+            let tmp = std::env::temp_dir().join(format!("luau_assist_{}.lua", std::process::id()));
+            let code = assist_files(&[(path.to_path_buf(), tmp.clone())], o);
+            if let Ok(text) = fs::read_to_string(&tmp) {
+                print!("{text}");
+            }
+            let _ = fs::remove_file(&tmp);
+            return code;
+        };
+        return assist_files(&[(path.to_path_buf(), out.to_path_buf())], o);
+    }
+    let Some(out) = out else {
+        eprintln!("--assist-text DIR needs --out OUT");
+        return 2;
+    };
+    let mut found: Vec<PathBuf> = Vec::new();
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else { continue };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().is_some_and(|x| x == "lua" || x == "luau") {
+                found.push(p);
+            }
+        }
+    }
+    found.sort();
+    let pairs: Vec<(PathBuf, PathBuf)> =
+        found.into_iter().map(|p| (p.clone(), out.join(p.strip_prefix(path).unwrap_or(&p)))).collect();
+    assist_files(&pairs, o)
+}
 
 /// A JSON string of s.
 fn json_string(s: &str) -> String {
@@ -744,7 +950,20 @@ fn run_dir(src: &Path, dst: &Path, opcodes: Opcodes, noflat: bool, cache_dir: Op
             eprintln!("{}: {e}", path.display());
         }
     }
-    if bad == 0 {
+    // names from the model, in place, for every script written
+    let assisted = match ASSIST.get() {
+        Some(o) => {
+            let pairs: Vec<(PathBuf, PathBuf)> = written
+                .iter()
+                .zip(&targets)
+                .filter(|(w, _)| w[4] == 1 && w[0] == 0)
+                .map(|(_, (p, _))| (p.clone(), p.clone()))
+                .collect();
+            assist_files(&pairs, o)
+        }
+        None => 0,
+    };
+    if bad == 0 && assisted == 0 {
         0
     } else {
         1
@@ -823,6 +1042,20 @@ fn usage() -> i32 {
          \x20 --stats-json PATH  with --dir, the run's counts as JSON: scripts\n\
          \x20              decompiled and failed, flags, dispatchers and time, in all and\n\
          \x20              for each file\n\
+         \x20 --assist     names for locals and parameters from a model (the `claude`\n\
+         \x20              command), each kept only if the script compiles to the same\n\
+         \x20              bytecode with it: needs luau_check (--luau-check PATH or\n\
+         \x20              $LUAU_BIN); output then differs from run to run\n\
+         \x20 --assist-text PATH  the same for decompiled text already written: a\n\
+         \x20              file, or a folder's .lua and .luau files into --out OUT\n\
+         \x20 --assist-model M, --assist-effort E  (claude-opus-5-5, low)\n\
+         \x20 --assist-comments  a one-line comment from the model above the\n\
+         \x20              functions whose purpose the code makes clear\n\
+         \x20 --assist-edits  lines rewritten too, each kept only if the script\n\
+         \x20              compiles to the same program but for its line numbers\n\
+         \x20              (rarely passes; can cost names)\n\
+         \x20 --assist-batch N  scripts to a request (4); --assist-jobs N  requests\n\
+         \x20              at once (6); --assist-claude PATH  the command ($LUAU_CLAUDE)\n\
          Bytecode saved as text, a `--` line and then base64, is read as such."
     );
     2
@@ -852,6 +1085,20 @@ fn run(args: Vec<String>) -> i32 {
     let mut args: Vec<String> = args.into_iter().filter(|a| !flags.contains(&a.as_str())).collect();
     if let Some(i) = args.iter().position(|a| a == "--key") {
         args.drain(i..i + 2);
+    }
+    match assist_options(&mut args) {
+        Err(code) => return code,
+        Ok(Some((o, Some(path)))) => {
+            let out = match take_value(&mut args, "--out") {
+                Ok(v) => v,
+                Err(code) => return code,
+            };
+            return run_assist_text(Path::new(&path), out.as_deref().map(Path::new), &o);
+        }
+        Ok(Some((o, None))) => {
+            let _ = ASSIST.set(o);
+        }
+        Ok(None) => {}
     }
     let cache_dir = match args.iter().position(|a| a == "--cache") {
         Some(i) if i + 1 < args.len() => Some(PathBuf::from(args.drain(i..i + 2).nth(1).unwrap())),
@@ -883,6 +1130,10 @@ fn run(args: Vec<String>) -> i32 {
         return run_dir(&src, &dst, opcodes, noflat, cache_dir.as_deref());
     }
     if args.first().is_some_and(|a| a == "--stream") {
+        if ASSIST.get().is_some() {
+            eprintln!("--assist does not go with --stream");
+            return 2;
+        }
         return run_stream(opcodes, noflat);
     }
     let disasm = args.iter().any(|a| a == "--disasm");
@@ -895,6 +1146,7 @@ fn run(args: Vec<String>) -> i32 {
         }
     };
     let refused = refused_source(&data);
+    let was_refused = refused.is_some();
     let text = match load(&data, opcodes) {
         _ if refused.is_some() => refused.unwrap_or_default(),
         Ok(m) if disasm => decomp::disassemble(&m),
@@ -912,6 +1164,20 @@ fn run(args: Vec<String>) -> i32 {
             eprintln!("{file}: {e}");
             return 1;
         }
+    };
+    let text = match ASSIST.get().filter(|_| !disasm && !was_refused) {
+        Some(o) => {
+            let (head, body) = split_head(&text);
+            let name = Path::new(file).file_stem().map_or_else(String::new, |s| s.to_string_lossy().into_owned());
+            let t0 = std::time::Instant::now();
+            let (done, totals) = assist::run(&[assist::Script { name, text: body.to_string() }], o);
+            assist_summary(&done, &totals, t0.elapsed().as_secs_f64());
+            match done.into_iter().next().and_then(|d| d.text) {
+                Some(named) => format!("{head}{named}"),
+                None => text,
+            }
+        }
+        None => text,
     };
     let stdout = std::io::stdout();
     let mut o = stdout.lock();

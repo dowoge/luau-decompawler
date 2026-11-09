@@ -305,6 +305,39 @@ pub struct Module {
     pub userdata: Vec<Option<String>>,
 }
 
+/// The program a module is, line numbers aside: every function's
+/// instructions, constants (strings as text), children, name, parameters and
+/// flags. Two modules with the same skeleton do the same, but for the lines
+/// they report.
+pub fn skeleton(m: &Module) -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    for p in &m.protos {
+        let _ = writeln!(
+            s,
+            "fn {:?} stack {} params {} ups {} vararg {} flags {} types {:?} children {:?}",
+            p.name, p.maxstack, p.numparams, p.nups, p.vararg, p.flags, p.param_types, p.children
+        );
+        for i in &p.code {
+            let _ = write!(s, "{}:{:x}:{:x} ", i.op, i.w, i.aux);
+        }
+        s.push('\n');
+        for k in &p.k {
+            match k {
+                K::Str(Some(i)) => {
+                    let _ = write!(s, "s{:?} ", m.strings.get(*i));
+                }
+                other => {
+                    let _ = write!(s, "{other:?} ");
+                }
+            }
+        }
+        s.push('\n');
+    }
+    let _ = write!(s, "main {}", m.main);
+    s
+}
+
 /// An annotation as the source wrote it, from a recorded type byte; None for
 /// those that name no type a source could have spelled that way (`any`, a
 /// table or function type, nil, plain userdata).
