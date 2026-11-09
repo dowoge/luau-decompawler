@@ -4893,12 +4893,64 @@ fn lowest_top_op(s: &str) -> Option<i32> {
     low
 }
 
-/// `x = x + e` -> `x += e` (Luau), when e is the whole right operand.
+/// Is `name`, at line i, a local of the function that line is in: one of its
+/// parameters, or declared in it before the line and still in scope? An
+/// upvalue or a global is not (reading one is an instruction of its own).
+fn own_local(lines: &[String], funcs: &[(i64, usize, Vec<String>)], i: usize, name: &str) -> bool {
+    let Some((h, _, params)) = funcs.iter().filter(|(h, e, _)| *h < i as i64 && i < *e).max_by_key(|f| f.0) else {
+        return false;
+    };
+    if params.iter().any(|p| p == name) {
+        return true;
+    }
+    if name == "self" && *h >= 0 {
+        // `function T:m(...)` has self as its first parameter
+        let head = &lines[*h as usize];
+        let method = head.find("function ").is_some_and(|p| head[p + 9..].split('(').next().is_some_and(|n| n.contains(':')));
+        if method {
+            return true;
+        }
+    }
+    // a declaration is in scope while no line after it is shallower than it
+    let mut lowest = indent_of(&lines[i]);
+    for j in ((h + 1) as usize..i).rev() {
+        let l = &lines[j];
+        if is_blank(l) {
+            continue;
+        }
+        let d = indent_of(l);
+        let s = &l[d..];
+        if d <= lowest {
+            if parse_local_list(s).is_some_and(|(names, _)| names.split(", ").any(|n| n == name)) {
+                return true;
+            }
+            if s.strip_prefix("local function ").is_some_and(|r| r.split('(').next() == Some(name)) {
+                return true;
+            }
+        }
+        if d < lowest {
+            // the header of a loop line i is in
+            let vars = parse_for_in(l).map(|(v, _)| v).or_else(|| parse_for_num(l));
+            if vars.is_some_and(|v| v.split(',').any(|x| strip(x) == name)) {
+                return true;
+            }
+        }
+        lowest = lowest.min(d);
+    }
+    false
+}
+
+/// `x = x + e` -> `x += e` (Luau), when e is the whole right operand. Not
+/// `a.b.k = a.b.k + e`: that reads `a.b` twice, the compound once (where the
+/// source said it once the emitter wrote `local b = a.b` first); nor `u.k` with
+/// u an upvalue or a global, read once more the same way.
 fn compound_assign(lines: Vec<String>) -> Vec<String> {
     const OPS: [(&str, i32); 7] =
         [("+", 6), ("-", 6), ("*", 7), ("/", 7), ("//", 7), ("%", 7), ("..", 5)];
     let mut out = lines;
-    for line in out.iter_mut() {
+    let funcs = functions(&out);
+    for i in 0..out.len() {
+        let line = &out[i];
         // ^( *)(ident(\.ident)*) = (.+)$
         let ind = indent_of(line);
         let b = line.as_bytes();
@@ -4908,6 +4960,11 @@ fn compound_assign(lines: Vec<String>) -> Vec<String> {
             continue;
         }
         let lhs = &line[ind..e];
+        match lhs.split_once('.') {
+            Some((_, key)) if key.contains('.') => continue,
+            Some((base, _)) if !own_local(&out, &funcs, i, base) => continue,
+            _ => {}
+        }
         let mut new = None;
         for (op, prec) in OPS {
             let head = format!("{lhs} {op} ");
@@ -4927,7 +4984,7 @@ fn compound_assign(lines: Vec<String>) -> Vec<String> {
             }
         }
         if let Some(n) = new {
-            *line = n;
+            out[i] = n;
         }
     }
     out
