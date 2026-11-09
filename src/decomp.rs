@@ -4011,9 +4011,10 @@ impl<'c, 'm> Dec<'c, 'm> {
     }
 
     /// The table made at pc, given only string-keyed stores up to `last`, then
-    /// goes into a constructor still being built, from the register Luau made
-    /// it in: it was an item written `{ ["k"] = v }` there (a variable has a
-    /// register of its own, and `{ k = v }` is made from a template).
+    /// goes into a constructor still being built, or is a call's argument,
+    /// from the register Luau made it in: it was an item written
+    /// `{ ["k"] = v }` there (a variable has a register of its own, copied to
+    /// where an argument goes, and `{ k = v }` is made from a template).
     fn item_of_constructor(&self, pc: i32, r: usize, last: Option<i32>) -> bool {
         let made = self.insn(pc);
         let code = &self.p.code;
@@ -4039,6 +4040,9 @@ impl<'c, 'm> Dec<'c, 'm> {
             if ins.jump_target().is_some() || self.has_label(ins.pc) {
                 return false;
             }
+            if is_fastcall(ins.op) {
+                continue; // the call after it says what it takes
+            }
             let (rd, wr, _) = self.effects_at(i);
             if rd.has(r) {
                 let (qa, qb, qc) = (ins.a(), ins.b(), ins.c());
@@ -4046,6 +4050,7 @@ impl<'c, 'm> Dec<'c, 'm> {
                     op::SETLIST => building(qa) && qb <= r && (qc == 0 || r < qb + qc - 1),
                     op::SETTABLEKS | op::SETTABLEN => qa == r && building(qb),
                     op::SETTABLE => qa == r && qc != r && building(qb),
+                    op::CALL | op::CALLFB => qa < r && (qb == 0 || r < qa + qb),
                     _ => false,
                 };
             }
