@@ -5878,9 +5878,10 @@ fn rename_variables(lines: Vec<String>) -> Vec<String> {
                 s_lo = lo; // used outside that block after all
                 s_hi = hi;
             }
-            // a name taken gets a number, as the declared ones do
+            // a name taken gets a number, as the declared ones do (a
+            // constructor's key `{ Cleaner = ... }` names no variable)
             let free = |c: &str| {
-                !(s_lo..s_hi).any(|j| has_word(&out[j], c))
+                !(s_lo..s_hi).any(|j| has_var_word(&out[j], c))
                     && !((s_lo, s_hi) == (lo, hi) && used.contains(&key(c.as_bytes())))
             };
             let new = if new == "_" || free(&new) {

@@ -958,6 +958,8 @@ mod tests {
             "local tween = TweenService:Create(a, info, {})",
             "local v4 = TweenService:Create(b, info, {})",
             "print(v1, v2, tween, v4)",
+            "local v6 = require(game.ReplicatedStorage.Modules.Cleaner)",
+            "print({ Cleaner = v6.new() })",
         ]
         .iter()
         .map(|s| s.to_string())
@@ -967,6 +969,9 @@ mod tests {
         assert_eq!(out[2], "local stringUtils = require(script.Parent:WaitForChild(\"string-utils\"))");
         assert_eq!(out[4], "local tween2 = TweenService:Create(b, info, {})");
         assert_eq!(out[5], "print(Settings, stringUtils, tween, tween2)");
+        // a constructor's key is no variable that takes the name
+        assert_eq!(out[6], "local Cleaner = require(game.ReplicatedStorage.Modules.Cleaner)");
+        assert_eq!(out[7], "print({ Cleaner = Cleaner.new() })");
     }
 
     #[test]
